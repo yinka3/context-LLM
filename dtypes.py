@@ -11,14 +11,14 @@ class MessageData:
     timestamp: datetime = field(default_factory=lambda: datetime.now())
     
 
-@dataclass
+@dataclass(frozen=True)
 class AttributeData:
     value: Union[str, 'EntityData']
     message: MessageData
     confidence_score: float
     mentioned_in: List[int] = field(default_factory=list)
 
-@dataclass
+@dataclass(frozen=True)
 class EntityData:
     id: int
     name: str
