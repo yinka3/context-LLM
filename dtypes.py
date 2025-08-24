@@ -1,13 +1,13 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 @dataclass
 class MessageData:
     id: int
     role: str
     message: str
-    sentiment: str
+    sentiment: str = "unknown"
     timestamp: datetime = field(default_factory=lambda: datetime.now())
     
 
@@ -16,14 +16,15 @@ class AttributeData:
     value: Union[str, 'EntityData']
     message: MessageData
     confidence_score: float
-    mentioned_in: List[int] = field(default_factory=list)
+    mentioned_in: List[Tuple] = field(default_factory=list)
 
-@dataclass(frozen=True)
+@dataclass
 class EntityData:
     id: int
     name: str
     type: str
     attributes: Dict[str, List[AttributeData]] = field(default_factory=dict)
+    mentioned_in: List[Tuple] = field(default_factory=list)
 
 
 @dataclass

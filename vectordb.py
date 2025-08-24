@@ -32,15 +32,14 @@ class ChromaClient:
             self.collection.add(ids=[str_id],
                                 documents=[item.message],
                                 metadatas=[{"node_type": "message", 
-                                            "data": {"sentiment": item.sentiment,
-                                                     "timestamp": item.timestamp}}]
+                                            "sentiment": item.sentiment,
+                                            "timestamp": item.timestamp}]
             )
         else:
             self.collection.add(ids=[str_id],
                                 documents=[item.name],
-                                metadatas=[{"node_type": "entity", 
-                                            "data": {"attributes": {**item.attributes},
-                                                     "entity_type": item.type}}]
+                                metadatas=[{"node_type": "entity",
+                                            "entity_type": item.type}]
             )
     
     def query(self, text: str, n_results: int = 15, node_type: str = "message", include: List[str] = ["embeddings", "metadatas", "documents", "distances"]):
