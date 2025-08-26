@@ -183,5 +183,12 @@
       "from": "graduated_from",
       "with": "graduated_with_degree"
     }
+  },
+  "locate": {
+    "default_relation": "is_located_at",
+    "prepositions": {
+      "in": "is_located_in",
+      "at": "is_located_at"
+    }
   }
 }

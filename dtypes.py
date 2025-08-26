@@ -23,8 +23,10 @@ class EntityData:
     id: int
     name: str
     type: str
+    aliases: List[Dict[str, str]] = field(default_factory=list)
+    confidence: float = 1.0
     attributes: Dict[str, List[AttributeData]] = field(default_factory=dict)
-    mentioned_in: List[Tuple] = field(default_factory=list)
+    mentioned_in: List[int] = field(default_factory=list)
 
 
 @dataclass

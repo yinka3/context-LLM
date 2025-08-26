@@ -2,6 +2,7 @@ from typing import List, Union
 import chromadb
 from chromadb.api.models.Collection import Collection
 import logging
+import json
 
 from dtypes import EntityData, MessageData
 
@@ -27,24 +28,29 @@ class ChromaClient:
 
     def add_item(self, item: Union[MessageData, EntityData]):
         
-        str_id = str(item.id)
         if isinstance(item, MessageData):
-            self.collection.add(ids=[str_id],
+            id_ = f"msg_{item.id}"
+            self.collection.add(ids=[id_],
                                 documents=[item.message],
                                 metadatas=[{"node_type": "message", 
                                             "sentiment": item.sentiment,
                                             "timestamp": item.timestamp}]
             )
         else:
-            self.collection.add(ids=[str_id],
+            id_ = f"ent_{item.id}"
+            self.collection.add(ids=[id_],
                                 documents=[item.name],
-                                metadatas=[{"node_type": "entity",
-                                            "entity_type": item.type}]
+                                metadatas=[{
+                                "node_type": "entity",
+                                "entity_type": item.type,
+                                "aliases": json.dumps(item.aliases),
+                                "confidence": item.confidence
+                            }]
             )
     
-    def query(self, text: str, n_results: int = 15, node_type: str = "message", include: List[str] = ["embeddings", "metadatas", "documents", "distances"]):
+    def query(self, text: str, n_results: int = 15, node_type: str = "message", 
+              include: List[str] = ["embeddings", "metadatas", "documents", "distances"]):
         
-
         results = self.collection.query(
                 query_texts=[text],
                 where={"node_type": node_type},

@@ -1,166 +1,169 @@
+from datetime import datetime
 import logging
 import json
 import os
-from typing import Dict, List, Set, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 from networkx import DiGraph, Graph
+from entity import EntityResolver
+from factcheck import FactExtractor
 from nlp_pipe import NLP_PIPE
 from dtypes import AttributeData, EntityData, MessageData
 from vectordb import ChromaClient
 
 class Context:
 
-    def __init__(self):
-        self.next_id = 0
+    def __init__(self, user_name: str = "Yinka"):
+        self.next_id = 1
         self.graph: DiGraph = DiGraph()
         self.nlp_pipe: NLP_PIPE = NLP_PIPE()
-        self.history: List[Dict[MessageData, EntityData]] = []
-        self.short_context: Set[EntityData] = {}
+        self.history: List[MessageData] = []
+        self.entities: Dict[int, EntityData] = {}
         self.chroma: ChromaClient = ChromaClient()
         self.user_message_cnt: int = 0
-
         self.vocab = {}
+        self.resolution_queue = []
+
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             vocab_path = os.path.join(script_dir, "vocab.json")
             with open(vocab_path) as file:
                 self.vocab = json.load(file)
-        except FileNotFoundError:
-            logging.error("Error: The file was not found.")
-            raise
-        except json.JSONDecodeError:
-            logging.error("Error: The file is not a valid JSON.")
-            raise
         except Exception as e:
             logging.error(f"An unexpected error occurred: {e}")
             raise
 
+        self.user_entity = self._create_user_entity(user_name)
+
+        self.ENTITY_RESOLVER = EntityResolver(
+            graph=self.graph,
+            chroma=self.chroma,
+            user_entity=self.user_entity,
+            next_id=self.get_new_id
+        )
+
+        self.FACT_EXTRACTOR = FactExtractor(vocab=self.vocab)
+
+    def _create_user_entity(self, user_name: str) -> EntityData:
+        user_entity = EntityData(
+            id=0, 
+            name="USER", 
+            type="person",
+            aliases=[{"text": user_name, "type": "person"}]
+        )
+        ent_id = f"ent_{user_entity.id}"
+        self.graph.add_node(ent_id, data=user_entity, type="entity")
+        self.entities[user_entity.id] = user_entity
+        self.chroma.add_item(user_entity)
+        return user_entity
+    
     def get_new_id(self):
         new_id = self.next_id
         self.next_id += 1
         return new_id
-
-    def check_chroma(self, text: str, threshold: float = 0.3):
-        results = self.chroma.collection.query(
-                    query_texts=[text],
-                    n_results=1,
-                    where={"node_type": "entity"})
-
-        if results['ids'][0] and results['distances'][0][0] < threshold:
-            return int(results['ids'][0][0])
-        
-        return None
     
-    def extract_svo(self, svo: Dict):
+    def add_to_resolution_queue(self, entity_data, context):
+        self.resolution_queue.append({
+            'entity': entity_data,
+            'message_context': context,
+            'surrounding_entities': list(self.entities.keys()),
+            'timestamp': datetime.now()
+        })
+    
+    def add(self, item: MessageData):
+        self.history.append(item)
+        if item.role == "user":
+            self.user_message_cnt += 1
+        self.process_live_messages(item)
+    
 
-        verb = svo["verb"]
+    def _apply_actions(self, actions: List[Dict]):
+        """Applies the state changes returned by the FactExtractor."""
+        for action in actions:
+            if not action:
+                continue
 
-        rules = self.vocab.get(verb)
-        preposition_phrase = svo.get("prepositional_phrases")
+            subject_id_str = action.get("subject_id")
+            if not subject_id_str or not self.graph.has_node(subject_id_str):
+                continue
+            
+            subject_entity: EntityData = self.graph.nodes[subject_id_str]['data']
 
-        if verb not in self.vocab:
-            return f"{verb}_expresses_about"
-        
-        if preposition_phrase:
-            first = preposition_phrase[0].split(' ', 1)[0]
+            if action["action"] == "add_fact":
+                relation = action["relation"]
+                new_fact = action["new_fact"]
+                if relation not in subject_entity.attributes:
+                    subject_entity.attributes[relation] = []
+                subject_entity.attributes[relation].append(new_fact)
+                logging.info(f"Applied Fact: ({subject_entity.name}) -> [{relation}] -> ({new_fact.value.name if isinstance(new_fact.value, EntityData) else new_fact.value})")
 
-            if first in rules["prepositions"]:
-                return rules["prepositions"][first]
-        
-        return rules["default_relation"]
+            elif action["action"] == "add_attribute":
+                key = action["attribute_key"]
+                new_attribute = action["new_attribute"]
+                if key not in subject_entity.attributes:
+                    subject_entity.attributes[key] = []
+                subject_entity.attributes[key].append(new_attribute)
+                logging.info(f"Applied Attribute: ({subject_entity.name}) -> [{key}] -> ({new_attribute.value})")
 
-
+    
     def process_live_messages(self, msg: MessageData):
         if self.nlp_pipe.type == "long":
             logging.info("This is only for live stream messages, switching to short type.")
             self.nlp_pipe.type = "short"
         
         msg_id = f"msg_{msg.id}"
+        self.graph.add_node(msg_id, data=msg, type="message")
+
         results = self.nlp_pipe.start_process(msg=msg)
         msg.sentiment = results["sentiment"]
-        self.graph.add_node(msg_id, data=msg, type="message")
-        resolved_entities = {}
-        for ents in results["found_entities"]:
-            word = ents["text"]
-            found_id = self.check_chroma(text=word)
-            if found_id is not None:
-                ent_id = f"ent_{found_id}"
-                if ent_id in self.graph.nodes and self.graph.nodes[ent_id]["type"] == "entity":
-                    existing_ent: EntityData = self.graph.nodes[ent_id]['data']
-                    if msg.id not in existing_ent.mentioned_in:
-                        existing_ent.mentioned_in.append(msg.id)
-                    resolved_entities[word] = existing_ent
 
-                    self.graph.add_edge(msg_id, ent_id, type="mentions")
-            else:
-                new_ent = EntityData(
-                    id=self.get_new_id(),
-                    name=word,
-                    type=ents["type"])
-                
-                ent_id = f"ent_{new_ent.id}"
-                self.graph.add_node(ent_id, data=new_ent, type="entity")
-                self.chroma.add_item(new_ent)
-                resolved_entities[word] = new_ent
-                self.graph.add_edge(msg_id, ent_id, type="mentions")
-
-
-        for svo in results["SVO"]:
-            subject_text = svo["subject"]
-
-            if subject_text in resolved_entities:
-                subject_entity = resolved_entities[subject_text]
-                object_text  = svo.get("object")
-
-                if object_text and object_text  in resolved_entities:
-
-                    relations = self.extract_svo(svo)
-                    object_entity = resolved_entities[object_text ]
-
-                    new_fact = AttributeData(
-                        value=object_entity,
-                        message=msg,
-                        confidence_score=0.95)
-
-                    if relations not in subject_entity.attributes:
-                        subject_entity.attributes[relations] = []
-                    
-                    subject_entity.attributes[relations].append(new_fact)
-                    logging.info(f"Created Link: ({subject_entity.name}) -> [{relations}] -> ({object_entity.name})")
-
-                if "prepositional_phrases" in svo:
-                    for preposition in svo["prepositional_phrases"]:
-
-                        try:
-                            _, prep_object_text = preposition.split(' ', 1)
-                        except ValueError:
-                            continue
-
-                        found_object: EntityData = None
-
-                        for entity_name, entity_object in resolved_entities.items():
-                            if entity_name in prep_object_text:
-                                found_object = entity_object
-                                break
-
-                        if found_object:
-                            temp_svo = {"verb": svo["verb"], "prepositional_phrases": [preposition]}
-                            relations = self.extract_svo(temp_svo)
-
-                            new_fact = AttributeData(
-                                value=found_object,
-                                message=msg,
-                                confidence_score=0.95)
-
-                            if relations not in subject_entity.attributes:
-                                subject_entity.attributes[relations] = []
-                            subject_entity.attributes[relations].append(new_fact)
-                            logging.info(f"Created Link (Prep): ({subject_entity.name}) -> [{relations}] -> ({found_object.name})")
-                        
-
-    def add(self, item: Union[str, EntityData]):
+        entities = results["found_entities"]
+        noun_chunks = results["noun_chunks"]
+        for entity in entities:
+            ent_start, ent_end = entity["span"]
+            
+            for chunk in noun_chunks:
+                chunk_start, chunk_end = chunk["span"]
+                if ent_start >= chunk_start and ent_end <= chunk_end and chunk["text"] != entity["text"]:
+                    entity.setdefault("aliases_to_add", []).append(chunk["text"])
+                    break
         
-        if isinstance(item, MessageData):
-            self.process_live_messages(item)
+        resolved_entities = {}
+        for ents in entities:
+            entity = self.ENTITY_RESOLVER.process_entity(ents, msg_id)
+            if entity:
+                resolved_entities[ents["span"]] = entity
+                if entity.id not in self.entities:
+                    self.entities[entity.id] = entity
+
+        actions_to_perform = []
+        for svo in results["SVO"]:
+            subject_entity = self.ENTITY_RESOLVER.find_entity_for_phrase(svo.get("subject"), resolved_entities)
+            if not subject_entity:
+                continue
+            
+            object_entity = None
+            if "object" in svo:
+                object_entity = self.ENTITY_RESOLVER.find_entity_for_phrase(svo.get("object"), resolved_entities)
+                if object_entity:
+                    action = self.FACT_EXTRACTOR.process_svo(svo, subject_entity, object_entity, msg)
+                    actions_to_perform.append(action)
+            
+            if "prepositional_phrases" in svo:
+                for prep_phrase in svo["prepositional_phrases"]:
+                    prep_object_entity: EntityData = self.ENTITY_RESOLVER.find_entity_for_phrase(prep_phrase.get("object"), resolved_entities)
+
+                    if prep_object_entity:
+                        temp_svo = {"verb": svo["verb"], "prepositional_phrases": [prep_phrase]}
+                        action = self.FACT_EXTRACTOR.process_svo(temp_svo, subject_entity, prep_object_entity, msg)
+                        actions_to_perform.append(action) 
+
+        for attr in results["attributes"]:
+            subject_entity = self.ENTITY_RESOLVER.span_to_entity(attr.get("subject", {}).get("span"), resolved_entities)
+            if subject_entity:
+                action = self.FACT_EXTRACTOR.process_attribute(attr, subject_entity, msg)
+                actions_to_perform.append(action)
+
+        self._apply_actions(actions_to_perform)   
         
 
 
