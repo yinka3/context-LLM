@@ -1,13 +1,13 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 @dataclass
 class MessageData:
     id: int
     role: str
     message: str
-    sentiment: str = "unknown"
+    sentiment: str
     timestamp: datetime = field(default_factory=lambda: datetime.now())
     
 
@@ -34,3 +34,12 @@ class EdgeData:
     type: str
     source_messages_id: List[int]
     confidence_score: float
+
+@dataclass
+class Tier2Task:
+    task_id: str
+    message_id: str
+    trigger_reason: str
+    priority: int
+    payload: Dict[str, Any]
+    timestamp: datetime = field(default_factory=lambda: datetime.now())

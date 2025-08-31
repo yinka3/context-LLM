@@ -43,12 +43,6 @@
       "with": "has_possession_of"
     }
   },
-  "know": {
-    "default_relation": "knows",
-    "prepositions": {
-      "about": "knows_about"
-    }
-  },
   "manage": {
     "default_relation": "manages",
     "prepositions": {}
@@ -188,7 +182,16 @@
     "default_relation": "is_located_at",
     "prepositions": {
       "in": "is_located_in",
-      "at": "is_located_at"
+      "at": "is_located_at",
+      "near": "is_located_near"
     }
+  },
+  "know": {
+  "default_relation": "knows",
+  "prepositions": {
+    "about": "knows_about",
+    "of": "knows_of",
+    "how": "knows_how_to"
   }
+}
 }

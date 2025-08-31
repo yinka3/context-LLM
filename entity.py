@@ -1,11 +1,15 @@
 import logging
+import logging_setup
 from typing import Callable, Dict, TYPE_CHECKING, List, Optional, Tuple
-
 from dtypes import EntityData
 
 if TYPE_CHECKING:
     from networkx import DiGraph
     from vectordb import ChromaClient
+
+logging_setup.setup_logging()
+
+logger = logging.getLogger(__name__)
 
 class EntityResolver:
 
@@ -35,6 +39,7 @@ class EntityResolver:
             {'person', 'team'},
             {'project', 'product', 'initiative'},
             {'organization', 'company', 'team'},
+            {'technology', 'product'}
         ]
         
         if type1 == type2:
@@ -64,11 +69,10 @@ class EntityResolver:
         if entity:
             return entity
         
-        logging.info(f"Span lookup failed for '{phrase_data['text']}, switching to semantic search...")
+        logger.info(f"Span lookup failed for '{phrase_data['text']}, switching to semantic search...")
         found_id_str = self.check_chroma(
             text=phrase_data['text'],
-            entity_type=None,
-            threshold=0.5
+            entity_type=None
         )
 
         if found_id_str and self.graph.has_node(found_id_str):
@@ -76,43 +80,73 @@ class EntityResolver:
 
         return None
     
-    def check_chroma(self, text: str, entity_type: Optional[str], threshold: float = 0.3,
-                     n_result: int = 5):
+    def check_chroma(self, text: str, entity_type: Optional[str], 
+                     auto_merge_threshold: float = 0.2,
+                     flag_threshold: float = 0.5,
+                     n_result: int = 5) -> Tuple[Optional[str], Optional[Dict]]:
         
         results = self.chroma.query(text=text, n_results=n_result, node_type="entity")
-        if not results['ids'][0]:
-            return None
+        if not results or not results.get('ids') or not results['ids'][0]:
+            return None, None
 
-        for i, metadata in enumerate(results['metadatas'][0]):
-            if entity_type:
-                existing_type = metadata.get('entity_type')
-                if not self.are_types_compatible(entity_type, existing_type):
-                    continue
-                
-            if results['distances'][0][i] < threshold:
-                return results['ids'][0][i]
+        best_candidate_id = results['ids'][0][0]
+        best_distance = results['distances'][0][0]
+        best_metadata = results['metadatas'][0][0]
+
+        if entity_type:
+            existing_type = best_metadata.get('entity_type')
+            if not self.are_types_compatible(entity_type, existing_type):
+                return None, None
         
-        return None
+        if best_distance < auto_merge_threshold:
+            return best_candidate_id, None
+        elif best_distance < flag_threshold:
+            flag_candidates = []
+            for i, entity_id in enumerate(results['ids'][0]):
+                distance = results['distances'][0][i]
+                if distance < flag_threshold:
+                    flag_candidates.append({
+                        "entity_id": entity_id,
+                        "distance": distance
+                    })
+            
+            return None, {"candidates": flag_candidates}
+        return None, None
 
-    def process_entity(self, entity_data: Dict, msg_id: str) -> EntityData:
+    def process_entity(self, entity_data: Dict, msg_id: str) -> Tuple[EntityData, Optional[Dict]]:
+        payload = None
         if entity_data["text"].lower() in ['i', 'me', 'my', 'myself']:
-            return self.user_entity
+            return self.user_entity, None
         
-        confidence_level = entity_data.get("confidence_level")
+        found_id, flag_data = self.check_chroma(
+            text=entity_data["text"],
+            entity_type=entity_data["type"]
+        )
 
-        if confidence_level == "high":
-            threshold = 0.2
-        else:
-            threshold = 0.4
         
-        found_id = self.check_chroma(text=entity_data["text"], 
-                                     threshold=threshold,
-                                     entity_type=entity_data["type"])
-        
-        if not found_id:
-            return self.create_entity(entity_data, msg_id)
+        if found_id:
+            entity = self.merge_entity_data(found_id, entity_data, msg_id)
+        elif flag_data:
+            entity = self.create_entity(entity_data, msg_id)
+
+            candidate_details = []
+            for cand in flag_data["candidates"]:
+                node_data = self.graph.nodes[cand["entity_id"]]["data"]
+                candidate_details.append({
+                    "id": cand["entity_id"],
+                    "name": node_data.name,
+                    "type": node_data.type,
+                    "distance": cand["distance"]
+                })
+            
+            payload = {
+                "new_entity": {"id": f"ent_{entity.id}", "name": entity.name},
+                "candidates": candidate_details
+            }
         else:
-            return self.merge_entity_data(found_id, entity_data, msg_id)
+            entity = self.create_entity(entity_data, msg_id)
+        
+        return entity, payload
     
     def create_entity(self, entity_data: Dict, msg_id: str):
         new_ent = EntityData(
@@ -145,7 +179,7 @@ class EntityResolver:
             type="mentions",
             confidence=new_ent.confidence)
         
-        logging.info(f"Created new entity: {new_ent.name} (type: {new_ent.type})")
+        logger.info(f"Created new entity: {new_ent.name} (type: {new_ent.type})")
         return new_ent
             
     def merge_entity_data(self, existing_id: str, new_entity_data: Dict, msg_id: str):
@@ -180,5 +214,5 @@ class EntityResolver:
             confidence=existing_ent.confidence
         )
 
-        logging.info(f"Merged entity: {existing_ent.name} with alias: {new_text}")
+        logger.info(f"Merged entity: {existing_ent.name} with alias: {new_text}")
         return existing_ent

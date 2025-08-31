@@ -2,9 +2,12 @@ from typing import List, Union
 import chromadb
 from chromadb.api.models.Collection import Collection
 import logging
+import logging_setup
 import json
-
 from dtypes import EntityData, MessageData
+
+logging_setup.setup_logging()
+logger = logging.getLogger(__name__)
 
 class ChromaClient:
 
@@ -14,7 +17,7 @@ class ChromaClient:
         self.collection: Collection = self.client.get_or_create_collection(name="llm-memory", 
                                                                            metadata={"hnsw:space": "cosine"})
 
-        logging.info("Chroma client initialized")
+        logger.info("Chroma client initialized")
     
     def get_item(self, item: Union[int, List], include: List[str] = ["embeddings", "metadatas", "documents"]):
         
