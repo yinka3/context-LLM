@@ -6,7 +6,6 @@ import logging_setup
 import json
 from dtypes import EntityData, MessageData
 
-logging_setup.setup_logging()
 logger = logging.getLogger(__name__)
 
 class ChromaClient:

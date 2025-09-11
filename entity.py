@@ -7,7 +7,6 @@ if TYPE_CHECKING:
     from networkx import DiGraph
     from vectordb import ChromaClient
 
-logging_setup.setup_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +36,8 @@ class EntityResolver:
     def are_types_compatible(self, type1: str, type2: str):
         compatible_groups = [
             {'person', 'team'},
-            {'project', 'product', 'initiative'},
-            {'organization', 'company', 'team'},
-            {'technology', 'product'}
+            {'project', 'product', 'initiative', 'technology'},
+            {'organization', 'company', 'team', 'product'}
         ]
         
         if type1 == type2:
@@ -69,14 +67,16 @@ class EntityResolver:
         if entity:
             return entity
         
-        logger.info(f"Span lookup failed for '{phrase_data['text']}, switching to semantic search...")
+        logger.warning(f"Span lookup failed for '{phrase_data['text']}, switching to semantic search...")
         found_id_str = self.check_chroma(
             text=phrase_data['text'],
             entity_type=None
         )
 
         if found_id_str and self.graph.has_node(found_id_str):
-            return self.graph[found_id_str]["data"]
+            res = self.graph[found_id_str]["data"]
+            logger.info(f"Semantic search results: {res}")
+            return res
 
         return None
     
@@ -185,7 +185,12 @@ class EntityResolver:
     def merge_entity_data(self, existing_id: str, new_entity_data: Dict, msg_id: str):
         existing_ent: EntityData = self.graph.nodes[existing_id]['data']
 
-        new_text = new_entity_data["text"]
+        new_text: str = new_entity_data["text"]
+
+        if existing_ent.name.lower() == new_text.lower():
+            logger.info("Entity already exsits.")
+            return existing_ent
+
         if not any(alias["text"] == new_text for alias in existing_ent.aliases):
             existing_ent.aliases.append({
                 "text": new_text,
