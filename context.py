@@ -4,7 +4,7 @@ import logging_setup
 import json
 import os
 from redisclient import RedisClient
-from typing import Dict, List
+from typing import Dict, List, Optional
 from networkx import DiGraph
 from entity import EntityResolver
 from nlp_pipe import NLP_PIPE
@@ -62,73 +62,15 @@ class Context:
         if item.role == "user":
             self.user_message_cnt += 1
         self.process_live_messages(item)
-    
 
-    def process_live_messages(self, msg: MessageData):
-        
-        msg_id = f"msg_{msg.id}"
-        self.graph.add_node(msg_id, data=msg, type="message")
+    def process_verbs(self, msg: MessageData, message_verbs: List):
+        pass
 
-        results = self.nlp_pipe.start_process(msg=msg, entity_threshold=0.7)
+    def process_adjectives(self, msg: MessageData, message_adjectives: List):
+        pass
 
-        self.redis_client.client.lpush(f'conversation:{self.user_name}', json.dumps({
-            'message': msg.message,
-            'timestamp': msg.timestamp.isoformat(),
-            'role': msg.role
-        }))
-
-        self.redis_client.client.ltrim(f'conversation:{self.user_name}', 0, 49) # might removed this but enforce through UI to keep a limit for a conversation session.
-        self.redis_client.client.expire(f'conversation:{self.user_name}', 86400)
-
-
-        if results.get("tier2_flags"):
-            for flag in results["tier2_flags"]:
-                logger.warning(f"Received Tier 2 flag from NLP_PIPE. Reason: {flag['reason']}")
-        
-        primary_emotion = max(results["emotion"], key=lambda x: x['score'])
-        msg.sentiment = primary_emotion['label']
-
-        entities = results["high_confidence_entities"]        
-        resolved_entities = {}
-        for ents in entities:
-            entity, tier2_payload = self.ENTITY_RESOLVER.process_entity(ents, msg_id)
-            
-            if tier2_payload:
-                conflicting_entity_name = tier2_payload.get('candidates', [{}])[0].get('name', 'N/A')
-
-                logger.warning(f"""Flagged for Tier 2: Potential merge conflict between new entity 
-                                '{tier2_payload['new_entity']['name']}' and existing entity '{conflicting_entity_name}'.
-                                Message: {msg.message} | Payload Info: {tier2_payload} \n""")
-
-            if entity:
-                resolved_entities[ents["span"]] = entity
-                if entity.id not in self.entities:
-                    self.entities[entity.id] = entity
-        
-        logger.info("Starting noun chunk candidate analysis...")
-
-        for ent_span, entity in resolved_entities.items():
-            ent_start, ent_end = ent_span
-
-            for chunk in results["noun_chunks"]:
-                chunk_start, chunk_end = chunk["span"]
-
-                if ent_start >= chunk_start and ent_end <= chunk_end:
-                    new_alias_text = chunk["text"]
-                    is_main_name = entity.name.lower() == new_alias_text.lower()
-                    is_existing_alias = any(alias["text"].lower() == new_alias_text.lower() for alias in entity.aliases)
-
-                    if not is_main_name and not is_existing_alias:
-                        entity.aliases.append({
-                            "text": new_alias_text,
-                            "type": "noun_chunk_alias"
-                        })
-                        logger.info(f"Enriched entity '{entity.name}' with new alias from noun chunk: '{new_alias_text}'")
-                        break 
-
-        coref_mention_map = {}
-        if results.get("coref_clusters"):
-            for cluster in results["coref_clusters"]:
+    def process_coref_clusters(self, msg: MessageData, message_corefs: List, coref_mention_map: Dict, resolved_entities: Dict):
+        for cluster in message_corefs:
                 
                 main_mention_span = cluster.main.start_char, cluster.main.end_char
                 
@@ -190,8 +132,86 @@ class Context:
                     
                     mention_span = (mention.start_char, mention.end_char)
                     coref_mention_map[mention_span] = main_entity
-                    logger.info(f"Coreference: Mapped '{mention.text}' to entity '{main_entity.name}'")
+                    logger.info(f"Coreference: Mapped '{mention.text}' to entity '{main_entity.name}'")    
 
+
+    def process_live_messages(self, msg: MessageData):
+        
+        msg_id = f"msg_{msg.id}"
+        self.graph.add_node(msg_id, data=msg, type="message")
+
+        results = self.nlp_pipe.start_process(msg=msg, entity_threshold=0.7)
+
+        self.redis_client.client.lpush(f'conversation:{self.user_name}', json.dumps({
+            'message': msg.message,
+            'timestamp': msg.timestamp.isoformat(),
+            'role': msg.role
+        }))
+
+
+        self.redis_client.client.ltrim(f'conversation:{self.user_name}', 0, 49) # might removed this but enforce through UI to keep a limit for a conversation session.
+        self.redis_client.client.expire(f'conversation:{self.user_name}', 86400)
+
+
+        if results.get("tier2_flags") != []:
+            for flag in results["tier2_flags"]:
+                logger.warning(f"Received Tier 2 flag from NLP_PIPE. Reason: {flag['reason']}")
+            return
+        
+        if results.get("high_confidence_entites") == []:
+            logging.info("Need entities")
+            return
+        
+        primary_emotion = max(results["emotion"], key=lambda x: x['score'])
+        msg.sentiment = primary_emotion['label']
+
+        entities = results["high_confidence_entities"]        
+        resolved_entities = {}
+        for ents in entities:
+            entity, tier2_payload = self.ENTITY_RESOLVER.process_entity(ents, msg_id)
+            
+            if tier2_payload:
+                conflicting_entity_name = tier2_payload.get('candidates', [{}])[0].get('name', 'N/A')
+
+                logger.warning(f"""Flagged for Tier 2: Potential merge conflict between new entity 
+                                '{tier2_payload['new_entity']['name']}' and existing entity '{conflicting_entity_name}'.
+                                Message: {msg.message} | Payload Info: {tier2_payload} \n""")
+
+            if entity:
+                resolved_entities[ents["span"]] = entity
+                if entity.id not in self.entities:
+                    self.entities[entity.id] = entity
+        
+        logger.info("Starting noun chunk candidate analysis...")
+
+        for ent_span, entity in resolved_entities.items():
+            ent_start, ent_end = ent_span
+
+            for chunk in results["noun_chunks"]:
+                chunk_start, chunk_end = chunk["span"]
+
+                if ent_start >= chunk_start and ent_end <= chunk_end:
+                    new_alias_text = chunk["text"]
+                    is_main_name = entity.name.lower() == new_alias_text.lower()
+                    is_existing_alias = any(alias["text"].lower() == new_alias_text.lower() for alias in entity.aliases)
+
+                    if not is_main_name and not is_existing_alias:
+                        entity.aliases.append({
+                            "text": new_alias_text,
+                            "type": "noun_chunk_alias"
+                        })
+                        logger.info(f"Enriched entity '{entity.name}' with new alias from noun chunk: '{new_alias_text}'")
+                        break 
+
+        
+        if results.get("coref_clusters") != []:
+            self.process_coref_clusters(msg=msg, message_corefs=results["coref_clusters"])
+        
+        if results.get("verbs") != []:
+            self.process_verbs(msg=msg, message_verbs=results["verbs"])
+        
+        if results.get("adjectives") != []:
+            self.process_adjectives(msg=msg, message_adjectives=results["adjectives"])
 
 
 
