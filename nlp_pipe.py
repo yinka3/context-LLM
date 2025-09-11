@@ -37,9 +37,9 @@ class NLP_PIPE:
             "FIELD_OF_STUDY", "FEELING", "STRESSOR"
         }
         
-        gliner_labels = [label.replace("_", " ").lower() for label in self.CANONICAL_LABELS]
-        self.label_map = {gl_label: can_label for gl_label, can_label in zip(gliner_labels, self.CANONICAL_LABELS)}
-        logger.info(f"Unified entity labels configured for {len(self.CANONICAL_LABELS)} types.")
+        self.gliner_labels = [label.replace("_", " ").lower() for label in self.CANONICAL_LABELS]
+        self.label_map = {gl_label: can_label for gl_label, can_label in zip(self.gliner_labels, self.CANONICAL_LABELS)}
+        logger.info(f"Entity labels configured for {len(self.CANONICAL_LABELS)} types.")
 
         try:
             if torch.cuda.is_available():
@@ -63,23 +63,6 @@ class NLP_PIPE:
             logger.info(f"Emotion classifier ({model_name}) loaded successfully.")
         except Exception as e:
             logger.error(f"Emotion classifier could not be initialized: {e}")
-            raise
-
-        self.dependency_matcher = DependencyMatcher(self.spacy.vocab, validate=True)
-        self.dependency_patterns = {}
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            pattern_path = os.path.join(script_dir, "matcher.json")
-            with open(pattern_path) as f:
-                self.dependency_patterns = json.load(f)
-            
-            for pattern_name, pattern_list in self.dependency_patterns.items():
-                self.dependency_matcher.add(pattern_name, pattern_list)
-            
-            logger.info(f"Successfully loaded and added {len(self.dependency_patterns)} patterns.")
-
-        except Exception as e:
-            logger.error(f"Error loading or adding matcher patterns: {e}")
             raise
 
 
@@ -109,6 +92,31 @@ class NLP_PIPE:
                 last_end = ent['end']
 
         return filtered
+    
+    def _build_verb_tree(self, verb_token: Token) -> Dict:
+        """
+        Recursively builds a nested dictionary for a verb and its related actions.
+        """
+        # Base structure for the current verb
+        verb_data = {
+            "text": verb_token.text,
+            "lemma": verb_token.lemma_,
+            "relation": verb_token.dep_,
+            "sub_actions": [],
+            "conjoined_actions": []
+        }
+
+        # Find children that are also verbs and part of a related action
+        for child in verb_token.children:
+            if child.pos_ == "VERB":
+                # Verbs in sub-clauses (e.g., "decided TO RUN")
+                if child.dep_ in ("xcomp", "ccomp"):
+                    verb_data["sub_actions"].append(self._build_verb_tree(child))
+                # Conjoined verbs (e.g., "ran AND JUMPED")
+                elif child.dep_ == "conj":
+                    verb_data["conjoined_actions"].append(self._build_verb_tree(child))
+
+        return verb_data
 
     
     def start_process(self, msg: MessageData, 
@@ -142,12 +150,12 @@ class NLP_PIPE:
             logger.warning(f"Flagged for Tier 2: Message too long: {len(msg.message)} chars | Payload Info: {payload} \n")
             return res # we will now ship this off to tier 2 also
         
-        entities = self.gliner.predict_entities(text=msg.message, labels=self.CANONICAL_LABELS)
+        entities = self.gliner.predict_entities(text=msg.message, labels=self.gliner_labels)
         entities = self.deduplicate_entities(entities)
 
         for ent in entities:
             ent_data = {
-                "text": ent["text"], "type": ent["label"],
+                "text": ent["text"], "type": self.label_map.get(ent["label"], "MISC"),
                 "confidence": ent['score'], "span": (ent["start"], ent["end"])
             }
 
@@ -179,213 +187,46 @@ class NLP_PIPE:
 
         res["coref_clusters"] = coref_clusters
 
-        entities = res["high_confidence_entities"]
-        for chunk in doc.noun_chunks:
-            for ent in entities:
-                if ent in chunk.text:
-                    ent = chunk.text
-            else:
-                res["noun_chunks"].append({
-                    "text": chunk.text, "span": (chunk.start_char, chunk.end_char), "root_pos": chunk.root.pos_
-                })
-        
-        for tok in doc:
-
-            if tok.dep_ == "ROOT":
-                span = (tok.idx, tok.idx + len(tok.text))
-                res["verbs"].append({
-                    "text": tok.text, "span": span, "token_dep": "ROOT"
-                })
+        high_conf_entities = res["high_confidence_entities"]
+        noun_chunks = [(chunk.text, chunk.start_char, chunk.end_char) for chunk in doc.noun_chunks]
+        for i, entity in enumerate(high_conf_entities):
+            ent_start, ent_end = entity["span"]
             
-            # do the rest
+            for chunk_text, chunk_start, chunk_end in noun_chunks:
+                if ent_start >= chunk_start and ent_end <= chunk_end:
+                    high_conf_entities[i]["text"] = chunk_text
+                    high_conf_entities[i]["span"] = (chunk_start, chunk_end)
+                    break 
 
+        for sentence in doc.sents:
+            root_verb = sentence.root
+            # ensure the root of the sentence is a verb before processing
+            if root_verb.pos_ == "VERB":
+                verb_tree = self._build_verb_tree(root_verb)
+                res["verbs"].append(verb_tree)
+
+        for token in doc:
+            if token.pos_ == "ADJ":
+                    described_noun = None
+                    if token.dep_ == "amod":
+                        described_noun = token.head
+                    elif token.dep_ == "acomp":
+                        verb_head = token.head
+                        subjects = [child for child in verb_head.children if child.dep_ in ("nsubj", "nsubjpass")]
+                        if subjects:
+                            described_noun = subjects[0]
+                    elif token.dep_ == "oprd":
+                        verb_head = token.head
+                        objects = [child for child in verb_head.children if child.dep_ == "dobj"]
+                        if objects:
+                            described_noun = objects[0]
+
+                    if described_noun:
+                        res["adjectives"].append({
+                            "text": token.text,
+                            "lemma": token.lemma_,
+                            "span": (token.idx, token.idx + len(token.text)),
+                            "describes_text": described_noun.text,
+                            "describes_lemma": described_noun.lemma_
+                        })
         return res
-
-        
-
-        
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        # high_conf_count = len(res['high_confidence_entities'])
-        # low_conf_count = len(res['low_confidence_entities'])
-        
-        # coref_count = len(res["coref_clusters"])
-        # dep_match_count = len(res["dependency_matches"])
-        # complexity_data = self.calculate_complexity_score(doc, high_conf_count, 
-        #                                                   low_conf_count, coref_count, dep_match_count)
-        
-        # should_escalate, reason = self.should_escalate_to_tier2(
-        #     complexity_data, msg_length, msg.message)
-
-        # if should_escalate:
-        #     payload = {
-        #         "original_text": msg.message,
-        #         "reason_details": complexity_data,
-        #         "escalation_reason": reason,
-        #         "message_length": msg_length,
-        #         "complexity_score": complexity_data["score"]
-        #     }
-        #     res["tier2_flags"].append({
-        #         "reason": "HIGH_SENTENCE_COMPLEXITY",
-        #         "priority": 6,
-        #         "payload": payload
-        #     })
-        #     logger.info(f"""Recommended Tier 2 review for high complexity: {complexity_data['score']:.2f}
-        #                     Message: {msg.message} | Payload Info: {payload} \n""")
-
-
-
-    # def non_projective_deps(self, doc: Doc):
-    #     crossing_pairs = set()
-    #     tokens = list(doc)
-    #     for i, token in enumerate(tokens):
-    #         if token.head == token: continue
-    #         for j, other in enumerate(tokens[i+1:], i+1):
-    #             if other.head == other or i == j: continue
-
-    #             arc1 = sorted([i, token.head.i])
-    #             arc2 = sorted([j, other.head.i])
-            
-    #             if (arc1[0] < arc2[0] < arc1[1] < arc2[1] or 
-    #                 arc2[0] < arc1[0] < arc2[1] < arc1[1]):
-    #                 crossing_pairs.add(tuple(sorted([i, j])))
-
-    #     return len(crossing_pairs)
-    
-    # def calculate_long_distance_deps(self, doc: Doc):
-    #     long_distance_count = 0
-    #     threshold = 7
-        
-    #     for token in doc:
-    #         if token.head != token:
-    #             distance = abs(token.i - token.head.i)
-    #             if distance >= threshold:
-    #                 long_distance_count += 1
-    #     return long_distance_count
-    
-    # def calculate_density_factor(self, doc: Doc):
-    #     total_deps = sum(1 for token in doc if token.head != token)
-    #     total_tokens = len([t for t in doc if not t.is_space])
-    #     return total_deps / total_tokens if total_tokens > 0 else 0
-    
-    # def max_depth(self, root_token: Token):
-
-    #     if not len(list(root_token.children)):
-    #         return 1
-        
-    #     return max(self.max_depth(child) for child in root_token.children) + 1
-        
-
-    # def calculate_complexity_score(self, doc: Doc, 
-    #                                high_conf_count: int, low_conf_count: int,
-    #                                coref_count: int, dep_match_count: int):
-    #     sub_clauses = 0
-    #     max_depth = 0
-    #     conjunctions = 0
-
-    #     subordinate_deps = {"mark", "csubj", "acl", "acl:relcl", "advcl", "ccomp", "xcomp"}
-
-    #     w_uncertain_entities = 1.0 
-    #     w_sub_clauses = 2.0
-    #     w_depth = 1.0
-    #     w_conjunctions = 0.75
-    #     w_coref_clusters = 1.25
-    #     w_dependency_matches = 0.25
-    #     w_long_distance = 1.25
-    #     w_non_projective = 2.5
-
-    #     for sent in doc.sents:
-    #         for token in sent:
-    #             if token.dep_ in subordinate_deps:
-    #                 sub_clauses += 1
-                
-    #             if token.dep_ == "cc":
-    #                 conjunctions += 1
-
-    #         root_token = sent.root
-    #         max_depth = max(max_depth, self.max_depth(root_token))
-        
-    #     norm_depth = math.log(max_depth + 1) / math.log(2)
-    #     uncertainty_score = low_conf_count - high_conf_count
-    #     token_distance = self.calculate_long_distance_deps(doc=doc)
-    #     density = self.calculate_density_factor(doc=doc)
-    #     non_proj = self.non_projective_deps(doc=doc)
-    #     score: float = (
-    #         (w_non_projective * non_proj) +
-    #         (w_long_distance * token_distance * density) +
-    #         (w_uncertain_entities * uncertainty_score) +
-    #         (w_sub_clauses * sub_clauses) +
-    #         (w_depth * norm_depth) +
-    #         (w_conjunctions * conjunctions) +
-    #         (w_coref_clusters * coref_count) +
-    #         (w_dependency_matches * dep_match_count)
-    #     )
-
-    #     result: Dict[str, Union[int, float]] = {
-    #         "score": score,
-    #         "sub_clauses": sub_clauses,
-    #         "max_depth": norm_depth,
-    #         "conjunctions": conjunctions,
-    #         "high_conf_count": high_conf_count,
-    #         "low_conf_count": low_conf_count,
-    #         "coref_count": coref_count,
-    #         "dep_match_count": dep_match_count,
-    #         "non_projective": non_proj,
-    #         "token_distances": token_distance
-    #     }
-        
-    #     return result
-
-    # def get_live_complexity_threshold(self, msg_length):
-    #     """Dynamic threshold based on message characteristics"""
-
-    #     # Base thresholds for different message types
-    #     if msg_length <= 20:
-    #         return 3.0
-    #     elif msg_length <= 50:
-    #         return 9.0
-    #     elif msg_length <= 150:
-    #         return 12.0
-    #     elif msg_length <= 300:
-    #         return 18.0
-    #     else:
-    #         return 25.0
-    
-
-    # def should_escalate_to_tier2(self, complexity_data, msg_length, msg_text):
-    #     """Hard rules for chatbot complexity"""
-        
-    #     if complexity_data["non_projective"] >= 1:
-    #         return True, "Non-projective dependencies detected"
-        
-    #     if complexity_data["token_distances"] >= 8:
-    #         return True, "Long-distance dependencies too complex"
-        
-    #     if complexity_data["sub_clauses"] >= 4:
-    #         return True, "Multiple nested clauses"
-        
-    #     if msg_length < 100 and complexity_data["score"] > 10:
-    #         return True, "High complexity density - user may be struggling"
-        
-    #     threshold = self.get_live_complexity_threshold(msg_length)
-    #     if complexity_data["score"] > threshold:
-    #         return True, f"Complexity score {complexity_data['score']:.1f} > threshold {threshold}"
-        
-    #     return False, "Acceptable complexity"
-
-
