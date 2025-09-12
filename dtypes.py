@@ -9,14 +9,8 @@ class MessageData:
     message: str
     sentiment: str
     timestamp: datetime = field(default_factory=lambda: datetime.now())
+    bridges: List['BridgeData'] = field(default_factory=list)
     
-
-@dataclass(frozen=True)
-class AttributeData:
-    value: Union[str, 'EntityData']
-    message: MessageData
-    confidence_score: float
-    mentioned_in: List[Tuple] = field(default_factory=list)
 
 @dataclass
 class EntityData:
@@ -25,15 +19,17 @@ class EntityData:
     type: str
     aliases: List[Dict[str, str]] = field(default_factory=list)
     confidence: float = 1.0
-    attributes: Dict[str, List[AttributeData]] = field(default_factory=dict)
     mentioned_in: List[int] = field(default_factory=list)
 
+@dataclass(frozen=True)
+class BridgeData:
+    type: str
+    value: Union[EntityData, str]
 
 @dataclass
 class EdgeData:
-    type: str
-    source_messages_id: List[int]
-    confidence_score: float
+    messages: Tuple[int, int]
+    bridge: BridgeData
 
 @dataclass
 class Tier2Task:

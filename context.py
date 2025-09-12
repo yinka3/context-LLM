@@ -4,11 +4,11 @@ import logging_setup
 import json
 import os
 from redisclient import RedisClient
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from networkx import DiGraph
 from entity import EntityResolver
 from nlp_pipe import NLP_PIPE
-from dtypes import AttributeData, EntityData, MessageData
+from dtypes import AttributeData, BridgeData, EdgeData, EntityData, MessageData
 from vectordb import ChromaClient
 from spacy.tokens import Token
 
@@ -28,6 +28,7 @@ class Context:
         self.chroma: ChromaClient = ChromaClient()
         self.redis_client = RedisClient()
         self.user_message_cnt: int = 0
+        self.bridge_map: Dict[str, Dict[Any, List[int]]] = {}
 
         self.user_entity = self._create_user_entity(user_name)
 
@@ -63,11 +64,45 @@ class Context:
             self.user_message_cnt += 1
         self.process_live_messages(item)
 
-    def process_verbs(self, msg: MessageData, message_verbs: List):
+    def process_verbs(self, msg: MessageData, message_verbs: List, resolved_entites: Dict):
         pass
 
     def process_adjectives(self, msg: MessageData, message_adjectives: List):
-        pass
+        adj_only_index = self.bridge_map.setdefault("shared_adjective", {})
+        adj_noun_index = self.bridge_map.setdefault("shared_adjective_concept", {})
+
+        for adj_data in message_adjectives:
+            adj_lemma = adj_data["lemma"]
+            noun_lemma = adj_data.get("describes_lemma")
+
+            if adj_lemma in adj_only_index:
+                for prev_msg_id in adj_only_index[adj_lemma]:
+                    if msg.id == prev_msg_id: continue
+                    
+                    bridge = BridgeData(type="shared_adjective", value=adj_lemma)
+                    edge = EdgeData(messages=(msg.id, prev_msg_id), bridge=bridge)
+                    self.graph.add_edge(f"msg_{msg.id}", f"msg_{prev_msg_id}", data=edge)
+                    logger.info(f"Bridged msg {msg.id} and msg {prev_msg_id} via adjective: '{adj_lemma}'")
+        
+            if msg.id not in adj_only_index.setdefault(adj_lemma, []):
+                adj_only_index[adj_lemma].append(msg.id)
+
+            if noun_lemma:
+                key = (adj_lemma, noun_lemma)
+                
+                if key in adj_noun_index:
+                    for prev_msg_id in adj_noun_index[key]:
+                        if msg.id == prev_msg_id: continue
+
+                        bridge_value = f"{adj_lemma} {noun_lemma}"
+                        bridge = BridgeData(type="shared_adjective_concept", value=bridge_value)
+                        edge = EdgeData(messages=(msg.id, prev_msg_id), bridge=bridge)
+                        
+                        self.graph.add_edge(f"msg_{msg.id}", f"msg_{prev_msg_id}", data=edge)
+                        logger.info(f"Bridged msg {msg.id} and msg {prev_msg_id} via concept: '{bridge_value}'")
+
+                if msg.id not in adj_noun_index.setdefault(key, []):
+                    adj_noun_index[key].append(msg.id)
 
     def process_coref_clusters(self, msg: MessageData, message_corefs: List, coref_mention_map: Dict, resolved_entities: Dict):
         for cluster in message_corefs:
