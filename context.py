@@ -64,8 +64,55 @@ class Context:
             self.user_message_cnt += 1
         self.process_live_messages(item)
 
-    def process_verbs(self, msg: MessageData, message_verbs: List, resolved_entites: Dict):
-        pass
+    def process_verbs(self, msg: MessageData, message_verbs: List):
+
+
+        def _extract_bridges(verb_node: Dict, extracted_bridges: set):
+            verb_lemma = verb_node.get("lemma")
+            subjects_list = verb_node.get("subjects", [])
+            objects_list = verb_node.get("objects", [])
+            indirect_objects_list = verb_node.get("indirect_objects", [])
+
+            if verb_lemma:
+                extracted_bridges.add(("verbs", verb_lemma))
+        
+                for subject in subjects_list:
+                    if subject.get("lemma"):
+                        extracted_bridges.add(("subject_verb", (subject["lemma"], verb_lemma)))
+                
+                for obj in objects_list:
+                    if obj.get("lemma"):
+                        extracted_bridges.add(("verb_object", (verb_lemma, obj["lemma"])))
+                
+                for ind_obj in indirect_objects_list:
+                    if ind_obj.get("lemma"):
+                        extracted_bridges.add(("verb_indirect_object", (verb_lemma, ind_obj["lemma"])))
+            
+            for sub_action in verb_node.get("sub_actions", []):
+                _extract_bridges(sub_action, extracted_bridges)
+            for conjoined_action in verb_node.get("conjoined_actions", []):
+                _extract_bridges(conjoined_action, extracted_bridges)
+
+        all_bridges_in_message = set()
+        for verb_tree in message_verbs:
+            _extract_bridges(verb_tree, all_bridges_in_message)
+        
+        for bridge_type, bridge_key in all_bridges_in_message:
+
+            index = self.bridge_map.setdefault(bridge_type, {})
+
+            if bridge_key in index:
+                for prev_msg_id in index[bridge_key]:
+                    if msg.id == prev_msg_id: continue
+
+                    bridge = BridgeData(type=bridge_type, value=str(bridge_key))
+                    edge = EdgeData(messages=(msg.id, prev_msg_id), bridge=bridge)
+                    self.graph.add_edge(f"msg_{msg.id}", f"msg_{prev_msg_id}", data=edge)
+                    logger.info(f"Bridged msg {msg.id} and msg {prev_msg_id} via {bridge_type}: '{bridge_key}'")
+
+            if msg.id not in index.setdefault(bridge_key, []):
+                index[bridge_key].append(msg.id)
+
 
     def process_adjectives(self, msg: MessageData, message_adjectives: List):
         adj_only_index = self.bridge_map.setdefault("shared_adjective", {})
@@ -103,6 +150,28 @@ class Context:
 
                 if msg.id not in adj_noun_index.setdefault(key, []):
                     adj_noun_index[key].append(msg.id)
+    
+    def process_entities(self, msg: MessageData, entities: List[EntityData]):
+        entity_index = self.bridge_map.setdefault("shared_entity", {})
+
+        for entity_obj in entities:
+            entity_id = entity_obj.id
+
+            if entity_id in entity_index:
+                previous_message_ids = entity_index[entity_id]
+                
+                for prev_msg_id in previous_message_ids:
+                    if msg.id == prev_msg_id:
+                        continue
+
+                    bridge = BridgeData(type="shared_entity", value=entity_obj)
+                    edge = EdgeData(messages=(msg.id, prev_msg_id), bridge=bridge)
+                    
+                    self.graph.add_edge(f"msg_{msg.id}", f"msg_{prev_msg_id}", data=edge)
+                    logger.info(f"Bridged msg {msg.id} and msg {prev_msg_id} via entity: '{entity_obj.name}'")
+
+            if msg.id not in entity_index.setdefault(entity_id, []):
+                entity_index[entity_id].append(msg.id)
 
     def process_coref_clusters(self, msg: MessageData, message_corefs: List, coref_mention_map: Dict, resolved_entities: Dict):
         for cluster in message_corefs:
@@ -238,7 +307,8 @@ class Context:
                         logger.info(f"Enriched entity '{entity.name}' with new alias from noun chunk: '{new_alias_text}'")
                         break 
 
-        
+        self.process_entities(msg=msg, entities=resolved_entities.values())
+
         if results.get("coref_clusters") != []:
             self.process_coref_clusters(msg=msg, message_corefs=results["coref_clusters"])
         
@@ -248,80 +318,5 @@ class Context:
         if results.get("adjectives") != []:
             self.process_adjectives(msg=msg, message_adjectives=results["adjectives"])
 
-
-
-
-
-
-    # def flag_and_apply(self, actions: List[Dict], msg: MessageData, threshold: 0.75):
-    #     """
-    #     Applies high-confidence actions directly and flags low-confidence ones for Tier 2.
-    #     """
-    #     for action in actions:
-    #         if not action:
-    #             continue
-
-    #         confidence = action["new_fact" if "new_fact" in action else "new_attribute"].confidence_score
-
-    #         if confidence >= threshold:
-    #             self._apply_state_action(action)
-    #         else:
-    #             subject_id = action.get("subject_id")
-    #             subject_entity: EntityData = self.graph.nodes[subject_id]["data"]
-
-    #             payload = {
-    #                 "text": msg.message,
-    #                 "action_details": action,
-    #                 "entity_name": subject_entity.name
-    #             }
-
-    #             # a function that sends the payload dict off to tier 2, in that function we will create a Tier2Task data obj
-    #             logger.warning(f"""Flagged for Tier 2: 
-    #                             Low confidence fact ({confidence:.2f}) for entity '{subject_entity.name}'. 
-    #                             Action not applied for message: {msg.message}. | Payload Info: {payload}""")
-
-    # def _apply_state_action(self, action: Dict):
-    #     """Applies a state change returned by the FactExtractor."""
-    #     subject_id_str = action.get("subject_id")
-    #     if not subject_id_str or not self.graph.has_node(subject_id_str):
-    #         return
-        
-    #     subject_entity: EntityData = self.graph.nodes[subject_id_str]['data']
-
-    #     if action["action"] == "add_fact":
-    #         new_fact: AttributeData = action["new_fact"]
-    #         target_entity: EntityData = new_fact.value
-    #         target_id_str = f"ent_{target_entity.id}"
-
-    #         if not self.graph.has_node(target_id_str):
-    #             logger.error(f"APPLY FACT FAILED: Target entity '{target_entity.name}' (ID: {target_id_str}) was not found in the graph before creating edge.")
-    #             return
-
-    #         if not self.graph.has_node(target_id_str): return
-
-    #         edge_attributes = {
-    #             "relation": action["relation"],
-    #             "confidence": new_fact.confidence_score,
-    #             "message_id": f"msg_{new_fact.message.id}"
-    #         }
-
-    #         if "source_entity_id" in action:
-    #             edge_attributes["source_id"] = action["source_entity_id"]
-            
-    #         self.graph.add_edge(subject_id_str, target_id_str, **edge_attributes)
-    #         logger.info(f"Applied Fact Edge: ({subject_entity.name}) -> [{action['relation']}] -> ({target_entity.name})")
-
-    #     elif action["action"] == "add_attribute":
-    #         key = action["attribute_key"]
-    #         new_attribute = action["new_attribute"]
-    #         if key not in subject_entity.attributes:
-    #             subject_entity.attributes[key] = []
-    #         subject_entity.attributes[key].append(new_attribute)
-
-    #         if new_attribute.value.lower() in subject_entity.name.lower():
-    #             logger.info(f"Attribute is within subject entity")
-    #             return
-
-    #         logger.info(f"Applied Attribute: ({subject_entity.name}) -> [{key}] -> ({new_attribute.value})")
 
     

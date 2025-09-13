@@ -6,7 +6,7 @@ import torch
 from gliner import GLiNER
 from spacy.tokens import Doc, Token, SpanGroup
 from dtypes import MessageData
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 import logging
 from transformers import pipeline
 from spacy.matcher import DependencyMatcher
@@ -27,6 +27,15 @@ class NLP_PIPE:
             logger.info("spaCy transformer pipeline with fastcoref loaded successfully.")
         except Exception as e:
             logger.error(f"Could not load spaCy model or fastcoref: {e}")
+            raise
+        
+        self.PREPOSITIONAL_VERB_PAIRS = set()
+        try:
+            with open('verb_prep.json') as f:
+                self.PREPOSITIONAL_VERB_PAIRS = {tuple(pair) for pair in json.load(f)}
+            logger.info(f"Loaded {len(self.PREPOSITIONAL_VERB_PAIRS)} prepositional verb pairs.")
+        except Exception as e:
+            logger.error(f"Could not load verb_prep.json: {e}")
             raise
             
         self.CANONICAL_LABELS = {
@@ -93,7 +102,7 @@ class NLP_PIPE:
 
         return filtered
     
-    def _build_verb_tree(self, verb_token: Token) -> Dict:
+    def _build_verb_tree(self, verb_token: Token, inherited_subject: Optional[Token] = None) -> Dict:
         """
         Recursively builds a nested dictionary for a verb and its related actions.
         """
@@ -102,19 +111,72 @@ class NLP_PIPE:
             "text": verb_token.text,
             "lemma": verb_token.lemma_,
             "relation": verb_token.dep_,
+            "subjects": [],
+            "objects": [],
+            "indirect_objects": [],
             "sub_actions": [],
             "conjoined_actions": []
         }
 
-        # Find children that are also verbs and part of a related action
+        subject_head_token = None
+
         for child in verb_token.children:
-            if child.pos_ == "VERB":
-                # Verbs in sub-clauses (e.g., "decided TO RUN")
+            if child.dep_ in ("nsubj", "nsubjpass", "agent", "csubj"):
+                # Determine if it's a subject or object based on passivity
+                participant_list = verb_data["subjects"] if child.dep_ != "nsubjpass" else verb_data["objects"]
+                
+                # Handle the 'agent' case where the noun is a child of 'by'
+                participant_token = child
+                if child.dep_ == "agent":
+                    agent_nouns = [c for c in child.children if c.dep_ == "pobj"]
+                    if agent_nouns:
+                        participant_token = agent_nouns[0]
+                    else:
+                        continue # Skip if agent has no noun
+
+                # Add the main participant and any conjoined ones (e.g., "John and Mary")
+                participant_list.append({"text": participant_token.text, "lemma": participant_token.lemma_})
+                for conjunct in participant_token.children:
+                    if conjunct.dep_ == "conj":
+                        participant_list.append({"text": conjunct.text, "lemma": conjunct.lemma_})
+                
+                # Keep track of the primary subject for inheritance
+                if child.dep_ == "nsubj":
+                    subject_head_token = child
+
+            elif child.dep_ == "dobj":
+                verb_data["objects"].append({"text": child.text, "lemma": child.lemma_})
+                for conjunct in child.children:
+                    if conjunct.dep_ == "conj":
+                        verb_data["objects"].append({"text": conjunct.text, "lemma": conjunct.lemma_})
+            
+            elif child.dep_ == "dative":
+                verb_data["indirect_objects"].append({"text": child.text, "lemma": child.lemma_})
+                for conjunct in child.children:
+                    if conjunct.dep_ == "conj":
+                        verb_data["indirect_objects"].append({"text": conjunct.text, "lemma": conjunct.lemma_})
+            
+            elif child.dep_ == "prep":
+                if (verb_token.lemma_, child.text.lower()) in self.PREPOSITIONAL_VERB_PAIRS:
+                    prep_objects = [c for c in child.children if c.dep_ == "pobj"]
+                    if prep_objects and not verb_data["objects"]: # Only if no direct object exists
+                        verb_data["objects"].append({"text": prep_objects[0].text, "lemma": prep_objects[0].lemma_})
+                        # Also check for conjoined prepositional objects
+                        for conjunct in prep_objects[0].children:
+                            if conjunct.dep_ == "conj":
+                                verb_data["objects"].append({"text": conjunct.text, "lemma": conjunct.lemma_})
+
+            elif child.pos_ == "VERB":
+                current_subject = subject_head_token if subject_head_token else inherited_subject
                 if child.dep_ in ("xcomp", "ccomp"):
-                    verb_data["sub_actions"].append(self._build_verb_tree(child))
-                # Conjoined verbs (e.g., "ran AND JUMPED")
+                    verb_data["sub_actions"].append(self._build_verb_tree(child, inherited_subject=current_subject))
                 elif child.dep_ == "conj":
-                    verb_data["conjoined_actions"].append(self._build_verb_tree(child))
+                    verb_data["conjoined_actions"].append(self._build_verb_tree(child, inherited_subject=current_subject))
+
+        # Handle implied subjects from the parent verb
+        if not verb_data["subjects"] and inherited_subject:
+            verb_data["subjects"].append({"text": inherited_subject.text, "lemma": inherited_subject.lemma_})
+
 
         return verb_data
 
@@ -205,9 +267,10 @@ class NLP_PIPE:
                 verb_tree = self._build_verb_tree(root_verb)
                 res["verbs"].append(verb_tree)
 
-        for token in doc:
-            if token.pos_ == "ADJ":
-                    described_noun = None
+            for token in sentence:
+                described_noun = None
+                descriptor_token = token
+                if token.pos_ == "ADJ":
                     if token.dep_ == "amod":
                         described_noun = token.head
                     elif token.dep_ == "acomp":
@@ -220,13 +283,15 @@ class NLP_PIPE:
                         objects = [child for child in verb_head.children if child.dep_ == "dobj"]
                         if objects:
                             described_noun = objects[0]
+                elif token.dep_ in ("acl", "relcl"):
+                    described_noun = token.head
 
-                    if described_noun:
-                        res["adjectives"].append({
-                            "text": token.text,
-                            "lemma": token.lemma_,
-                            "span": (token.idx, token.idx + len(token.text)),
-                            "describes_text": described_noun.text,
-                            "describes_lemma": described_noun.lemma_
-                        })
+                if described_noun:
+                    res["adjectives"].append({
+                        "text": descriptor_token.text,
+                        "lemma": descriptor_token.lemma_,
+                        "span": (descriptor_token.idx, descriptor_token.idx + len(descriptor_token.text)),
+                        "describes_text": described_noun.text,
+                        "describes_lemma": described_noun.lemma_
+                    })
         return res
