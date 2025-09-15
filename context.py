@@ -4,13 +4,15 @@ import logging_setup
 import json
 import os
 from redisclient import RedisClient
+from redis import Redis
 from typing import Any, Dict, List, Optional
 from networkx import DiGraph
 from entity import EntityResolver
 from nlp_pipe import NLP_PIPE
-from dtypes import AttributeData, BridgeData, EdgeData, EntityData, MessageData
+from dtypes import BridgeData, EdgeData, EntityData, MessageData
 from vectordb import ChromaClient
 from spacy.tokens import Token
+from rq import Queue
 
 logging_setup.setup_logging()
 
@@ -27,8 +29,10 @@ class Context:
         self.entities: Dict[int, EntityData] = {}
         self.chroma: ChromaClient = ChromaClient()
         self.redis_client = RedisClient()
+        self.rq_client = Redis(password=os.getenv('REDIS_PASSWORD'))
         self.user_message_cnt: int = 0
         self.bridge_map: Dict[str, Dict[Any, List[int]]] = {}
+        self.queue: Queue = Queue(connection=self.rq_client)
 
         self.user_entity = self._create_user_entity(user_name)
 
@@ -92,6 +96,8 @@ class Context:
                 _extract_bridges(sub_action, extracted_bridges)
             for conjoined_action in verb_node.get("conjoined_actions", []):
                 _extract_bridges(conjoined_action, extracted_bridges)
+            for contextual_action in verb_node.get("contextual_actions"):
+                _extract_bridges(contextual_action, extracted_bridges)
 
         all_bridges_in_message = set()
         for verb_tree in message_verbs:
@@ -153,6 +159,11 @@ class Context:
     
     def process_entities(self, msg: MessageData, entities: List[EntityData]):
         entity_index = self.bridge_map.setdefault("shared_entity", {})
+
+        unique_entities = set()
+
+        for ent in entities:
+            unique_entities.add(ent.name)
 
         for entity_obj in entities:
             entity_id = entity_obj.id
@@ -238,6 +249,14 @@ class Context:
                     coref_mention_map[mention_span] = main_entity
                     logger.info(f"Coreference: Mapped '{mention.text}' to entity '{main_entity.name}'")    
 
+    def format_verbs(self):
+        pass
+
+    def format_adjectives(self):
+        pass
+
+    def format_entities(self):
+        pass
 
     def process_live_messages(self, msg: MessageData):
         
@@ -306,11 +325,12 @@ class Context:
                         })
                         logger.info(f"Enriched entity '{entity.name}' with new alias from noun chunk: '{new_alias_text}'")
                         break 
-
-        self.process_entities(msg=msg, entities=resolved_entities.values())
+        
+        unique_entities = set(resolved_entities.values())
+        self.process_entities(msg=msg, entities=list(unique_entities))
 
         if results.get("coref_clusters") != []:
-            self.process_coref_clusters(msg=msg, message_corefs=results["coref_clusters"])
+            self.process_coref_clusters(msg=msg, message_corefs=results["coref_clusters"], coref_mention_map={}, resolved_entities=resolved_entities)
         
         if results.get("verbs") != []:
             self.process_verbs(msg=msg, message_verbs=results["verbs"])

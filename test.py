@@ -28,14 +28,19 @@ class TestTier1ConversationFlow(unittest.TestCase):
     def test_student_research_conversation(self):
         # --- 1. Define and Process the Conversation ---
         conversation = [
-            "Okay, I need to start planning my research paper for Professor Davies' class. The main topic I've chosen is a company called Innovate Dynamics.",
-            "Innovate Dynamics has developed a powerful new technology known as the Helios AI. My research project, Project Starlight, will analyze the impact of this product.",
-            "According to my sources, the Helios AI was built by their internal Core AI team. I also found that this entire team is located in Boston.",
-            "Good news, my classmate Maria is going to work with me on Project Starlight. She knows a lot about machine learning, which is a key technology for the Helios AI.",
-            "Professor Davies mentioned that Project Starlight is very important for my final grade. The first draft for Project Starlight is due on October 15th, so we need to get started soon.",
-            "I'm feeling pretty stressed about my chemistry midterm, I think I'll ft Maria later to vent.",
-            "My major is computer science and I want to learn Python. I'd love to get an internship at Google eventually.",
-            "I just joined the AI club to meet some new people, since I'm trying to be more social this semester."
+            "My machine learning course with Professor Hansen is getting intense. I need to start planning the final project.",
+            "It's a very challenging project, but the topic, 'AI in robotics', is interesting.",
+            "This kind of work is why I want to apply for the internship at Google. Their robotics division is world-class.",
+            "I asked Sarah and David to work on the project with me. They seem excited about it.",
+            "Honestly, I'm feeling anxious about the deadline. The whole thing was making me stressed.",
+            "My last big report was written for a class at NYU. It was graded by the TA.",
+            "Anyway, I'm going to the AI club meetup tonight. I hope to meet some new people.",
+            "I saw Alex there and we talked for a bit. We grabbed coffee and discussed our classes. I felt much better after I talked with him. Socializing really helps with the stress.",
+            "Today, Dr. Hansen gave me and Sarah some really useful feedback on our proposal.",
+            "It wasn't all good though. I disagreed with David about the project's direction. He's more of an idealist. It's a classic conflict between the practical and the theoretical.",
+            "I need to remember to ask the professor for a letter of recommendation for that Google internship.",
+            "Our project team usually works in the main library. The building is always crowded.",
+            "Managing a team, a difficult course, and my social life is complicated but rewarding."
         ]
 
         for message in conversation:

@@ -1,5 +1,4 @@
 import logging
-import logging_setup
 from typing import Callable, Dict, TYPE_CHECKING, List, Optional, Tuple
 from dtypes import EntityData
 
@@ -82,7 +81,7 @@ class EntityResolver:
     
     def check_chroma(self, text: str, entity_type: Optional[str], 
                      auto_merge_threshold: float = 0.2,
-                     flag_threshold: float = 0.5,
+                     flag_threshold: float = 0.35,
                      n_result: int = 5) -> Tuple[Optional[str], Optional[Dict]]:
         
         results = self.chroma.query(text=text, n_results=n_result, node_type="entity")

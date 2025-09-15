@@ -1,15 +1,12 @@
 import json
-import math
-import os
 import spacy
 import torch
 from gliner import GLiNER
-from spacy.tokens import Doc, Token, SpanGroup
+from spacy.tokens import Doc, Token
 from dtypes import MessageData
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 import logging
 from transformers import pipeline
-from spacy.matcher import DependencyMatcher
 from fastcoref import spacy_component
 
 
@@ -115,7 +112,8 @@ class NLP_PIPE:
             "objects": [],
             "indirect_objects": [],
             "sub_actions": [],
-            "conjoined_actions": []
+            "conjoined_actions": [],
+            "contextual_actions": []
         }
 
         subject_head_token = None
@@ -172,6 +170,8 @@ class NLP_PIPE:
                     verb_data["sub_actions"].append(self._build_verb_tree(child, inherited_subject=current_subject))
                 elif child.dep_ == "conj":
                     verb_data["conjoined_actions"].append(self._build_verb_tree(child, inherited_subject=current_subject))
+                elif child.dep_ == "advcl":
+                    verb_data["contextual_actions"].append(self._build_verb_tree(child, inherited_subject=current_subject))
 
         # Handle implied subjects from the parent verb
         if not verb_data["subjects"] and inherited_subject:
