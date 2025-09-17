@@ -20,6 +20,15 @@ class EntityData:
     aliases: List[Dict[str, str]] = field(default_factory=list)
     confidence: float = 1.0
     mentioned_in: List[int] = field(default_factory=list)
+    contextual_mentions: List[str] = field(default_factory=list)
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __eq__(self, other):
+        if not isinstance(other, EntityData):
+            return NotImplemented
+        return self.id == other.id
 
 @dataclass(frozen=True)
 class BridgeData:

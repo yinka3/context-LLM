@@ -1,7 +1,5 @@
 import unittest
-import logging
 from typing import Optional
-import logging_setup 
 from context import Context 
 from dtypes import MessageData, EntityData
 
@@ -28,22 +26,19 @@ class TestTier1ConversationFlow(unittest.TestCase):
     def test_student_research_conversation(self):
         # --- 1. Define and Process the Conversation ---
         conversation = [
-            "My machine learning course with Professor Hansen is getting intense. I need to start planning the final project.",
-            "It's a very challenging project, but the topic, 'AI in robotics', is interesting.",
-            "This kind of work is why I want to apply for the internship at Google. Their robotics division is world-class.",
-            "I asked Sarah and David to work on the project with me. They seem excited about it.",
-            "Honestly, I'm feeling anxious about the deadline. The whole thing was making me stressed.",
-            "My last big report was written for a class at NYU. It was graded by the TA.",
-            "Anyway, I'm going to the AI club meetup tonight. I hope to meet some new people.",
-            "I saw Alex there and we talked for a bit. We grabbed coffee and discussed our classes. I felt much better after I talked with him. Socializing really helps with the stress.",
-            "Today, Dr. Hansen gave me and Sarah some really useful feedback on our proposal.",
-            "It wasn't all good though. I disagreed with David about the project's direction. He's more of an idealist. It's a classic conflict between the practical and the theoretical.",
-            "I need to remember to ask the professor for a letter of recommendation for that Google internship.",
-            "Our project team usually works in the main library. The building is always crowded.",
-            "Managing a team, a difficult course, and my social life is complicated but rewarding."
+            "My advisor, Dr. Anya Sharma, suggested I tailor my final project on distributed systems for the software engineering internship at Cloudflare. I think it's a great idea to get ahead.",
+            "Honestly, I'm feeling pretty overwhelmed by the upcoming midterms, especially the one for Professor Evans's class on algorithms. That course is notoriously difficult and is a major stressor for me right now.",
+            "I was thinking of organizing a study group session at the main library for this weekend. I already asked Michael and Jessica from my class if they wanted to join me on Saturday afternoon.",
+            "To prepare for technical interviews, I've been grinding problems on LeetCode and trying to get better at Python. My goal is to eventually work at a company like Google or maybe even a smaller startup.",
+            "Quick update on the robotics project: we finally got the new sensor module working yesterday. David is going to integrate it with the main codebase by the end of next week, which should put us back on schedule."
         ]
 
-        for message in conversation:
+        for i, message in enumerate(conversation):
+
+            # if i == 2:
+            #     self._process_message(message)
+            #     break
+            
             self._process_message(message)
 
 

@@ -18,13 +18,15 @@ class ChromaClient:
 
         logger.info("Chroma client initialized")
     
-    def get_item(self, item: Union[int, List], include: List[str] = ["embeddings", "metadatas", "documents"]):
-        
-        if isinstance(item, int):
-            results = self.collection.get(ids=[str(item)], include=include)
+    def get_item(self, item: Union[str, List[str]], include: List[str] = ["embeddings", "metadatas", "documents"]):
+    
+
+        if isinstance(item, str):
+            if item.startswith('msg') or item.startswith('ent'):
+                results = self.collection.get(ids=[str(item)], include=include)
         else:
-            str_ids = [str(id_) for id_ in item]
-            results = self.collection.get(ids=str_ids, include=include)
+            if item[0].startswith('msg') or item[0].startswith('ent'):
+                results = self.collection.get(ids=item, include=include)
         
         return results
 

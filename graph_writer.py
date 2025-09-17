@@ -11,7 +11,8 @@ load_dotenv()
 class GraphWriter:
 
     def __init__(self, queue_list: List[str], graph: DiGraph):
-        self.client = Redis(password=os.getenv('REDIS_PASSWORD'))
+        hashed_psw = hash_password(password=os.getenv('REDIS_PASSWORD'))
+        self.client = Redis(password=hashed_psw)
         self.worker = Worker(queues=queue_list,connection=self.client)
         self.graph = graph
         self.status = {}
