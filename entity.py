@@ -1,7 +1,7 @@
 import logging
 from metaphone import doublemetaphone
 from typing import Callable, Dict, TYPE_CHECKING, List, Optional, Tuple
-from dtypes import EntityData
+from shared.dtypes import EntityData
 import networkx as nx
 from redisclient import RedisClient
 

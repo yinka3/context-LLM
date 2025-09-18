@@ -1,3 +1,4 @@
+from collections import namedtuple
 import json
 import spacy
 import torch
@@ -5,7 +6,7 @@ from datetime import datetime
 from sutime import SUTime
 from gliner import GLiNER
 from spacy.tokens import Doc, Token
-from dtypes import MessageData
+from shared.dtypes import MessageData
 from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
 from transformers import pipeline
@@ -14,6 +15,8 @@ from fastcoref import spacy_component
 
 logger = logging.getLogger(__name__)
 
+CoreferenceCluster = namedtuple('CoreferenceCluster', ['main', 'mentions', 'size'])
+
 class NLP_PIPE:
 
     PRONOUNS = {
@@ -21,7 +24,8 @@ class NLP_PIPE:
         "yourself", "he", "him", "his", "himself", "she", "her", "herself", 
         "it", "itself", "they", "them", "their", "themselves", "this", "that"
     }
-    
+
+
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Using device: {self.device}")
@@ -29,21 +33,16 @@ class NLP_PIPE:
         try:
             self.spacy = spacy.load('en_core_web_trf', enable=["fastcoref", "doc_cleaner"], 
                                     exclude=["ner"])
-            logger.info("spaCy transformer pipeline with fastcoref loaded successfully.")
+            logger.info(f"spaCy transformer pipeline with these labels: {self.spacy.pipe_names}.")
         except Exception as e:
             logger.error(f"Could not load spaCy model or fastcoref: {e}")
             raise
-        
-        # self.PREPOSITIONAL_VERB_PAIRS = set()
-        # try:
-        #     with open('verb_prep.json') as f:
-        #         self.PREPOSITIONAL_VERB_PAIRS = {tuple(pair) for pair in json.load(f)}
-        #     logger.info(f"Loaded {len(self.PREPOSITIONAL_VERB_PAIRS)} prepositional verb pairs.")
-        # except Exception as e:
-        #     logger.error(f"Could not load verb_prep.json: {e}")
-        #     raise
 
-        # self.sutime = SUTime()
+        try:
+            self.sutime = SUTime()
+        except Exception as e:
+            logger.error("Could not load SUTime library")
+            raise
             
         self.CANONICAL_LABELS = {
             "PERSON",
@@ -127,8 +126,110 @@ class NLP_PIPE:
                 last_end = ent['end']
 
         return filtered
-
     
+
+    def _extract_message_features(self, msg: MessageData, entity_threshold: float, res: Dict):
+
+        if not msg.message or not msg.message.strip():
+            return res
+        
+        entities = None
+        with torch.no_grad():
+            entities = self.gliner.predict_entities(text=msg.message, labels=self.gliner_labels)
+
+        cleaned_entities = self.clean_entities(entities)
+
+        for ent in cleaned_entities:
+            ent_data = {
+                "text": ent["text"], "type": self.label_map.get(ent["label"], "MISC"),
+                "confidence": ent['score'], "span": (ent["start"], ent["end"]), "contextual_mention": ""
+            }
+
+            if ent['score'] >= entity_threshold:
+                res['high_confidence_entities'].append(ent_data)
+            else:
+                res['low_confidence_entities'].append(ent_data)
+    
+        res["emotion"] = self.analyze_emotion(msg.message)
+        res["time_expressions"] = self.analyze_time(msg.message)
+    
+    def _contextual_features(self, message_block: Tuple[str, List[str]], res: Dict):
+
+        str_version, list_version = message_block
+
+        if message_block and str_version.strip():
+            docs: List[Doc] = list(self.spacy.pipe(texts=list_version))
+            current_doc = docs[-1]
+            appositive_map = {}
+            for token in current_doc:
+                if token.dep_ == "appos":
+                    head = token.head
+                    appositive_map[(head.idx, head.idx + len(head))] = \
+                        (token.idx, token.idx + len(token))
+            res["appositive_map"] = appositive_map
+
+            coref_clusters = []
+            if current_doc._.coref_clusters:
+                for cluster_spans in current_doc._.coref_clusters:
+                    if len(cluster_spans) < 2:
+                        continue
+                    
+                    main_span = current_doc[cluster_spans[0][0]:cluster_spans[0][1]]
+                    mention_spans = [current_doc[span[0]:span[1]] for span in cluster_spans]
+
+                    cluster_obj = CoreferenceCluster(
+                        main=main_span,
+                        mentions=mention_spans,
+                        size=len(cluster_spans)
+                    )
+                    
+                    coref_clusters.append(cluster_obj)
+
+                res["coref_clusters"] = coref_clusters
+
+            high_conf_entities = res["high_confidence_entities"]
+            noun_chunks = [(chunk.text, chunk.start_char, chunk.end_char) for chunk in current_doc.noun_chunks]
+            for i, entity in enumerate(high_conf_entities):
+                ent_start, ent_end = entity["span"]
+                for chunk_text, chunk_start, chunk_end in noun_chunks:
+                    if ent_start >= chunk_start and ent_end <= chunk_end:
+                        high_conf_entities[i]["contextual_mention"] = chunk_text
+                        break
+
+            chunks_to_analyze = {}
+            for i, entity in enumerate(res["low_confidence_entities"]):
+                ent_start, ent_end = entity["span"]
+                for chunk_text, chunk_start, chunk_end in noun_chunks:
+                    if ent_start >= chunk_start and ent_end <= chunk_end:
+                        chunks_to_analyze[chunk_text] = (chunk_start, chunk_end)
+                        break
+
+            chunk_texts = list(chunks_to_analyze.keys())
+            batched_results = []
+            if chunk_texts:
+                with torch.no_grad():
+                    batched_results = self.gliner.predict_entities(text=chunks_to_analyze, labels=self.gliner_labels)
+
+
+            for i, chunk_text in enumerate(chunk_texts):
+                entities_in_chunk = batched_results[i]
+                chunk_start, _ = chunks_to_analyze[chunk_text]
+                cleaned_entities_in_chunk = self.clean_entities(entities_in_chunk)
+
+                for new_ent in cleaned_entities_in_chunk:
+                    if new_ent['score'] >= 0.8: # stricter threshold since dealing with original low conf entities
+                        adjusted_start = new_ent['start'] + chunk_start
+                        adjusted_end = new_ent['end'] + chunk_start
+
+                        high_conf_entities.append({
+                            "text": new_ent["text"],
+                            "span": (adjusted_start, adjusted_end),
+                            "type": self.label_map.get(new_ent["label"], "MISC"),
+                            "confidence": new_ent["score"],
+                            "contextual_mention": chunk_text
+                        })
+                                
+                    
     def start_process(self, message_block: Tuple[str, List[str]], msg: MessageData,
                       entity_threshold: float = 0.7):
         res: Dict[str, Union[List, Dict]] = {
@@ -139,80 +240,9 @@ class NLP_PIPE:
             "emotion": [],
             "tier2_flags": []
             }
-        
-        if msg.message and msg.message.strip():
-            entities = self.gliner.predict_entities(text=msg.message, labels=self.gliner_labels)
-            cleaned_entities = self.clean_entities(entities)
 
-            for ent in cleaned_entities:
-                ent_data = {
-                    "text": ent["text"], "type": self.label_map.get(ent["label"], "MISC"),
-                    "confidence": ent['score'], "span": (ent["start"], ent["end"]), "contextual_mention": ""
-                }
-
-                if ent['score'] >= entity_threshold:
-                    res['high_confidence_entities'].append(ent_data)
-                else:
-                    res['low_confidence_entities'].append(ent_data)
-        
-
-            res["emotion"] = self.analyze_emotion(msg.message)
-            # res["time_expressions"] = self.analyze_time(msg.message)
-
-        str_version, list_version = message_block
-
-        if message_block and str_version.strip():
-            docs: List[Doc] = list(self.spacy.pipe(texts=list_version))
-            appositive_map = {}
-            for doc in docs:
-                for token in doc:
-                    if token.dep_ == "appos":
-                        head = token.head
-                        appositive_map[(head.idx, head.idx + len(head))] = \
-                            (token.idx, token.idx + len(token))
-                res["appositive_map"] = appositive_map
-
-                coref_clusters = []
-                if doc._.coref_clusters:
-                    for cluster_spans in doc._.coref_clusters:
-                        if len(cluster_spans) < 2:
-                            continue
-                        
-                        main_span = doc[cluster_spans[0][0]:cluster_spans[0][1]]
-                        mention_spans = [doc[span[0]:span[1]] for span in cluster_spans]
-
-                        cluster_obj = type('CoreferenceCluster', (), {
-                            'main': main_span,
-                            'mentions': mention_spans,
-                            'size': len(cluster_spans)
-                        })()
-                        
-                        coref_clusters.append(cluster_obj)
-
-                    res["coref_clusters"] = coref_clusters
-
-                high_conf_entities = res["high_confidence_entities"]
-                noun_chunks = [(chunk.text, chunk.start_char, chunk.end_char) for chunk in doc.noun_chunks]
-                for i, entity in enumerate(high_conf_entities):
-                    ent_start, ent_end = entity["span"]
-                    for chunk_text, chunk_start, chunk_end in noun_chunks:
-                        if ent_start >= chunk_start and ent_end <= chunk_end:
-                            high_conf_entities[i]["contextual_mention"] = chunk_text
-                            break
-                
-
-                for i, entity in enumerate(res["low_confidence_entities"]):
-                    ent_start, ent_end = entity["span"]
-                    
-                    for chunk_text, chunk_start, chunk_end in noun_chunks:
-                        if ent_start >= chunk_start and ent_end <= chunk_end:
-                            high_conf_entities.append({
-                                "text": chunk_text, "span": (chunk_start, chunk_end), 
-                                "type": res["low_confidence_entities"][i]["type"],
-                                "confidence": res["low_confidence_entities"][i]["confidence"] * 1.2} # give it up bump up score
-                            )
-                            break
-                
+        self._extract_message_features(msg=msg, entity_threshold=entity_threshold, res=res)
+        self._contextual_features(message_block=message_block, res=res)
         return res
     
 

@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Tuple
 import networkx as nx
 from networkx import DiGraph
 from nlp_pipe import NLP_PIPE
-from dtypes import EntityData, MessageData
+from shared.dtypes import EntityData, MessageData
 from vectordb import ChromaClient
 from rq import Queue
 from fact_check import FactExtractor

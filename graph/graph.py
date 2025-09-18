@@ -3,7 +3,7 @@ import graph_tool.all as gt
 import threading
 
 if TYPE_CHECKING:
-    from dtypes import EntityData
+    from shared.dtypes import EntityData
 
 
 class ThreadSafeGraph:

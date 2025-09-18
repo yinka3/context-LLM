@@ -4,7 +4,7 @@ from chromadb.api.models.Collection import Collection
 import logging
 import logging_setup
 import json
-from dtypes import EntityData, MessageData
+from shared.dtypes import EntityData, MessageData
 
 logger = logging.getLogger(__name__)
 

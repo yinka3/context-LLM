@@ -1,7 +1,7 @@
 from typing import Dict, List
 from redis import Redis
 from networkx import DiGraph
-from utils import hash_password
+from shared.utils import hash_password
 import os
 from dotenv import load_dotenv
 from rq import Worker

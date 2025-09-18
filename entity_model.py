@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Dict, List
 from functools import lru_cache
 import numpy as np
-from dtypes import EntityData
+from shared.dtypes import EntityData
 from entity import EntityResolver
 from embedding_model import EmbeddingModel
 from sentence_transformers import util
