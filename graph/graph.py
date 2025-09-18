@@ -1,6 +1,9 @@
+import time
 from typing import Any, Dict, TYPE_CHECKING
 import graph_tool.all as gt
 import threading
+
+from shared.dtypes import EdgeData
 
 if TYPE_CHECKING:
     from shared.dtypes import EntityData
@@ -30,11 +33,11 @@ class ThreadSafeGraph:
             'data': self.graph.new_vertex_property("object")
         }
 
-        #NOTE change this to have edgedata instead
+
         self.e_property = {
             'edge_type': self.graph.new_edge_property("string"),
-            'confidence': self.graph.new_edge_property("float"),
-            'timestamp': self.graph.new_edge_property("int64_t")
+            'timestamp': self.graph.new_edge_property("int64_t"),
+            'data': self.graph.new_edge_property("object")
         }
 
         self.ent_to_vertex: Dict[int, Any] = {}
@@ -46,29 +49,29 @@ class ThreadSafeGraph:
                 return self.ent_to_vertex[entity_id]
             
             v = self.graph.add_vertex()
-            self.v_props['entity_id'][v] = entity_id
-            self.v_props['entity_name'][v] = entity_data.name
-            self.v_props['entity_type'][v] = entity_data.type
-            self.v_props['data'][v] = entity_data
+            self.v_property['entity_id'][v] = entity_id
+            self.v_property['entity_name'][v] = entity_data.name
+            self.v_property['entity_type'][v] = entity_data.type
+            self.v_property['data'][v] = entity_data
             
-            self.entity_to_vertex[entity_id] = v
+            self.ent_to_vertex[entity_id] = v
             return v
     
-    #NOTE change this to have edgedata instead
+
     def add_relationship(self, entity1_id: int, entity2_id: int, 
-                        edge_type: str, confidence: float = 1.0):
+                        edge_data: 'EdgeData'):
         """Thread-safe edge addition"""
         with self._lock:
-            v1 = self.entity_to_vertex.get(entity1_id)
-            v2 = self.entity_to_vertex.get(entity2_id)
+            v1 = self.ent_to_vertex.get(entity1_id)
+            v2 = self.ent_to_vertex.get(entity2_id)
             
             if v1 is None or v2 is None:
                 return None
                 
-            e = self.g.add_edge(v1, v2)
-            self.e_props['edge_type'][e] = edge_type
-            self.e_props['confidence'][e] = confidence
-            self.e_props['timestamp'][e] = int(time.time())
+            e = self.graph.add_edge(v1, v2)
+            self.e_property['edge_type'][e] = edge_data.bridge.type
+            self.e_property['timestamp'][e] = int(time.time())
+            self.e_property['data'][e] = edge_data
             return e
     
 

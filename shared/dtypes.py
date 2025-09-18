@@ -35,7 +35,7 @@ class BridgeData:
     type: str
     value: Union[EntityData, str]
 
-@dataclass
+@dataclass(frozen=True)
 class EdgeData:
     messages: Tuple[int, int]
     bridge: BridgeData
