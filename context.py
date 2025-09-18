@@ -1,14 +1,14 @@
 from datetime import datetime, timedelta
 import logging
+from entity_model import ERTransformer
 import logging_setup
 import json
 import os
 from redisclient import RedisClient
 from redis import Redis
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 import networkx as nx
 from networkx import DiGraph
-from entity_model import ERTransformer
 from nlp_pipe import NLP_PIPE
 from dtypes import EntityData, MessageData
 from vectordb import ChromaClient
@@ -43,6 +43,7 @@ class Context:
             chroma=self.chroma,
             user_entity=self.user_entity,
             next_id=self.get_new_id,
+            redis_client=self.redis_client,
             alias_index=self.alias_index
         )
         self.FACT_EXTRACTOR = FactExtractor(entity_resolver=self.ENTITY_RESOLVER)
@@ -73,7 +74,7 @@ class Context:
         self.process_live_messages(item)
 
     
-    def get_recent_context(self, num_messages: int = 5) -> str:
+    def get_recent_context(self, num_messages: int = 10) -> Tuple[str, List[str]]:
         # Get from Redis cache
         sorted_set_key = f"recent_messages:{self.user_name}"
         recent_msg_ids = self.redis_client.client.zrevrange(sorted_set_key, 0, num_messages-1)
@@ -84,7 +85,7 @@ class Context:
             if msg_data:
                 context_text.append(json.loads(msg_data)['message'])
         
-        return " ".join(context_text)
+        return " ".join(context_text), context_text
 
 
     def search_graph(self, src_node: str, depth: int = 2):

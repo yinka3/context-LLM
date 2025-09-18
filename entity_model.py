@@ -4,7 +4,8 @@ from functools import lru_cache
 import numpy as np
 from dtypes import EntityData
 from entity import EntityResolver
-from sentence_transformers import SentenceTransformer, util
+from embedding_model import EmbeddingModel
+from sentence_transformers import util
 import logging
 from collections import deque
 
@@ -17,7 +18,7 @@ class ERTransformer(EntityResolver):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.semantic_model = SentenceTransformer('all-MiniLM-L12-v2')
+        self.semantic_model = EmbeddingModel()
         self._get_cached_embedding = lru_cache(maxsize=1000)(self._compute_embedding)
         self.entity_cache = {}
         self.entity_history = {}
@@ -34,6 +35,7 @@ class ERTransformer(EntityResolver):
             f"CONCEPT DRIFT DETECTED for entity {entity_id} "
             f"with new context: '{new_context}'. User clarification needed."
         )
+
         # In a real implementation, this would return a special flag or
         # add a clarification request to a response queue.
         pass
@@ -46,6 +48,19 @@ class ERTransformer(EntityResolver):
         logger.info(f"Ambiguity check for '{entity_data['text']}': {is_ambiguous} (avg similarity: {avg_similarity:.2f})")
         return is_ambiguous
     
+    def retrieve_similar_entities(self, query_text: str, threshold: float = 0.85):
+        """RAG retrieval from Redis"""
+        query_embedding = self.semantic_model.encode_single(query_text)
+        all_embeddings = super().redis_client.get_all_embeddings()
+        
+        similarities = []
+        for ent_id, stored_emb in all_embeddings.items():
+            sim = util.cos_sim(query_embedding, stored_emb).item()
+            if sim > threshold:
+                similarities.append((ent_id, sim))
+    
+        return sorted(similarities, key=lambda x: x[1], reverse=True)[:5]
+    
     def track_entity_change(self, entity_id: int, new_context: str, timestamp: datetime):
 
         new_emb = self._get_cached_embedding(new_context)
@@ -54,7 +69,6 @@ class ERTransformer(EntityResolver):
             self.entity_history[entity_id] = deque(maxlen=self.CONCEPT_WINDOW_SIZE)
 
         history_window = self.entity_history[entity_id]
-
 
         if len(history_window) > 5:
 
@@ -71,7 +85,7 @@ class ERTransformer(EntityResolver):
 
             if new_sim_score < drift_threshold:
                 self._handle_concept_drift(entity_id, new_context)
-            
+
         history_window.append({
             'embedding': new_emb,
             'timestamp': timestamp,

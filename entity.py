@@ -3,6 +3,8 @@ from metaphone import doublemetaphone
 from typing import Callable, Dict, TYPE_CHECKING, List, Optional, Tuple
 from dtypes import EntityData
 import networkx as nx
+from redisclient import RedisClient
+
 if TYPE_CHECKING:
     from networkx import DiGraph
     from vectordb import ChromaClient
@@ -15,12 +17,13 @@ ENTITY_MAP = Dict[Tuple[int, int], EntityData]
 class EntityResolver:
 
     def __init__(self, graph: 'DiGraph', chroma: 'ChromaClient',
-                 user_entity: EntityData, next_id: Callable, alias_index: Dict[str, EntityData]):
+                 user_entity: EntityData, next_id: Callable, alias_index: Dict[str, EntityData], redis_client: RedisClient):
         self.graph = graph
         self.chroma = chroma
         self.user_entity = user_entity
         self.next_id_func = next_id
         self.alias_index = alias_index
+        self.redis_client = redis_client
         self.blocking_index = {}
 
     

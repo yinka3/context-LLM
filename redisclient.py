@@ -1,5 +1,8 @@
+import json
+import numpy as np
 import redis
 import logging
+
 logger = logging.getLogger(__name__)
 REDIS_HOST = 'localhost'
 REDIS_PORT = 6379
@@ -17,3 +20,23 @@ class RedisClient:
             logger.error(f"Redis not connected at {host}:{port}")
             self.client = None
     
+    def store_entity_embedding(self, entity_id: int, embedding: np.ndarray, metadata: dict):
+        """Store entity embedding for RAG retrieval"""
+        self.client.hset(
+            "entity_embeddings",
+            f"ent_{entity_id}",
+            embedding.tobytes()
+        )
+        self.client.hset(
+            "entity_metadata", 
+            f"ent_{entity_id}",
+            json.dumps(metadata)
+        )
+
+    def get_all_embeddings(self):
+        """Retrieve all embeddings for similarity search"""
+        embeddings = self.client.hgetall("entity_embeddings")
+        return {
+            ent_id: np.frombuffer(emb_bytes, dtype=np.float32) 
+            for ent_id, emb_bytes in embeddings.items()
+        }

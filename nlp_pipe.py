@@ -6,7 +6,7 @@ from sutime import SUTime
 from gliner import GLiNER
 from spacy.tokens import Doc, Token
 from dtypes import MessageData
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
 from transformers import pipeline
 from fastcoref import spacy_component
@@ -27,8 +27,8 @@ class NLP_PIPE:
         logger.info(f"Using device: {self.device}")
 
         try:
-            self.spacy = spacy.load('en_core_web_trf', exclude=["ner"])
-            self.spacy.add_pipe("fastcoref")
+            self.spacy = spacy.load('en_core_web_trf', enable=["fastcoref", "doc_cleaner"], 
+                                    exclude=["ner"])
             logger.info("spaCy transformer pipeline with fastcoref loaded successfully.")
         except Exception as e:
             logger.error(f"Could not load spaCy model or fastcoref: {e}")
@@ -57,8 +57,7 @@ class NLP_PIPE:
             "ACADEMIC_CONCEPT",
             "TECHNOLOGY",
             "EVENT",
-            "TOPIC",
-            "EMOTIONAL_FEELING"
+            "TOPIC"
         }
         
         self.gliner_labels = [label.replace("_", " ").lower() for label in self.CANONICAL_LABELS]
@@ -130,7 +129,7 @@ class NLP_PIPE:
         return filtered
 
     
-    def start_process(self, message_block: str, msg: MessageData,
+    def start_process(self, message_block: Tuple[str, List[str]], msg: MessageData,
                       entity_threshold: float = 0.7):
         res: Dict[str, Union[List, Dict]] = {
             "high_confidence_entities": [],
@@ -160,34 +159,37 @@ class NLP_PIPE:
             res["emotion"] = self.analyze_emotion(msg.message)
             # res["time_expressions"] = self.analyze_time(msg.message)
 
-        if message_block and message_block.strip():
-            doc: Doc = self.spacy(text=message_block)
+        str_version, list_version = message_block
+
+        if message_block and str_version.strip():
+            docs: List[Doc] = list(self.spacy.pipe(texts=list_version))
             appositive_map = {}
-            for token in doc:
-                if token.dep_ == "appos":
-                    head = token.head
-                    appositive_map[(head.idx, head.idx + len(head))] = \
-                        (token.idx, token.idx + len(token))
-            res["appositive_map"] = appositive_map
+            for doc in docs:
+                for token in doc:
+                    if token.dep_ == "appos":
+                        head = token.head
+                        appositive_map[(head.idx, head.idx + len(head))] = \
+                            (token.idx, token.idx + len(token))
+                res["appositive_map"] = appositive_map
 
-            coref_clusters = []
-            if doc._.coref_clusters:
-                for cluster_spans in doc._.coref_clusters:
-                    if len(cluster_spans) < 2:
-                        continue
-                    
-                    main_span = doc[cluster_spans[0][0]:cluster_spans[0][1]]
-                    mention_spans = [doc[span[0]:span[1]] for span in cluster_spans]
+                coref_clusters = []
+                if doc._.coref_clusters:
+                    for cluster_spans in doc._.coref_clusters:
+                        if len(cluster_spans) < 2:
+                            continue
+                        
+                        main_span = doc[cluster_spans[0][0]:cluster_spans[0][1]]
+                        mention_spans = [doc[span[0]:span[1]] for span in cluster_spans]
 
-                    cluster_obj = type('CoreferenceCluster', (), {
-                        'main': main_span,
-                        'mentions': mention_spans,
-                        'size': len(cluster_spans)
-                    })()
-                    
-                    coref_clusters.append(cluster_obj)
+                        cluster_obj = type('CoreferenceCluster', (), {
+                            'main': main_span,
+                            'mentions': mention_spans,
+                            'size': len(cluster_spans)
+                        })()
+                        
+                        coref_clusters.append(cluster_obj)
 
-                res["coref_clusters"] = coref_clusters
+                    res["coref_clusters"] = coref_clusters
 
                 high_conf_entities = res["high_confidence_entities"]
                 noun_chunks = [(chunk.text, chunk.start_char, chunk.end_char) for chunk in doc.noun_chunks]
@@ -210,7 +212,7 @@ class NLP_PIPE:
                                 "confidence": res["low_confidence_entities"][i]["confidence"] * 1.2} # give it up bump up score
                             )
                             break
-            
+                
         return res
     
 
