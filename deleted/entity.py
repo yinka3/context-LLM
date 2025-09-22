@@ -3,11 +3,11 @@ from metaphone import doublemetaphone
 from typing import Callable, Dict, TYPE_CHECKING, List, Optional, Tuple
 from shared.dtypes import EntityData
 import networkx as nx
-from redisclient import RedisClient
+from main.redisclient import RedisClient
 
 if TYPE_CHECKING:
     from networkx import DiGraph
-    from vectordb import ChromaClient
+    from main.vectordb import ChromaClient
 
 
 logger = logging.getLogger(__name__)

@@ -1,6 +1,6 @@
 import unittest
 from typing import Optional
-from context import Context 
+from main.context import Context 
 from shared.dtypes import MessageData, EntityData
 
 

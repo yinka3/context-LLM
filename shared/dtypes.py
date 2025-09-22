@@ -33,6 +33,7 @@ class EntityData:
 @dataclass(frozen=True)
 class BridgeData:
     type: str
+    confidence: float
     value: Union[EntityData, str]
 
 @dataclass(frozen=True)

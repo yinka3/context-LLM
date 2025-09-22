@@ -2,8 +2,11 @@ from collections import defaultdict
 import time
 from typing import Any, Dict, TYPE_CHECKING, Optional
 import graph_tool.all as gt
-import threading
+from readerwriterlock import rwlock
+from concurrent.futures import ThreadPoolExecutor
 import logging
+
+from redis import Redis
 from shared.dtypes import EdgeData
 
 if TYPE_CHECKING:
@@ -11,16 +14,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#NOTE its not thread safe, i need to define the data coming in and out before making this thread safe
 class ThreadSafeGraph:
     _instance = None
-    _lock = threading.RLock()
 
 
     def __new__(cls):
         if not cls._instance:
-            with cls._lock:
-                if not cls._instance:
-                    cls._instance = super().__new__(cls)
+            if not cls._instance:
+                cls._instance = super().__new__(cls)
         
         return cls._instance
 
@@ -50,39 +52,37 @@ class ThreadSafeGraph:
     
     def add_entity(self, entity_id: str, entity_data: 'EntityData'):
         """Thread-safe edge addition"""
-        with self._lock:
-            if entity_id in self.ent_to_vertex:
-                return self.ent_to_vertex[entity_id]
-            
-            v = list(self.graph.add_vertex())
-            self.v_property['entity_id'][v] = entity_id
-            self.v_property['entity_name'][v] = entity_data.name
-            self.v_property['entity_type'][v] = entity_data.type
-            self.v_property['data'][v] = entity_data
-            
-            self.ent_to_vertex[entity_id] = v
-            return v
+        
+        if entity_id in self.ent_to_vertex:
+            return self.ent_to_vertex[entity_id]
+        
+        v = list(self.graph.add_vertex())
+        self.v_property['entity_id'][v] = entity_id
+        self.v_property['entity_name'][v] = entity_data.name
+        self.v_property['entity_type'][v] = entity_data.type
+        self.v_property['data'][v] = entity_data
+        
+        self.ent_to_vertex[entity_id] = v
+        return v
     
 
     def add_relationship(self, entity1_id: str, entity2_id: str, 
                         edge_data: 'EdgeData'):
         """Thread-safe edge addition"""
-        with self._lock:
-            v1 = self.ent_to_vertex.get(entity1_id)
-            v2 = self.ent_to_vertex.get(entity2_id)
+        v1 = self.ent_to_vertex.get(entity1_id)
+        v2 = self.ent_to_vertex.get(entity2_id)
+        
+        if v1 is None or v2 is None:
+            return None
             
-            if v1 is None or v2 is None:
-                return None
-                
-            e = self.graph.add_edge(v1, v2)
-            self.e_property['edge_type'][e] = edge_data.bridge.type
-            self.e_property['timestamp'][e] = int(time.time())
-            self.e_property['confidence_score'][e] = edge_data.confidence
-            self.e_property['data'][e] = edge_data
-            return e
+        e = self.graph.add_edge(v1, v2)
+        self.e_property['edge_type'][e] = edge_data.bridge.type
+        self.e_property['timestamp'][e] = int(time.time())
+        self.e_property['confidence_score'][e] = edge_data.confidence
+        self.e_property['data'][e] = edge_data
+        return e
     
     def get_vertex_stats(self, snapshot_graph: Optional['gt.Graph'] = None):
-
 
         if snapshot_graph:
             target_graph = snapshot_graph
@@ -102,24 +102,55 @@ class ThreadSafeGraph:
 
     def get_neighbors(self, entity_id: str, max_depth: int = 2):
 
-        with self._lock:
-            if entity_id not in self.ent_to_vertex:
-                return []
-            
-            start_vertex = self.ent_to_vertex[entity_id]
+        if entity_id not in self.ent_to_vertex:
+            return []
+        
+        start_vertex = self.ent_to_vertex[entity_id]
 
-            dist = gt.shortest_distance(
-                self.graph,
-                source=start_vertex,
-                max_dist=max_depth)
+        dist = gt.shortest_distance(
+            self.graph,
+            source=start_vertex,
+            max_dist=max_depth)
 
-            neighbors = []
-            for v in self.graph.vertices():
-                if dist[v] <= max_depth and v != start_vertex:
-                    neighbor_id = self.v_property['entity_id'][v]
-                    neighbors.append(neighbor_id)
-                    
-            return neighbors
+        neighbors = []
+        for v in self.graph.vertices():
+            if dist[v] <= max_depth and v != start_vertex:
+                neighbor_id = self.v_property['entity_id'][v]
+                neighbors.append(neighbor_id)
+                
+        return neighbors
+    
+    def snapshot_graph(self) -> 'gt.Graph':
+        """Get Snapshot of current graph state"""
+        snapshot = self.graph.copy()
+        self.snapshot_id += 1
+        self.graph_snapshots[self.snapshot_id] = (snapshot, time.time())
+        return snapshot
+
+
+    #NOTE look into graph_tool.topology, see if its possible to use similarity to check how far off or on page_rank was?
+    # link: https://graph-tool.skewed.de/static/docs/stable/topology.html
+    # using the similarity funtion in this subsection
+    # look at dominator_tree - find the main vertex aka node in a community or in fildered GraphView
+    # topo-sort can be used but propably mainly fo return vertices in order based on edges but edges can change over time, no?
+
+    def page_rank(self):
+
+
+        snapshot = self.snapshot_graph()
+        weight_map = snapshot.edge_properties['confidence_score']
+        rank_map = snapshot.vertex_properties['page_rank']
+        gt.pagerank(g=snapshot, weight=weight_map, prop=rank_map)
+        
+        ranks = {}
+        entity_id_map = snapshot.vertex_properties['entity_id']
+
+        for v in snapshot.vertices():
+            entity_id = entity_id_map[v]
+            rank_score = rank_map[v]
+            ranks[entity_id] = rank_score
+        
+        return ranks
     
     def community_dectection(self, use_snapshot=True):
 
@@ -163,7 +194,6 @@ class ThreadSafeGraph:
             logger.info(f"it took {time.time() - start_time:.1f}s for snapshot operation")
         
 
-        
         entity_to_vertex = {}
         if use_snapshot:
             entity_id_map = target_graph.vertex_properties['entity_id'] # this should be a string
@@ -216,7 +246,7 @@ class ThreadSafeGraph:
 
             logger.info(f"  Topic subgraph: {topic_subgraph.num_vertices()} nodes, {topic_subgraph.num_edges()} edges")
 
-            print(f"Running community detection for {topic_name}...")
+            logger.info(f"Running community detection for {topic_name}...")
 
             if topic_subgraph.num_edges == 0:
                 logger.warning(f" No edges in {topic_name} - skipping community detection")
@@ -245,6 +275,7 @@ class ThreadSafeGraph:
             gt.mcmc_equilibrate(state=state,
                                 wait=num_samples * 15,
                                 mcmc_args=dict(niter=15),
+                                multiflip=True,
                                 callback=collect_topic_sample,
                                 verbose=True) # i want to see progress information
             
@@ -252,34 +283,96 @@ class ThreadSafeGraph:
 
             if len(partition_samples) > 0:
                 partition_mode = gt.PartitionModeState(partition_samples, converge=True)
+                aligned_samples = partition_mode.get_partitions()
+
+                topic_confidences = {}
+                for v in topic_subgraph.vertices():
+                    entity_id = topic_entity_map[v]
+                    community_counts = defaultdict(int)
+
+                    for partition in aligned_samples:
+                        community_id = partition[v]
+                        community_counts[community_id] += 1
+                    
+                    total_samples = len(aligned_samples)
+                    community_confidences = {}
+                    for community_id, count in community_counts.items():
+                        confidence_score = count / total_samples
+                        community_confidences[community_id] = confidence_score
+                    
+                    topic_confidences[entity_id] = community_confidences
+                
+                topic_results = {
+                    'communities': {},
+                    'confidence_scores': {},
+                    'entity_count': len(ent_ids),
+                    'processing_time': time.time() - step1_time
+                }
+
+                for entity_id, confidences in topic_confidences.items():
+                    high_confidence_communities = [
+                        (comm_id, conf) for comm_id, conf in confidences.items()
+                        if conf >= confidence_threshold
+                    ]
+                    
+                    if high_confidence_communities:
+                        high_confidence_communities.sort(key=lambda x: x[1], reverse=True)
+                        
+                        topic_results['confidence_scores'][entity_id] = {
+                            'topic': topic_name,
+                            'community_ids': [sub_id for sub_id, _ in high_confidence_communities],
+                            'community_confidences': dict(high_confidence_communities),
+                            'max_confidence': max(confidences.values()),
+                            'all_community_confidences': confidences
+                        }
+                    else:
+                        # Low confidence - potential topic misassignment or bridge entity
+                        topic_results['confidence_scores'][entity_id] = {
+                            'topic': topic_name,
+                            'community_ids': [],
+                            'community_confidences': {},
+                            'max_confidence': max(confidences.values()),
+                            'potential_misassignment': True,  # Flag for your re-assignment system
+                            'all_community_confidences': confidences
+                        }
+                
+                community_groups = defaultdict(list)
+                for entity_id, conf_info in topic_results['confidence_scores'].items():
+                    for subcomm_id in conf_info.get('community_ids', []):
+                        community_groups[subcomm_id].append(entity_id)
+                
+                topic_results['communities'] = dict(community_groups)
+                
+                logger.info(f"  {topic_name} completed: {len(community_groups)} communities found")
+                
+            else:
+                logger.info(f"  No samples collected for {topic_name}")
+                topic_results = {'error': 'No samples collected'}
+            
+            results[topic_name] = topic_results
         
+        final_results = {
+            'per_topic_communities': results,
+            'potential_reassignments': [],
+            'summary': {
+                'total_topics': len(topics_to_entities),
+                'total_entities_processed': sum(len(entities) for entities in topics_to_entities.values()),
+                'total_time_minutes': (time.time() - start_time) / 60
+            }
+        }
+
+        for topic_name, topic_results in results.items():
+            if 'confidence_scores' in topic_results:
+                for entity_id, conf_info in topic_results['confidence_scores'].items():
+                    if conf_info.get('potential_misassignment', False):
+                        final_results['potential_reassignments'].append({
+                            'entity_id': entity_id,
+                            'current_topic': topic_name,
+                            'max_confidence': conf_info['max_confidence'],
+                            'suggested_action': 'review_assignment'
+                        })
+
+        logger.info(f"\nCommunity detection completed! Total time: {(time.time() - start_time)/60:.1f}m")
+        logger.info(f"Found {len(final_results['potential_reassignments'])} potential topic reassignments")
         
-
-
-    def snapshot_graph(self) -> 'gt.Graph':
-        """Get Snapshot of current graph state"""
-        with self._lock:
-            snapshot = self.graph.copy()
-            self.snapshot_id += 1
-            self.graph_snapshots[self.snapshot_id] = (snapshot, time.time())
-            return snapshot
-    
-
-    def page_rank(self):
-
-
-        snapshot = self.snapshot_graph()
-        weight_map = snapshot.edge_properties['confidence_score']
-        rank_map = snapshot.vertex_properties['page_rank']
-        gt.pagerank(g=snapshot, weight=weight_map, prop=rank_map)
-        
-        ranks = {}
-        entity_id_map = snapshot.vertex_properties['entity_id']
-
-        for v in snapshot.vertices():
-            entity_id = entity_id_map[v]
-            rank_score = rank_map[v]
-            ranks[entity_id] = rank_score
-        
-        return ranks
-      
+        return final_results

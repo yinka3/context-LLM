@@ -3,8 +3,8 @@ from typing import Dict, List
 from functools import lru_cache
 import numpy as np
 from shared.dtypes import EntityData
-from entity import EntityResolver
-from embedding_model import EmbeddingModel
+from main.entity import EntityResolver
+from main.embedding_model import EmbeddingModel
 from sentence_transformers import util
 import logging
 from collections import deque
