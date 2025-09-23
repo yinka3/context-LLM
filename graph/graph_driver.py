@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 class ThreadSafeGraph:
     _instance = None
 
-
     def __new__(cls):
         if not cls._instance:
             if not cls._instance:

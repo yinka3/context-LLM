@@ -7,7 +7,7 @@ from sutime import SUTime
 from gliner import GLiNER
 from spacy.tokens import Doc, Token
 from shared.dtypes import MessageData
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import logging
 from transformers import pipeline
 from fastcoref import spacy_component
@@ -16,6 +16,11 @@ from fastcoref import spacy_component
 logger = logging.getLogger(__name__)
 
 CoreferenceCluster = namedtuple('CoreferenceCluster', ['main', 'mentions', 'size'])
+
+#I like to see what my results are
+RES_LABEL = Literal["high_confidence_entities", "low_confidence_entities", 
+                    "emotion", "time_expressions", "appositive_map",
+                    "coref_clusters", "noun_chunk"]
 
 class NLP_PIPE:
 
@@ -92,12 +97,12 @@ class NLP_PIPE:
         """
         Analyzes the text for temporal expressions.
         """
-        # Use the current time as the reference for expressions like "tonight"
+
         reference_date = datetime.now().isoformat()
         time_expressions = self.sutime.parse(text, reference_date)
         return time_expressions
 
-    def analyze_emotion(self, text: str) -> List[Dict]:
+    def analyze_emotion(self, text: str):
         """
         Analyzes the text and returns a list of emotions with their scores.
         """
@@ -229,16 +234,17 @@ class NLP_PIPE:
                             "contextual_mention": chunk_text
                         })
                                 
-                    
+
     def start_process(self, message_block: Tuple[str, List[str]], msg: MessageData,
                       entity_threshold: float = 0.7):
-        res: Dict[str, Union[List, Dict]] = {
+        res: Dict[RES_LABEL, Union[List, Dict]] = {
             "high_confidence_entities": [],
             "low_confidence_entities": [],
             "noun_chunks": [],
             "coref_clusters": [],
-            "emotion": []
-            }
+            "emotion": [],
+            "appositive_map": {}
+        }
 
         self._extract_message_features(msg=msg, entity_threshold=entity_threshold, res=res)
         self._contextual_features(message_block=message_block, res=res)
