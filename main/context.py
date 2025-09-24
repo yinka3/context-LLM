@@ -156,12 +156,6 @@ class Context:
         - "add_entity": For each entity in resolved_entities 
         - "add_relationship": For each relationship extracted
 
-        ANALYTICAL OPERATIONS (suggest based on conditions):
-        - "page_rank": If 3+ high-confidence entities OR relationships with important entities
-        - "community_detection": If 4+ new relationships OR cross-topic relationships  
-        - "get_neighbors": If entity disambiguation needed OR conflicting entity types
-        - "snapshot_graph": If suggesting expensive analytical operations
-
         
         OUTPUT (JSON only):
         {

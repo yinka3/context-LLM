@@ -2,7 +2,6 @@ from collections import defaultdict
 import time
 from typing import Any, Dict, TYPE_CHECKING, Optional
 import graph_tool.all as gt
-from readerwriterlock import rwlock
 from concurrent.futures import ThreadPoolExecutor
 import logging
 
@@ -15,7 +14,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 #NOTE its not thread safe, i need to define the data coming in and out before making this thread safe
-class ThreadSafeGraph:
+class KnowGraph:
     _instance = None
 
     def __new__(cls):
@@ -33,35 +32,45 @@ class ThreadSafeGraph:
             'entity_id': self.graph.new_vertex_property("string"),
             'entity_name': self.graph.new_vertex_property("string"),
             'entity_type': self.graph.new_vertex_property("string"),
-            'page_rank': self.graph.new_vertex_property("double"),
+            'aliasis': self.graph.new_vertex_property("object", vals=[]),
+            'topic': self.graph.new_vertex_property("string"),
+            'origin_msg': self.graph.new_vertex_property("string"),
+            'community_id': self.graph.new_vertex_property("int"),
+            'confidence_score': self.graph.new_edge_property("double"),
+            'mentioned_in': self.graph.new_vertex_property("object", vals=[]),
+            'context_mentions': self.graph.new_vertex_property("object", vals=[]),
+            'page_rank_hist': self.graph.new_vertex_property("object", vals={}),
             'data': self.graph.new_vertex_property("object")
         }
 
         self.e_property = {
-            'edge_type': self.graph.new_edge_property("string"),
+            'relation_type': self.graph.new_edge_property("string"),
             'timestamp': self.graph.new_edge_property("int64_t"),
+            'messages_connected': self.graph.new_edge_property("object", []),
             'confidence_score': self.graph.new_edge_property("double"),
             'data': self.graph.new_edge_property("object")
         }
 
         self.vertex_stats = {} 
-        self.snapshot_id = 0
+        self.current_snapshot_id = 0
         self.ent_to_vertex: Dict[str, Any] = {}
         self.graph_snapshots = Dict[int, 'gt.Graph'] = {}
     
-    def add_entity(self, entity_id: str, entity_data: 'EntityData'):
+    def add_entity(self, entity_data: dict):
         """Thread-safe edge addition"""
         
-        if entity_id in self.ent_to_vertex:
-            return self.ent_to_vertex[entity_id]
+        if entity_data["id"] in self.ent_to_vertex:
+            return
         
         v = list(self.graph.add_vertex())
-        self.v_property['entity_id'][v] = entity_id
-        self.v_property['entity_name'][v] = entity_data.name
-        self.v_property['entity_type'][v] = entity_data.type
+        self.v_property['entity_id'][v] = entity_data["id"]
+        self.v_property['entity_name'][v] = entity_data["name"]
+        self.v_property['entity_type'][v] = entity_data["type"]
+        self.v_property['topic'][v] = entity_data["id"]
+        self.v_property['confidence_score'] = entity_data["confidence"]
         self.v_property['data'][v] = entity_data
         
-        self.ent_to_vertex[entity_id] = v
+        self.ent_to_vertex[entity_data["id"]] = v
         return v
     
 
@@ -75,7 +84,7 @@ class ThreadSafeGraph:
             return None
             
         e = self.graph.add_edge(v1, v2)
-        self.e_property['edge_type'][e] = edge_data.bridge.type
+        self.e_property['relation_type'][e] = edge_data.bridge.type
         self.e_property['timestamp'][e] = int(time.time())
         self.e_property['confidence_score'][e] = edge_data.confidence
         self.e_property['data'][e] = edge_data
@@ -122,12 +131,12 @@ class ThreadSafeGraph:
     def snapshot_graph(self) -> 'gt.Graph':
         """Get Snapshot of current graph state"""
         snapshot = self.graph.copy()
-        self.snapshot_id += 1
-        self.graph_snapshots[self.snapshot_id] = (snapshot, time.time())
+        self.current_snapshot_id += 1
+        self.graph_snapshots[self.current_snapshot_id] = (snapshot, time.time())
         return snapshot
 
 
-    #NOTE look into graph_tool.topology, see if its possible to use similarity to check how far off or on page_rank was?
+    #NOTE look into graph_tool.topology, see if its possible to use similarity to check how far off or on page_rank was? when time permits
     # link: https://graph-tool.skewed.de/static/docs/stable/topology.html
     # using the similarity funtion in this subsection
     # look at dominator_tree - find the main vertex aka node in a community or in fildered GraphView

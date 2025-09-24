@@ -1,0 +1,39 @@
+syntax = "proto3"
+
+import "common.proto";
+
+message AddEntitiesRequest {
+    repeated Entity entities = 1;
+    string source_message_id = 2;
+    int64 timestamp = 3;
+    string operation_id = 4;
+}
+
+message AddEntitiesResponse {
+    GraphResponse response = 1;
+    repeated string entity_ids = 2;
+}
+
+message AddRelationshipsRequest {
+    repeated Relationship relationships = 1;
+    string source_message_id = 2;
+    int64 timestamp = 3;
+    string operation_id = 4;
+}
+
+message AddRelationshipsResponse {
+    GraphResponse response = 1;
+    repeated string relationship_ids = 2;
+}
+
+message GetNeighborsRequest {
+    string entity_text = 1;
+    int32 max_depth = 2;
+    string operation_id = 3;
+}
+
+message GetNeighborsResponse {
+    GraphResponse response = 1;
+    repeated string neighbor_texts = 2;
+}
+
