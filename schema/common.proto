@@ -1,19 +1,10 @@
 syntax = "proto3";
 
-
-message EntityAlias {
-    string text = 1;
-    string alias_type = 2;
-    float confidence = 3;
-    int64 first_seen = 4;
-}
-
 message Entity {
     string text = 1;
     string type = 2;
     float confidence = 3; 
     bool is_new = 4;
-    repeated EntityAlias aliases = 5;
 }
 
 message Relationship {
@@ -22,6 +13,12 @@ message Relationship {
     string relation = 3;
     float confidence = 4;
     string directionality = 5;
+}
+
+message BatchMessage {
+    string message_id = 1;
+    repeated Entity list_ents = 2;
+    repeated Relationship list_relations = 3;
 }
 
 message GraphResponse {

@@ -8,7 +8,7 @@ from redis import Redis
 from typing import Any, Dict, List, Tuple
 from main.nlp_pipe import NLP_PIPE
 from shared.dtypes import EntityData, MessageData
-
+from schema.common_pb2 import Entity, Relationship, BatchMessge, GraphResponse
 
 logging_setup.setup_logging()
 
@@ -17,19 +17,20 @@ logger = logging.getLogger(__name__)
 class Context:
 
     def __init__(self, user_name: str = "Yinka"):
-        self.next_id = 1
         self.user_name = user_name
         self.nlp_pipe: NLP_PIPE = NLP_PIPE()
         self.llm_client = None
         self.entities: Dict[int, EntityData] = {}
         self.redis_client = RedisClient()
-        self.rq_client = Redis(password=os.getenv('REDIS_PASSWORD'))
+        self.publish_id = 0
         self.user_message_cnt: int = 0
         self.bridge_map: Dict[str, Dict[Any, List[int]]] = {}
         self.alias_index: Dict[str, EntityData] = {}
         self.user_entity = self._create_user_entity(user_name)
 
 
+    #TODO: This should be sent when instantiating the context, it can bypass parser and be on the graph immediately
+    # or I can do it on the graph side(might pick the later optional)
     def _create_user_entity(self, user_name: str) -> EntityData:
         user_entity = EntityData(
             id=0, 
@@ -40,12 +41,11 @@ class Context:
         ent_id = f"ent_{user_entity.id}"
         #NOTE send data to graph, will do that later
         self.entities[user_entity.id] = user_entity
-        self.chroma.add_item(user_entity)
         return user_entity
     
-    def get_new_id(self):
-        new_id = self.next_id
-        self.next_id += 1
+    def make_publish_id(self):
+        new_id = self.publish_id
+        self.publish_id += 1
         return new_id
     
     
@@ -201,8 +201,22 @@ class Context:
     def _call_llm():
         pass
 
-    def _verify_response():
-        pass
+    def _verify_response(self, response: json) -> Dict:
+        
+        response_dict = response.loads(response)
+
+        if not response_dict["resolved_entities"]:
+            # do something, have a call back function
+            # if need to see if all processed message need a resolved entity
+            # or just do nothing, maybe trust the LLM, maybe
+            pass
+
+        if not response_dict["relationships"]:
+            # ditto
+            pass
+
+        return response_dict
+        
 
     def clean_nlp_for_prompt(self, result: Dict):
         analysis_payload = {}
@@ -241,31 +255,44 @@ class Context:
 
     def process_live_messages(self, msg: MessageData):
         
-        msg_id = f"msg_{msg.id}"
-        #NOTE send data to graph, will do that later
-        #self.graph.add_node(msg_id, data=msg, type="message")
         self.add_to_redis(msg)
-        
 
         results = self.nlp_pipe.start_process(message_block=self.get_recent_context(), 
                                               msg=msg, entity_threshold=0.7)
-
-        if results.get("tier2_flags") != []:
-            for flag in results["tier2_flags"]:
-                logger.warning(f"Received Tier 2 flag from NLP_PIPE. Reason: {flag['reason']}")
-            return
-        
-        if not results.get("high_confidence_entities"):
-            logger.info("No entities found")
-            return
         
         recent_context, _ = self.get_recent_context()
 
         prompt = self._build_llm_prompt(msg, results, recent_context)
         llm_response = self._call_llm(prompt)
-        verify_response = self._verify_response(llm_response)
-        #NOTE have to send all the information to graph
+        self.publish_message(llm_response=llm_response, msg=msg)
         
+    
+    def publish_message(self, llm_response, msg=MessageData):
+
+        verify_response = self._verify_response(llm_response)
+        batched_msg = BatchMessge(message_id=f"msg_{msg.id}")
+        for ent in verify_response["resolved_entities"]:
+            
+            new_ent = Entity(text=ent["text"], type=ent["type"], 
+                             confidence=ent["confidence"], is_new=ent["is_new"])
+            
+            batched_msg.list_ents.append(new_ent)
+        
+        for relationship in verify_response["relationships"]:
+
+            new_relation = Relationship(source_text=relationship["source_text"], 
+                                        target_text=relationship["target_text"],
+                                        relation=relationship["relation"],
+                                        confidence=relationship["confidence"],
+                                        directionality=relationship["directionality"])
+            
+            batched_msg.list_relations.append(new_relation)
+        
+        serialized_data = batched_msg.SerializeToString()
+        channel = f"ai_response:{self.make_publish_id()}"
+        self.redis_client.client.publish(channel=channel, message=serialized_data)
+
+
 
         
 

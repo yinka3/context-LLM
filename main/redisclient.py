@@ -1,7 +1,11 @@
 import json
+import os
 import numpy as np
 import redis
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 REDIS_HOST = 'localhost'
@@ -13,7 +17,7 @@ class RedisClient:
     def __init__(self, host=REDIS_HOST, port=REDIS_PORT, db_num=REDIS_DB):
 
         try:
-            self.client = redis.Redis(host=host, port=port, db=db_num, decode_responses=True)
+            self.client = redis.Redis(host=host, port=port, db=db_num, decode_responses=True, password=os.getenv('REDIS_PASSWORD'))
             self.client.ping()
             logger.info(f"Redis connected at {host}:{port}")
         except redis.exceptions.ConnectionError:
