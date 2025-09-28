@@ -3,7 +3,7 @@ from metaphone import doublemetaphone
 from typing import Callable, Dict, TYPE_CHECKING, List, Optional, Tuple
 from shared.dtypes import EntityData
 import networkx as nx
-from main.redisclient import RedisClient
+from redisclient import RedisClient
 
 if TYPE_CHECKING:
     from networkx import DiGraph

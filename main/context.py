@@ -1,9 +1,10 @@
+import asyncio
 from datetime import datetime, timedelta
 import logging
 import logging_setup
 import json
 import os
-from main.redisclient import RedisClient
+from redisclient import RedisClient
 from redis import Redis
 from typing import Any, Dict, List, Tuple
 from main.nlp_pipe import NLP_PIPE
@@ -42,12 +43,7 @@ class Context:
         #NOTE send data to graph, will do that later
         self.entities[user_entity.id] = user_entity
         return user_entity
-    
-    def make_publish_id(self):
-        new_id = self.publish_id
-        self.publish_id += 1
-        return new_id
-    
+        
     
     def add(self, item: MessageData):
         if item.role == "user":
@@ -268,7 +264,7 @@ class Context:
         
     
     def publish_message(self, llm_response, msg=MessageData):
-
+        
         verify_response = self._verify_response(llm_response)
         batched_msg = BatchMessge(message_id=f"msg_{msg.id}")
         for ent in verify_response["resolved_entities"]:
@@ -289,13 +285,14 @@ class Context:
             batched_msg.list_relations.append(new_relation)
         
         serialized_data = batched_msg.SerializeToString()
-        channel = f"ai_response:{self.make_publish_id()}"
-        self.redis_client.client.publish(channel=channel, message=serialized_data)
+        self.redis_client.client.publish(channel="ai_response", message=serialized_data)
 
 
-
-        
-
+if '__main__' == __name__:
+    manager = Context()
+    while True:
+        manager.publish_message()
+        asyncio.sleep(0.5)
 
 
 
