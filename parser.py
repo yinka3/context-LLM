@@ -21,6 +21,11 @@ class Parser:
         if message['type'] == 'message': 
             self.process_msg(message['data'])
     
+    def send_data(self):
+        
+        
+        
+    
     
 class EntityResolver:
 

@@ -13,7 +13,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#NOTE its not thread safe, i need to define the data coming in and out before making this thread safe
 class KnowGraph:
     _instance = None
 
@@ -57,7 +56,6 @@ class KnowGraph:
         self.graph_snapshots = Dict[int, 'gt.Graph'] = {}
     
     def add_entity(self, entity_data: dict):
-        """Thread-safe edge addition"""
         
         if entity_data["id"] in self.ent_to_vertex:
             return
@@ -71,24 +69,23 @@ class KnowGraph:
         self.v_property['data'][v] = entity_data
         
         self.ent_to_vertex[entity_data["id"]] = v
-        return v
     
 
     def add_relationship(self, entity1_id: str, entity2_id: str, 
                         edge_data: 'EdgeData'):
-        """Thread-safe edge addition"""
+
         v1 = self.ent_to_vertex.get(entity1_id)
         v2 = self.ent_to_vertex.get(entity2_id)
         
         if v1 is None or v2 is None:
-            return None
+            return
             
         e = self.graph.add_edge(v1, v2)
         self.e_property['relation_type'][e] = edge_data.bridge.type
         self.e_property['timestamp'][e] = int(time.time())
         self.e_property['confidence_score'][e] = edge_data.confidence
         self.e_property['data'][e] = edge_data
-        return e
+
     
     def get_vertex_stats(self, snapshot_graph: Optional['gt.Graph'] = None):
 
