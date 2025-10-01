@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from readerwriterlock import rwlock
 from concurrent.futures import ThreadPoolExecutor
 import signal
@@ -7,9 +8,8 @@ import sys
 
 from graph_driver import KnowGraph
 from redisclient import RedisClient
-from shared.dtypes import EntityData, EdgeData
-import common_pb2
-import graph_messages_pb2
+from schema.common_pb2 import Entity, Relationship
+from schema.graph_messages_pb2 import *
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ class GraphBuilder:
             'graph:add-entity': self._handle_add_entity,
             'graph:add-relationship': self._handle_add_relationship
         }
+
     
     def start(self):
         logger.info("Starting GraphBuilder...")
@@ -49,11 +50,7 @@ class GraphBuilder:
         logger.info("Stopping GraphBuilder...")
         self.running.clear()
         self.shutdown_event.set()
-        
-        # Close pubsub connection
         self.pubsub.close()
-        
-        # Shutdown executor
         self.executor.shutdown(wait=True, timeout=30)
         
         logger.info(f"Service stopped. Processed: {self.processed_messages}, Failed: {self.failed_messages}")
@@ -63,10 +60,30 @@ class GraphBuilder:
         self.stop()
         sys.exit(0)
     
+    def _message_loop(self):
+        """Main message processing loop"""
+        logger.info("Starting message processing loop...")
+        
+        while self.running.is_set():
+            try:
+                message = self.pubsub.get_message(timeout=1.0)
+                
+                if message is None:
+                    continue
+                    
+                if message['type'] == 'message':
+                    self.executor.submit(self._process_message, message)
+                    
+            except Exception as e:
+                logger.error(f"Error in message loop: {e}")
+                if not self.running.is_set():
+                    break
+                time.sleep(1)
+    
     def _handle_add_entity(self, data: bytes):
         with self.graph_lock.gen_wlock():
             try:
-                entity_msg = common_pb2.Entity()
+                entity_msg = Entity()
                 entity_msg.ParseFromString(data)
                 
                 entity_data = {
@@ -83,6 +100,31 @@ class GraphBuilder:
                 logger.error(f"Failed to add entity: {e}")
                 raise
     
+    def _handle_add_relation(self, data: bytes):
+
+        with self.graph_lock.gen_wlock():
+            try:
+
+                relation_msg = Relationship()
+                relation_msg.ParseFromString(data)
+
+                v1 = relation_msg.source_text
+                v2 = relation_msg.target_text
+                
+
+                edge_data = {
+                    "relation": relation_msg.relation,
+                    "direction": relation_msg.direction,
+                    "confidence": relation_msg.confidence
+                }
+
+                
+            
+            except Exception as e:
+                logger.error(f"Failed to add relationship: {e}")
+
+
+                
 
 def main():
 

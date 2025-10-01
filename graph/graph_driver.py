@@ -72,7 +72,7 @@ class KnowGraph:
     
 
     def add_relationship(self, entity1_id: str, entity2_id: str, 
-                        edge_data: 'EdgeData'):
+                        edge_data: dict):
 
         v1 = self.ent_to_vertex.get(entity1_id)
         v2 = self.ent_to_vertex.get(entity2_id)
@@ -81,9 +81,9 @@ class KnowGraph:
             return
             
         e = self.graph.add_edge(v1, v2)
-        self.e_property['relation_type'][e] = edge_data.bridge.type
+        self.e_property['relation_type'][e] = edge_data["relation"]
         self.e_property['timestamp'][e] = int(time.time())
-        self.e_property['confidence_score'][e] = edge_data.confidence
+        self.e_property['confidence_score'][e] = edge_data["confidence"]
         self.e_property['data'][e] = edge_data
 
     

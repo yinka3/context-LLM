@@ -9,7 +9,7 @@ from redis import Redis
 from typing import Any, Dict, List, Tuple
 from main.nlp_pipe import NLP_PIPE
 from shared.dtypes import EntityData, MessageData
-from schema.common_pb2 import Entity, Relationship, BatchMessge, GraphResponse
+from schema.common_pb2 import Entity, Relationship, BatchMessge, GraphResponse, Message
 
 logging_setup.setup_logging()
 
@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 class Context:
 
     def __init__(self, user_name: str = "Yinka"):
+        self.ents_id = 0
+        self.msg_id = 1
         self.user_name = user_name
         self.nlp_pipe: NLP_PIPE = NLP_PIPE()
         self.llm_client = None
@@ -28,24 +30,34 @@ class Context:
         self.bridge_map: Dict[str, Dict[Any, List[int]]] = {}
         self.alias_index: Dict[str, EntityData] = {}
         self.user_entity = self._create_user_entity(user_name)
+    
+    def get_next_msg_id(self) -> str:
+        self.msg_id += 1
+        return f"msg_{self.msg_id}"
 
+    def get_next_ent_id(self) -> str:
+        self.ents_id += 1
+        return f"ent_{self.ents_id}"
 
-    #TODO: This should be sent when instantiating the context, it can bypass parser and be on the graph immediately
-    # or I can do it on the graph side(might pick the later optional)
-    def _create_user_entity(self, user_name: str) -> EntityData:
-        user_entity = EntityData(
-            id=0, 
-            name="USER", 
-            type="person",
-            aliases=[{"text": user_name, "type": "person"}]
+    def _create_user_entity(self):
+        logger.info("Adding basic USER information to graph")
+        user_entity = Entity(
+            id=self.get_next_ent_id(),
+            text="USER",
+            type="PERSON",
+            confidence=1.0,
+            aliases=[{"text": self.user_name, "type": "PERSON"}],
+            recieving_ents=[],
+            mentioned_in=[]
         )
-        ent_id = f"ent_{user_entity.id}"
-        #NOTE send data to graph, will do that later
+
+        seriliazed_message = user_entity.SerializeToString()
+        self.redis_client.client.publish("direct:add_user", message=seriliazed_message)
         self.entities[user_entity.id] = user_entity
         return user_entity
         
     
-    def add(self, item: MessageData):
+    def add(self, item: Message):
         if item.role == "user":
             self.user_message_cnt += 1
         self.process_live_messages(item)
@@ -158,8 +170,7 @@ class Context:
         "resolved_entities": [
             {
                 "text": str,
-                "type": str, 
-                "is_new": bool,
+                "type": str,
                 "confidence": float
             }
         ],
@@ -176,12 +187,6 @@ class Context:
             {
                 "suggested_topic": str, 
                 "entities": [list of entity texts]
-            }
-        ],
-        "suggested_operations": [
-            {
-                "method": str, 
-                "priority": str
             }
         ]
         }"""
@@ -249,10 +254,11 @@ class Context:
 
 
 
-    def process_live_messages(self, msg: MessageData):
+    def process_live_messages(self, msg: Message):
         
         self.add_to_redis(msg)
 
+        #NOTE this should be a blocking operation right???
         results = self.nlp_pipe.start_process(message_block=self.get_recent_context(), 
                                               msg=msg, entity_threshold=0.7)
         
@@ -263,14 +269,21 @@ class Context:
         self.publish_message(llm_response=llm_response, msg=msg)
         
     
-    def publish_message(self, llm_response, msg=MessageData):
+    def publish_message(self, llm_response, msg=Message):
         
         verify_response = self._verify_response(llm_response)
-        batched_msg = BatchMessge(message_id=f"msg_{msg.id}")
+        batched_msg = BatchMessge(message_id=msg.id)
         for ent in verify_response["resolved_entities"]:
-            
-            new_ent = Entity(text=ent["text"], type=ent["type"], 
-                             confidence=ent["confidence"], is_new=ent["is_new"])
+
+            new_ent = Entity(
+                            id=self.get_next_ent_id(),
+                            text=ent["text"], 
+                            type=ent["type"], 
+                            confidence=ent["confidence"],
+                            aliases=ent["aliases"],
+                            recieving_ents=[],
+                            mentioned_in=[msg.id]
+                        )
             
             batched_msg.list_ents.append(new_ent)
         
@@ -285,7 +298,7 @@ class Context:
             batched_msg.list_relations.append(new_relation)
         
         serialized_data = batched_msg.SerializeToString()
-        self.redis_client.client.publish(channel="ai_response", message=serialized_data)
+        self.redis_client.client.publish(channel="parser:ai_response", message=serialized_data)
 
 
 if '__main__' == __name__:
