@@ -199,25 +199,15 @@ class Context:
         
         return system_prompt, json.dumps(user_prompt_data, indent=2)
 
-    def _call_llm():
+    
+    def _call_llm(self, prompt):
+
+        sys_prompt, user_prompt = prompt
+        # call model
+        # get response
+        # parse to dict 
+        # return dict
         pass
-
-    def _verify_response(self, response: json) -> Dict:
-        
-        response_dict = response.loads(response)
-
-        if not response_dict["resolved_entities"]:
-            # do something, have a call back function
-            # if need to see if all processed message need a resolved entity
-            # or just do nothing, maybe trust the LLM, maybe
-            pass
-
-        if not response_dict["relationships"]:
-            # ditto
-            pass
-
-        return response_dict
-        
 
     def clean_nlp_for_prompt(self, result: Dict):
         analysis_payload = {}
@@ -271,23 +261,22 @@ class Context:
     
     def publish_message(self, llm_response, msg=Message):
         
-        verify_response = self._verify_response(llm_response)
         batched_msg = BatchMessge(message_id=msg.id)
-        for ent in verify_response["resolved_entities"]:
+        for ent in llm_response["resolved_entities"]:
 
             new_ent = Entity(
                             id=self.get_next_ent_id(),
                             text=ent["text"], 
-                            type=ent["type"], 
+                            type=ent["type"],
+                            topic_groups=ent["topic"],
                             confidence=ent["confidence"],
                             aliases=ent["aliases"],
-                            recieving_ents=[],
                             mentioned_in=[msg.id]
                         )
             
             batched_msg.list_ents.append(new_ent)
         
-        for relationship in verify_response["relationships"]:
+        for relationship in llm_response["relationships"]:
 
             new_relation = Relationship(source_text=relationship["source_text"], 
                                         target_text=relationship["target_text"],

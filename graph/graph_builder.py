@@ -87,7 +87,7 @@ class GraphBuilder:
                 entity_msg.ParseFromString(data)
                 
                 entity_data = {
-                    "id": f"ent_{len(self.driver.ent_to_vertex)}",  # Generate ID
+                    "id": entity_msg,  # Generate ID
                     "name": entity_msg.text,
                     "type": entity_msg.type,
                     "confidence": entity_msg.confidence
@@ -118,8 +118,6 @@ class GraphBuilder:
                     "confidence": relation_msg.confidence
                 }
 
-                
-            
             except Exception as e:
                 logger.error(f"Failed to add relationship: {e}")
 
