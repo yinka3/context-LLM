@@ -21,8 +21,8 @@ message Entity {
 
 
 message Relationship {
-    string source_id = 1;
-    string target_id = 2;
+    string source_text = 1;
+    string target_text = 2;
     string relation = 3;
     float confidence = 4;
     string direction = 5;

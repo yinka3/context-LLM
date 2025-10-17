@@ -1,8 +1,10 @@
-import json
 import logging
 import signal
+import os
+import socket
 import sys
 import time
+from redis import exceptions
 from redisclient import RedisClient
 from schema.common_pb2 import BatchMessage, Entity, Relationship
 
@@ -10,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 STREAM_KEY = "stream:ai_response"
 CONSUMER_GROUP = "group:parsers"
-CONSUMER_NAME = "parser-instance-1"
+CONSUMER_NAME = CONSUMER_NAME = f"parser-{socket.gethostname()}-{os.getpid()}"
 DEAD_QUEUE = 'stream:parser_dead_letters'
 
 class Parser:
@@ -38,6 +40,8 @@ class Parser:
     def run(self):
         
         logger.info(f"From Parser, listening to stream {STREAM_KEY}")
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
 
         while self.is_running:
             try:
@@ -54,6 +58,9 @@ class Parser:
                 for _, messages in response:
                     for msg_id, msg_data in messages:
                         self.process_msg(msg_id, msg_data[b'data'])
+            except exceptions.ConnectionError as e:
+                logger.error(f"Redis connection lost: {e}. Retry in 3 seconds")
+                time.sleep(3)
             except Exception as e:
                 logger.error(f"Error in parser loop: Retry in 3 seconds")
                 time.sleep(3)
@@ -81,7 +88,40 @@ class Parser:
             logger.error(f"CRITICAL FAILURE processing message {msg_id}: {e}. Moving to Dead Letter Queue.")
             self.redis.client.xadd(DEAD_QUEUE, {'original_id': msg_id, 'data': data})
             self.redis.client.xack(STREAM_KEY, CONSUMER_GROUP, msg_id)
+    
+    #TODO: When switching to a mark and process flow, add a needs_review flag in protobuf message and also something similar as node property
+    def is_batch_valid(self, batch_msg: BatchMessage):
 
+        entity_texts = {e.text for e in batch_msg.list_ents}
+        for entity in batch_msg.list_ents:
+            if not entity.text.strip() or not entity.type:
+                logger.error("Missing entity text or type")
+                return False
+            
+            #NOTE I might still add low confidence but maybe mark it as low confidence?
+            if entity.confidence < 0.4:
+                logger.error("Low confidence entity detected")
+                return False
+        
+        for rel in batch_msg.list_relations:
+
+            if not rel.source_text.strip() or not rel.target_text.strip() or rel.relation.strip():
+                logger.error("Relationship missing source, target, or relation")
+                return False
+            
+            
+            if rel.source_text not in entity_texts or rel.target_text not in entity_texts:
+                logger.error("Misaligned entity representation")
+                return False
+            
+            #NOTE I might still add low confidence but maybe mark it as low confidence?
+            if rel.confidence < 0.4:
+                logger.error("Low confidence relationship detected")
+                return False
+        
+        return True
+            
+        
 
 if '__main__' == __name__:
     import logging_setup
