@@ -1,57 +1,93 @@
 import json
+import logging
+import signal
+import sys
+import time
 from redisclient import RedisClient
-from schema.common_pb2 import Message
+from schema.common_pb2 import BatchMessage, Entity, Relationship
+
+logger = logging.getLogger(__name__)
+
+STREAM_KEY = "stream:ai_response"
+CONSUMER_GROUP = "group:parsers"
+CONSUMER_NAME = "parser-instance-1"
+DEAD_QUEUE = 'stream:parser_dead_letters'
+
 class Parser:
 
     def __init__(self):
         self.redis = RedisClient()
-        self.pubsub = self.redis.client.pubsub()
-        self.resolver = EntityResolver(redis=self.redis)
+        self.is_running = True
 
-        self.handlers = {
-            "parser:ai_response": self.process_msg
-        }
-
-    def process_msg(self, data: bytes):
-        
-        msg_data = Message()
-        msg_data.ParseFromString(data)
-        self.resolver.send_to_ER(msg_data)
-
-
-
-class EntityResolver:
-
-    def __init__(self, redis):
-        self.user_name = "Yinka"
-        self.redis = redis
-        def get_redis_context(self):
-            sorted_set_key = f"recent_messages:{self.user_name}"
-            recent_msg_ids = self.redis_client.client.zrevrange(sorted_set_key, 0, 49)
-            
-            context_text = []
-            for msg_id in recent_msg_ids:
-                msg_data = self.redis_client.client.hget(f"message_content:{self.user_name}", msg_id)
-                if msg_data:
-                    context_text.append(json.loads(msg_data)['message'])
-            
-            return " ".join(context_text)
-        
-        self.context = get_redis_context()
+        try:
+            logger.info(f"Consumer Group: {CONSUMER_GROUP} exisit for stream {STREAM_KEY}")
+            self.redis.client.xgroup_create(STREAM_KEY, CONSUMER_GROUP, id='$', mkstream=True)
+        except Exception as e:
+            if "BUSYGROUP" in str(e):
+                logger.warning("Consumer group already in use")
+            else:
+                logger.error(f"An unexpected error occurred setting up consumer group: {e}")
+                sys.exit(1)
     
 
-    def send_to_ER(self):
-        pass
+    def _signal_handler(self, signum, frame):
+        # if this shuts down, there needs to be a cascade of shut down
+        logger.info(f"Recieved signal {signum}, initiating graceful shutdown")
+        self.is_running = False
     
+    def run(self):
+        
+        logger.info(f"From Parser, listening to stream {STREAM_KEY}")
 
+        while self.is_running:
+            try:
+                response = self.redis.client.xreadgroup(
+                    CONSUMER_GROUP,
+                    CONSUMER_NAME,
+                    {STREAM_KEY: '>'},
+                    block=3000
+                )
+            
+                if not response:
+                    continue
 
+                for _, messages in response:
+                    for msg_id, msg_data in messages:
+                        self.process_msg(msg_id, msg_data[b'data'])
+            except Exception as e:
+                logger.error(f"Error in parser loop: Retry in 3 seconds")
+                time.sleep(3)
+        
+        logger.info("Parser has shut down")
 
+        
+    def process_msg(self, msg_id: str, data: bytes):
+        
+        try:
+            batch_data = BatchMessage()
+            batch_data.ParseFromString(data)
+
+            if not self.is_batch_valid(batch_data):
+                logger.warning(f"Message {msg_id} is invalid. Moving to Dead Letter Queue.")
+                self.redis.client.xadd(DEAD_QUEUE, {'original_id': msg_id, 'data': data})
+                self.redis.client.xack(STREAM_KEY, CONSUMER_GROUP, msg_id)
+                return
+            
+            self.redis.client.xadd('stream:graph_tasks', {'data': data})
+            logger.info(f"Successfully routed valid BatchMessage {msg_id} to graph_tasks stream.")
+            self.redis.client.xack(STREAM_KEY, CONSUMER_GROUP, msg_id)
+            logger.debug(f"Acknowledged message {msg_id}.")
+        except Exception as e:
+            logger.error(f"CRITICAL FAILURE processing message {msg_id}: {e}. Moving to Dead Letter Queue.")
+            self.redis.client.xadd(DEAD_QUEUE, {'original_id': msg_id, 'data': data})
+            self.redis.client.xack(STREAM_KEY, CONSUMER_GROUP, msg_id)
 
 
 if '__main__' == __name__:
+    import logging_setup
+    logging_setup.setup_logging(log_file="parser_service.log")
     parser = Parser()
-    while True:
-        parser.recieve_messages()
+    parser.run()
 
         
 

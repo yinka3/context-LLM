@@ -39,6 +39,7 @@ class Context:
         self.ents_id += 1
         return f"ent_{self.ents_id}"
 
+    # maybe do this in graph builder instead of here
     def _create_user_entity(self):
         logger.info("Adding basic USER information to graph")
         user_entity = Entity(
@@ -52,7 +53,9 @@ class Context:
         )
 
         seriliazed_message = user_entity.SerializeToString()
-        self.redis_client.client.publish("direct:add_user", message=seriliazed_message)
+        try:
+            self.redis_client.client.xadd("stream-direct:add_user", {'data': seriliazed_message})
+            self.redis_client.client.xack()
         self.entities[user_entity.id] = user_entity
         return user_entity
         
