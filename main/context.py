@@ -4,8 +4,9 @@ import logging
 import logging_setup
 import json
 import os
+from main.entity_resolve import EntityResolver
 from redisclient import RedisClient
-from redis import Redis
+from redis import exceptions
 from typing import Any, Dict, List, Tuple
 from main.nlp_pipe import NLP_PIPE
 from shared.dtypes import EntityData, MessageData
@@ -14,21 +15,21 @@ from schema.common_pb2 import Entity, Relationship, BatchMessge, GraphResponse, 
 logging_setup.setup_logging()
 
 logger = logging.getLogger(__name__)
-
+STREAM_KEY_AI_RESPONSE = "stream:ai_response"
 class Context:
 
     def __init__(self, user_name: str = "Yinka"):
         self.ents_id = 0
         self.msg_id = 1
-        self.user_name = user_name
-        self.nlp_pipe: NLP_PIPE = NLP_PIPE()
-        self.llm_client = None
-        self.entities: Dict[int, EntityData] = {}
-        self.redis_client = RedisClient()
-        self.publish_id = 0
         self.user_message_cnt: int = 0
-        self.bridge_map: Dict[str, Dict[Any, List[int]]] = {}
-        self.alias_index: Dict[str, EntityData] = {}
+        self.user_name = user_name
+        self.entities: Dict[int, EntityData] = {}
+        self.nlp_pipe: NLP_PIPE = NLP_PIPE()
+        self.ent_resolver: EntityResolver = EntityResolver()
+        self.redis_client = RedisClient()
+        self.llm_client = None
+        
+
         self.user_entity = self._create_user_entity(user_name)
     
     def get_next_msg_id(self) -> str:
@@ -53,9 +54,9 @@ class Context:
         )
 
         seriliazed_message = user_entity.SerializeToString()
-        try:
-            self.redis_client.client.xadd("stream-direct:add_user", {'data': seriliazed_message})
-            self.redis_client.client.xack()
+        
+        self.redis_client.client.xadd("stream-direct:add_user", {'data': seriliazed_message})
+        self.redis_client.client.xack()
         self.entities[user_entity.id] = user_entity
         return user_entity
         
@@ -80,21 +81,6 @@ class Context:
         return " ".join(context_text), context_text
 
 
-    
-    def track_active_entities(self, resolved_entities: Dict, timestamp: datetime):
-        """Keep track of recently mentioned entities"""
-        active_key = f"active_entities:{self.user_name}"
-        
-        for entity in resolved_entities.values():
-            self.redis_client.client.zadd(
-                active_key,
-                {f"ent_{entity.id}": timestamp.timestamp()}
-            )
-        
-        # Keep only last hour's entities
-        cutoff = (timestamp - timedelta(hours=1)).timestamp()
-        self.redis_client.client.zremrangebyscore(active_key, 0, cutoff)
-
     def add_to_redis(self, msg: MessageData):
         sorted_set_key = f"recent_messages:{self.user_name}" 
         hash_key = f"message_content:{self.user_name}"
@@ -109,95 +95,51 @@ class Context:
         self.redis_client.client.zremrangebyrank(sorted_set_key, 0, -76)
     
     
-    def _build_llm_prompt(self, msg: MessageData, nlp_results: Dict, recent_context: List[str]) -> Tuple[str, str]:
+    def _build_llm_prompt(self, msg: MessageData, nlp_results: Dict, resolution_candidates: Dict[str, List[Dict]],
+                          recent_context: List[str]) -> Tuple[str, str]:
         """
         Builds the system and user prompts for the SLM.
         """
-        system_prompt = f"""You are a semantic extraction engine for business knowledge graphs. Extract entities and relationships with precision and appropriate confidence scoring.
+        system_prompt = f"""You are a semantic extraction and entity resolution engine. Your goal is to accurately identify entities in a user's message, linking them to existing known entities when possible, or identifying them as new.
 
-        ENTITY EXTRACTION:
-        - VALIDATE: Confirm high_confidence_entities, correct types if needed
-        - SCRUTINIZE: Accept/reject low_confidence_entities based on context
-        - DISCOVER: Find missed entities using coref_clusters and conversation context
+        **ENTITY RESOLUTION TASK:**
+        - For each potential entity found in the `pre_analysis`, I have provided a list of `entity_resolution_candidates`.
+        - Review the `conversation_history` and the candidate `profile` summaries.
+        - **DECISION:** For each entity, you MUST decide if it refers to one of the candidates OR if it is a completely new entity.
+        - **LINKING:** If it matches a candidate, you MUST use that candidate's `id` in your output. The `text` in your output should be the candidate's canonical name. You may add newly discovered aliases.
+        - **CREATING:** If it is a new entity, you MUST use `null` for the `id`.
 
-        ENTITY TYPES:
-        Use these primary types: PERSON, ORGANIZATION, LOCATION, DATE, TIME, WORK_PRODUCT_OR_PROJECT, TECHNOLOGY, EVENT, TOPIC, ACADEMIC_CONCEPT, POSSESSIVE_ENTITY, GROUP_OF_ENTITIES
-
-        TOPIC ASSIGNMENT:
-        User's active topics: {', '.join(self.active_topics)}
+        **EXTRACTION TASK:**
+        - Extract semantic relationships between the final resolved entities.
+        - Ensure relationship `source` and `target` fields use the final canonical names.
         
-        For each entity, assign to the most relevant topic from the active list. If no active topic fits well, suggest a new topic name that better captures the entity's context.
-        
-        RELATIONSHIP EXTRACTION:
-        Extract semantic relationships between entities using your reasoning capabilities. Consider these common patterns as examples, but discover ANY meaningful relationships present:
-
-        EXAMPLE PATTERNS (not exhaustive):
-        - Actions: "Sarah teaches Mike" → [teaches], "team plays against rivals" → [competes_with]
-        - Possession: "Sarah's guitar" → [owns], "Mike's theory" → [authored/developed]  
-        - Roles: "Sarah, the guitarist" → [has_role], "Mike, my brother" → [sibling_of]
-        - Location: "meeting in library" → [located_in], "lives in Boston" → [resides_in]
-        - Temporal: "concert tomorrow" → [scheduled_for], "after graduation" → [follows]
-        - Social: "friends with", "dating", "mentored by" → [friends_with], [dating], [mentored_by]
-        - Academic: "studies under", "researches", "cites" → [studies_under], [researches], [cites]
-        - Creative: "inspired by", "covers song by", "collaborated on" → [inspired_by], [covers], [collaborated_on]
-
-        DISCOVERY APPROACH:
-        Look beyond these examples. Extract relationships from any domain - personal, academic, creative, technical, social, familial, professional, hobby-related, etc. Use your reasoning to identify meaningful connections between entities.
-
-        RELATIONSHIP EXTRACTION METHODS:
-        - Verbs connecting entities: "Sarah teaches guitar" → [teaches]
-        - Possessives: "Mike's research" → [conducts/owns] 
-        - Appositives: "Jake, my roommate" → [roommate_of]
-        - Prepositions: "concert at venue" → [performed_at]
-        - Contextual implications: "study group met" → [participates_in]
-        - Implicit relationships: "They've been together 5 years" → [in_relationship_with]
-
-        RELATIONSHIP NAMING:
-        Use clear, descriptive relation names. Prefer specific verbs ("teaches", "lives_with", "studies") over generic ones ("relates_to", "associated_with").
-
-        CONFIDENCE SCORING:
-        ENTITIES: 1.0 (explicit/unambiguous), 0.8 (contextually clear), 0.6 (reasonably inferred), 0.4 (uncertain)
-        RELATIONSHIPS: 1.0 (explicit verbs), 0.8 (clear syntax), 0.6 (contextual inference), 0.4 (weak signal)
-        Reject entities/relationships below 0.4 confidence.
-
-        GRAPH OPERATION SUGGESTIONS:
-        Based on extraction results, suggest these operations:
-
-        REQUIRED OPERATIONS (always suggest when applicable):
-        - "add_entity": For each entity in resolved_entities 
-        - "add_relationship": For each relationship extracted
-
-        
-        OUTPUT (JSON only):
-        {
-        "resolved_entities": [
-            {
-                "text": str,
-                "type": str,
-                "confidence": float
-            }
-        ],
-        "relationships": [
-            {
-                "source": str,
-                "target": str,
-                "relation": str, 
-                "confidence": float,
-                "directionality": "bidirectional|source_to_target|target_to_source"
-            }
-        ],
-        "topic_suggestions": [
-            {
-                "suggested_topic": str, 
-                "entities": [list of entity texts]
-            }
-        ]
-        }"""
+        **OUTPUT (JSON only):**
+        {{
+          "resolved_entities": [
+            {{
+              "id": str | null, // Use candidate's ID if matched, otherwise null
+              "canonical_name": str, // The primary name for the entity
+              "entity_type": str,
+              "aliases": [str], // Include all known and new aliases
+              "summary": str, // A brief, updated summary based on new context
+              "confidence": float
+            }}
+          ],
+          "relationships": [
+            {{
+              "source": str, // Canonical name of source entity
+              "target": str, // Canonical name of target entity
+              "relation": str, 
+              "confidence": float
+            }}
+          ]
+        }}"""
 
         user_prompt_data = {
             "conversation_history": recent_context[-10:],
             "current_message": msg.message,
-            "pre_analysis": self.clean_nlp_for_prompt(nlp_results)
+            "pre_analysis": self.clean_nlp_for_prompt(nlp_results),
+            "entity_resolution_candidates": resolution_candidates
         }
         
         return system_prompt, json.dumps(user_prompt_data, indent=2)
@@ -245,20 +187,52 @@ class Context:
         
         return analysis_payload
 
+    #TODO: make a profile data structure to keep consistency in context and entity resolver
+    async def _update_resolver_from_llm(self, response):
+        
+        if "resolved_entities" not in response:
+            logger.warning("LLM response missing 'resolved_entities'. Cannot update resolver")
+            return
+
+        for entity_profile in response["resolved_entities"]:
+            ent_id = entity_profile.get("id")
+
+            if ent_id:
+                logger.info(f"Updating entity {ent_id} in resolver.")
+                self.ent_resolver.update_entity(ent_id, entity_profile)
+            else:
+                new_ent_id = self.get_next_ent_id()
+                entity_profile["id"] = new_ent_id
+                logger.info(f"Adding new entity {new_ent_id} to resolver.")
+                self.ent_resolver.add_entity(
+                    entity_id=new_ent_id,
+                    profile=entity_profile
+                )
+        logger.info("Entity resolver update task finished.")
 
 
-    def process_live_messages(self, msg: Message):
+    async def process_live_messages(self, msg: Message):
         
         self.add_to_redis(msg)
+        recent_context = self.get_recent_context()
 
         #NOTE this should be a blocking operation right???
-        results = self.nlp_pipe.start_process(message_block=self.get_recent_context(), 
-                                              msg=msg, entity_threshold=0.7)
+        results = self.nlp_pipe.start_process(message_block=recent_context, 
+                                              msg=msg, entity_threshold=0.65)
         
-        recent_context, _ = self.get_recent_context()
+        potential_mentions = results.get("high_confidence_entities", [])
+        resolution_candidates = {}
+        for mention in potential_mentions:
+            mention_text = mention["text"]
+            # Find top 3 candidates for this mention
+            candidates = self.ent_resolver.resolve(text=mention_text, context=msg.message, top_k=3)
+            if candidates:
+                resolution_candidates[mention_text] = candidates
 
-        prompt = self._build_llm_prompt(msg, results, recent_context)
+        prompt = self._build_llm_prompt(msg, results, resolution_candidates, recent_context[0])
         llm_response = self._call_llm(prompt)
+
+        asyncio.create_task(self._update_resolver_from_llm(llm_response))
         self.publish_message(llm_response=llm_response, msg=msg)
         
     
@@ -266,14 +240,12 @@ class Context:
         
         batched_msg = BatchMessge(message_id=msg.id)
         for ent in llm_response["resolved_entities"]:
-
-            new_ent = Entity(
-                            id=self.get_next_ent_id(),
+            entity_id = ent.get("id") or self.get_next_ent_id()
+            new_ent = Entity(id=entity_id,
                             text=ent["text"], 
-                            type=ent["type"],
-                            topic_groups=ent["topic"],
+                            type=ent["entity_type"],
                             confidence=ent["confidence"],
-                            aliases=ent["aliases"],
+                            aliases=ent.get("aliases", []),
                             mentioned_in=[msg.id]
                         )
             
@@ -284,13 +256,17 @@ class Context:
             new_relation = Relationship(source_text=relationship["source_text"], 
                                         target_text=relationship["target_text"],
                                         relation=relationship["relation"],
-                                        confidence=relationship["confidence"],
-                                        directionality=relationship["directionality"])
+                                        confidence=relationship["confidence"])
             
             batched_msg.list_relations.append(new_relation)
         
         serialized_data = batched_msg.SerializeToString()
-        self.redis_client.client.publish(channel="parser:ai_response", message=serialized_data)
+
+        try:
+            self.redis_client.client.xadd(STREAM_KEY_AI_RESPONSE, {'data': serialized_data})
+            logger.info(f"Added message for {msg.id} to stream '{STREAM_KEY_AI_RESPONSE}'")
+        except exceptions.RedisError as e:
+            logger.error(f"Failed to add message to Redis Stream: {e}")
 
 
 if '__main__' == __name__:
@@ -309,6 +285,20 @@ if '__main__' == __name__:
 
 
 
-
+"""
+def track_active_entities(self, resolved_entities: Dict, timestamp: datetime):
+        Keep track of recently mentioned entities
+        active_key = f"active_entities:{self.user_name}"
+        
+        for entity in resolved_entities.values():
+            self.redis_client.client.zadd(
+                active_key,
+                {f"ent_{entity.id}": timestamp.timestamp()}
+            )
+        
+        # Keep only last hour's entities
+        cutoff = (timestamp - timedelta(hours=1)).timestamp()
+        self.redis_client.client.zremrangebyscore(active_key, 0, cutoff)
+"""
 
 

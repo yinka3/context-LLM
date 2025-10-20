@@ -13,10 +13,9 @@ message Entity {
     int32 id = 1;
     string text = 2;
     string type = 3;
-    string topic_groups = 4;
-    float confidence = 5;
-    repeated map<string, string> aliases = 6;
-    repeated string mentioned_in = 7;
+    float confidence = 4;
+    repeated string aliases = 5;
+    repeated string mentioned_in = 6;
 }
 
 
@@ -25,7 +24,6 @@ message Relationship {
     string target_text = 2;
     string relation = 3;
     float confidence = 4;
-    string direction = 5;
 }
 
 message BatchMessage {

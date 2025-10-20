@@ -114,7 +114,6 @@ class GraphBuilder:
 
                 edge_data = {
                     "relation": relation_msg.relation,
-                    "direction": relation_msg.direction,
                     "confidence": relation_msg.confidence
                 }
 
