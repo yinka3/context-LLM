@@ -10,6 +10,7 @@ from redis import exceptions
 from typing import Any, Dict, List, Tuple
 from main.nlp_pipe import NLP_PIPE
 from shared.dtypes import EntityData, MessageData
+from models.factory import get_llm_client
 from schema.common_pb2 import Entity, Relationship, BatchMessge, GraphResponse, Message
 
 logging_setup.setup_logging()
@@ -27,7 +28,7 @@ class Context:
         self.nlp_pipe: NLP_PIPE = NLP_PIPE()
         self.ent_resolver: EntityResolver = EntityResolver()
         self.redis_client = RedisClient()
-        self.llm_client = None
+        self.llm_client = get_llm_client()
         
 
         self.user_entity = self._create_user_entity(user_name)
@@ -40,16 +41,15 @@ class Context:
         self.ents_id += 1
         return f"ent_{self.ents_id}"
 
-    # maybe do this in graph builder instead of here
+
     def _create_user_entity(self):
-        logger.info("Adding basic USER information to graph")
+        logger.info("Adding USER information to graph")
         user_entity = Entity(
             id=self.get_next_ent_id(),
             text="USER",
             type="PERSON",
             confidence=1.0,
-            aliases=[{"text": self.user_name, "type": "PERSON"}],
-            recieving_ents=[],
+            aliases=[],
             mentioned_in=[]
         )
 

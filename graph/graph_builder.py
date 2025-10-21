@@ -1,6 +1,10 @@
 import logging
+import os
+import socket
 import threading
 import time
+import logging_setup
+from redis import exceptions
 from readerwriterlock import rwlock
 from concurrent.futures import ThreadPoolExecutor
 import signal
@@ -11,7 +15,13 @@ from redisclient import RedisClient
 from schema.common_pb2 import Entity, Relationship
 from schema.graph_messages_pb2 import *
 
+logging_setup.setup_logging(log_file="graph_builder_service.log")
 logger = logging.getLogger(__name__)
+
+STREAM_KEY = "stream:graph_tasks"
+CONSUMER_GROUP = "group:graph_builders"
+CONSUMER_NAME = f"builder-{socket.gethostname()}-{os.getpid()}"
+DEAD_QUEUE = 'stream:builder_dead_letters'
 
 class GraphBuilder:
     def __init__(self, max_workers: int = 4):
@@ -27,18 +37,19 @@ class GraphBuilder:
         self.processed_messages = 0
         self.failed_messages = 0
         
-        self.channel_handlers = {
-            'graph:add-entity': self._handle_add_entity,
-            'graph:add-relationship': self._handle_add_relationship
-        }
+        try:
+            logger.info(f"Ensuring consumer group '{CONSUMER_GROUP}' exists for stream '{STREAM_KEY}'.")
+            self.redis_client.client.xgroup_create(STREAM_KEY, CONSUMER_GROUP, id='$', mkstream=True)
+        except exceptions.ResponseError as e:
+            if "BUSYGROUP" in str(e):
+                logger.warning(f"Consumer group '{CONSUMER_GROUP}' already exists.")
+            else:
+                logger.error(f"Failed to create consumer group: {e}")
+                sys.exit(1)
 
     
     def start(self):
-        logger.info("Starting GraphBuilder...")
-        
-        channels = list(self.channel_handlers.keys())
-        self.pubsub.subscribe(*channels)
-        logger.info(f"Subscribed to channels: {channels}")
+        logger.info(f"Starting GraphBuilder service as consumer '{CONSUMER_NAME}'.")
         
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -50,8 +61,7 @@ class GraphBuilder:
         logger.info("Stopping GraphBuilder...")
         self.running.clear()
         self.shutdown_event.set()
-        self.pubsub.close()
-        self.executor.shutdown(wait=True, timeout=30)
+        self.executor.shutdown(wait=True)
         
         logger.info(f"Service stopped. Processed: {self.processed_messages}, Failed: {self.failed_messages}")
     
@@ -66,18 +76,26 @@ class GraphBuilder:
         
         while self.running.is_set():
             try:
-                message = self.pubsub.get_message(timeout=1.0)
-                
-                if message is None:
+                response = self.redis_client.client.xreadgroup(
+                    CONSUMER_GROUP,
+                    CONSUMER_NAME,
+                    {STREAM_KEY: '>'}, 
+                    count=10,
+                    block=1000
+                )
+            
+                if not response:
                     continue
+
+                for _, messages in response:
+                    for msg_id, msg_data in messages:
+                        self.executor.submit(self._process_message, msg_id, msg_data)
                     
-                if message['type'] == 'message':
-                    self.executor.submit(self._process_message, message)
-                    
+            except exceptions.ConnectionError as e:
+                logger.error(f"Redis connection lost: {e}. Retrying in 5 seconds...")
+                time.sleep(5)
             except Exception as e:
-                logger.error(f"Error in message loop: {e}")
-                if not self.running.is_set():
-                    break
+                logger.error(f"An unexpected error occurred in the message loop: {e}", exc_info=True)
                 time.sleep(1)
     
     def _handle_add_entity(self, data: bytes):
@@ -124,9 +142,6 @@ class GraphBuilder:
                 
 
 def main():
-
-    import logging_setup
-    logging_setup.setup_logging(log_file="graph_builder_service.log")
     service = GraphBuilder(max_workers=4)
     
     try:
