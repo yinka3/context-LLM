@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Tuple
 from main.nlp_pipe import NLP_PIPE
 from shared.dtypes import EntityData, MessageData
 from models.factory import get_llm_client
-from schema.common_pb2 import Entity, Relationship, BatchMessge, GraphResponse, Message
+from schema.common_pb2 import Entity, Relationship, BatchMessage, Message
 
 logging_setup.setup_logging()
 
@@ -238,7 +238,7 @@ class Context:
     
     def publish_message(self, llm_response, msg=Message):
         
-        batched_msg = BatchMessge(message_id=msg.id)
+        batched_msg = BatchMessage(message_id=msg.id)
         for ent in llm_response["resolved_entities"]:
             entity_id = ent.get("id") or self.get_next_ent_id()
             new_ent = Entity(id=entity_id,

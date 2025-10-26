@@ -12,16 +12,15 @@ import sys
 
 from graph_driver import KnowGraph
 from redisclient import RedisClient
-from schema.common_pb2 import Entity, Relationship
-from schema.graph_messages_pb2 import *
+from schema.common_pb2 import Entity, Relationship, BatchMessage
 
 logging_setup.setup_logging(log_file="graph_builder_service.log")
 logger = logging.getLogger(__name__)
 
-STREAM_KEY = "stream:graph_tasks"
-CONSUMER_GROUP = "group:graph_builders"
+STREAM_KEY = "stream:ai_response"
+CONSUMER_GROUP = "group:parsers"
 CONSUMER_NAME = f"builder-{socket.gethostname()}-{os.getpid()}"
-DEAD_QUEUE = 'stream:builder_dead_letters'
+DEAD_QUEUE = 'stream:parser_dead_letters'
 
 class GraphBuilder:
     def __init__(self, max_workers: int = 4):
@@ -137,7 +136,52 @@ class GraphBuilder:
 
             except Exception as e:
                 logger.error(f"Failed to add relationship: {e}")
+    
+    #TODO: When switching to a mark and process flow, add a needs_review flag in protobuf message and also something similar as node property
+    def _is_batch_valid(self, batch_msg: BatchMessage):
 
+        entity_texts = {e.text for e in batch_msg.list_ents}
+        for entity in batch_msg.list_ents:
+            if not entity.text.strip() or not entity.type:
+                logger.error("Missing entity text or type")
+                return False
+            
+            #NOTE I might still add low confidence but maybe mark it as low confidence?
+            if entity.confidence < 0.4:
+                logger.error("Low confidence entity detected")
+                return False
+        
+        for rel in batch_msg.list_relations:
+
+            if not rel.source_text.strip() or not rel.target_text.strip() or rel.relation.strip():
+                logger.error("Relationship missing source, target, or relation")
+                return False
+            
+            
+            if rel.source_text not in entity_texts or rel.target_text not in entity_texts:
+                logger.error("Misaligned entity representation")
+                return False
+            
+            #NOTE I might still add low confidence but maybe mark it as low confidence?
+            if rel.confidence < 0.4:
+                logger.error("Low confidence relationship detected")
+                return False
+        
+        return True
+
+    def _process_message(self, msg_id, msg_data):
+
+        batch_msg = BatchMessage()
+        batch_msg.ParseFromString(msg_data[b'data'])
+
+        if not self._is_batch_valid(batch_msg):
+            logger.warning(f"Invalid BatchMessage {msg_id}. Moving to DLQ")
+            self.redis_client.client.xadd(DEAD_QUEUE, {'original_id': msg_id, 'data': msg_data[b'data']})
+            self.redis_client.client.xack(STREAM_KEY, CONSUMER_GROUP, msg_id)
+            self.failed_messages += 1
+            return
+        
+        
 
                 
 

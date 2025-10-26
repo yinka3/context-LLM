@@ -89,37 +89,7 @@ class Parser:
             self.redis.client.xadd(DEAD_QUEUE, {'original_id': msg_id, 'data': data})
             self.redis.client.xack(STREAM_KEY, CONSUMER_GROUP, msg_id)
     
-    #TODO: When switching to a mark and process flow, add a needs_review flag in protobuf message and also something similar as node property
-    def is_batch_valid(self, batch_msg: BatchMessage):
-
-        entity_texts = {e.text for e in batch_msg.list_ents}
-        for entity in batch_msg.list_ents:
-            if not entity.text.strip() or not entity.type:
-                logger.error("Missing entity text or type")
-                return False
-            
-            #NOTE I might still add low confidence but maybe mark it as low confidence?
-            if entity.confidence < 0.4:
-                logger.error("Low confidence entity detected")
-                return False
-        
-        for rel in batch_msg.list_relations:
-
-            if not rel.source_text.strip() or not rel.target_text.strip() or rel.relation.strip():
-                logger.error("Relationship missing source, target, or relation")
-                return False
-            
-            
-            if rel.source_text not in entity_texts or rel.target_text not in entity_texts:
-                logger.error("Misaligned entity representation")
-                return False
-            
-            #NOTE I might still add low confidence but maybe mark it as low confidence?
-            if rel.confidence < 0.4:
-                logger.error("Low confidence relationship detected")
-                return False
-        
-        return True
+    
             
         
 
