@@ -1,12 +1,9 @@
 from collections import defaultdict
+from pathlib import Path
 import time
 from typing import Any, Dict, TYPE_CHECKING, Optional
 import graph_tool.all as gt
-from concurrent.futures import ThreadPoolExecutor
 import logging
-
-from redis import Redis
-from shared.dtypes import EdgeData
 
 if TYPE_CHECKING:
     from shared.dtypes import EntityData
@@ -26,7 +23,18 @@ class KnowGraph:
 
     def __init__(self):
         self.graph = gt.Graph()
+        self.v_property = None
+        self.e_property = None
 
+        self._properties()
+
+        self.vertex_stats = {} 
+        self.current_snapshot_id = 0
+        self.ent_to_vertex: Dict[str, Any] = {}
+        self.graph_snapshots = Dict[int, 'gt.Graph'] = {}
+    
+
+    def _properties(self):
         self.v_property = {
             'entity_id': self.graph.new_vertex_property("string"),
             'entity_name': self.graph.new_vertex_property("string"),
@@ -49,11 +57,21 @@ class KnowGraph:
             'confidence_score': self.graph.new_edge_property("double"),
             'data': self.graph.new_edge_property("object")
         }
+    
 
-        self.vertex_stats = {} 
-        self.current_snapshot_id = 0
-        self.ent_to_vertex: Dict[str, Any] = {}
-        self.graph_snapshots = Dict[int, 'gt.Graph'] = {}
+    def load_graph(self, file_path: Path):
+
+        if not file_path.exists():
+            logger.warning(f"Graph file not found at {file_path}")
+            return
+
+        try:
+            self.graph = gt.load_graph(str(file_path), fmt="graphml")
+            self._properties()
+        except Exception as e:
+            logger.critical(f"FATAL: Failed to load graph from {file_path}. Error: {e}", exc_info=True)
+            raise
+
     
     def add_entity(self, entity_data: dict):
         
@@ -64,7 +82,6 @@ class KnowGraph:
         self.v_property['entity_id'][v] = entity_data["id"]
         self.v_property['entity_name'][v] = entity_data["name"]
         self.v_property['entity_type'][v] = entity_data["type"]
-        self.v_property['topic'][v] = entity_data["id"]
         self.v_property['confidence_score'] = entity_data["confidence"]
         self.v_property['data'][v] = entity_data
         
