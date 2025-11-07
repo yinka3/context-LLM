@@ -15,7 +15,7 @@ from graph_driver import KnowGraph
 from redisclient import RedisClient
 from schema.common_pb2 import BatchMessage
 from timeloop import Timeloop
-from main import entity_resolve as ER
+from run import entity_resolve as ER
 logging_setup.setup_logging(log_file="graph_builder_service.log")
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,8 @@ CONSUMER_NAME = f"builder-{socket.gethostname()}-{os.getpid()}"
 class GraphBuilder:
     WAIT_TIME_SECONDS = 1
 
-    def __init__(self, max_workers: int = 4):
-        self.driver: KnowGraph = KnowGraph()
+    def __init__(self, driver: KnowGraph, max_workers: int = 4):
+        self.driver: KnowGraph = driver
         self.redis_client = RedisClient()
         self.pubsub = self.redis_client.client.pubsub()
         self.timer: 'Timeloop' = Timeloop()

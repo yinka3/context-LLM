@@ -19,14 +19,14 @@ logger = logging.getLogger(__name__)
 STREAM_KEY_AI_RESPONSE = "stream:ai_response"
 class Context:
 
-    def __init__(self, user_name: str = "Yinka"):
+    def __init__(self, resolver: EntityResolver, user_name: str = "Yinka"):
         self.ents_id = 0
         self.msg_id = 1
         self.user_message_cnt: int = 0
         self.user_name = user_name
         self.entities: Dict[int, EntityData] = {}
         self.nlp_pipe: NLP_PIPE = NLP_PIPE()
-        self.ent_resolver: EntityResolver = EntityResolver()
+        self.ent_resolver: EntityResolver = resolver
         self.redis_client = RedisClient()
         self.llm_client = get_llm_client()
         
