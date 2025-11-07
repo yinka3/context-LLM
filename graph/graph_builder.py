@@ -5,7 +5,6 @@ from pathlib import Path
 import socket
 import threading
 import time
-from typing import Callable
 import logging_setup
 from redis import exceptions
 from readerwriterlock import rwlock
@@ -16,6 +15,7 @@ from graph_driver import KnowGraph
 from redisclient import RedisClient
 from schema.common_pb2 import BatchMessage
 from timeloop import Timeloop
+from main import entity_resolve as ER
 logging_setup.setup_logging(log_file="graph_builder_service.log")
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ class GraphBuilder:
         self.driver: KnowGraph = KnowGraph()
         self.redis_client = RedisClient()
         self.pubsub = self.redis_client.client.pubsub()
-        self.timer: 'Timeloop' = None
+        self.timer: 'Timeloop' = Timeloop()
 
         self.persistence_dir = Path("./graph_data")
         self.persistence_dir.mkdir(exist_ok=True)
@@ -56,6 +56,12 @@ class GraphBuilder:
             else:
                 logger.error(f"Failed to create consumer group: {e}")
                 sys.exit(1)
+        
+        @self.timer.job(interval=timedelta(minutes=30))
+        def scheduler():
+            self._starting_saving_process()
+        
+        self.resolver = ER.EntityResolver()
     
 
     def _to_disk(self, snapshot):
@@ -69,11 +75,14 @@ class GraphBuilder:
             logger.error(f"Failed to save graph to disk: {e}", exc_info=True)
 
 
-    def _saving(self, is_shutdown=False):
+    def _starting_saving_process(self, is_shutdown=False):
         
+        if not self.save_lock.acquire(blocking=False):
+            logger.info("Save operation in progress already")
+            return False
+    
+        logger.info("Snapshotting graph...")
         try:
-
-            self.save_lock.acquire()
             with self.graph_lock.gen_rlock():
                 snapshot = self.driver.snapshot_graph()
             if is_shutdown:
@@ -81,11 +90,14 @@ class GraphBuilder:
             else:
                 self.save_thread = threading.Thread(target=self._to_disk, args=(snapshot,))
                 self.save_thread.start()
+        except Exception as e:
+            logger.error(f"Error during save initiation: {e}", exc_info=True)
+            return False 
         finally:
-            self.save_lock.release()
+                self.save_lock.release()
     
     
-    def start(self,):
+    def start(self):
         
         self.driver.load_graph(self.graph_path)
 
@@ -94,7 +106,6 @@ class GraphBuilder:
         signal.signal(signal.SIGTERM, self._signal_handler)
         
         self.timer.start()
-        
         self.running.set()
         self._message_loop()
         
@@ -103,15 +114,15 @@ class GraphBuilder:
         self.running.clear()
 
         if self.timer:
+            logger.info("Stopping Timeloop scheduler...")
             self.timer.stop()
 
         if self.save_thread and self.save_thread.is_alive():
             self.save_thread.join()
         
-        self._saving(is_shutdown=True)
+        self._starting_saving_process(is_shutdown=True)
 
         self.executor.shutdown(wait=True)
-        
         logger.info(f"Service stopped. Processed: {self.processed_messages}, Failed: {self.failed_messages}")
     
     def _signal_handler(self, signum, frame):
@@ -234,9 +245,7 @@ def main():
     service = GraphBuilder(max_workers=4)
     service.timer = Timeloop()
 
-    @service.timer.job(interval=timedelta(minutes=30))
-    def scheduler():
-        service._saving()
+ 
 
     try:
         service.start()

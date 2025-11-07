@@ -26,15 +26,6 @@ class KnowGraph:
         self.v_property = None
         self.e_property = None
 
-        self._properties()
-
-        self.vertex_stats = {} 
-        self.current_snapshot_id = 0
-        self.ent_to_vertex: Dict[str, Any] = {}
-        self.graph_snapshots = Dict[int, 'gt.Graph'] = {}
-    
-
-    def _properties(self):
         self.v_property = {
             'entity_id': self.graph.new_vertex_property("string"),
             'entity_name': self.graph.new_vertex_property("string"),
@@ -43,7 +34,7 @@ class KnowGraph:
             'topic': self.graph.new_vertex_property("string"),
             'origin_msg': self.graph.new_vertex_property("string"),
             'community_id': self.graph.new_vertex_property("int"),
-            'confidence_score': self.graph.new_edge_property("double"),
+            'confidence_score': self.graph.new_vertex_property("double"),
             'mentioned_in': self.graph.new_vertex_property("object", vals=[]),
             'context_mentions': self.graph.new_vertex_property("object", vals=[]),
             'page_rank_hist': self.graph.new_vertex_property("object", vals={}),
@@ -57,6 +48,45 @@ class KnowGraph:
             'confidence_score': self.graph.new_edge_property("double"),
             'data': self.graph.new_edge_property("object")
         }
+
+        self.vertex_stats = {} 
+        self.current_snapshot_id = 0
+        self.ent_to_vertex: Dict[str, Any] = {}
+        self.graph_snapshots = Dict[int, 'gt.Graph'] = {}
+
+
+    def rebind_properties(self):
+        logger.info("Re-binding property maps from loaded graph.")
+        self.v_property = {
+            'entity_id': self.graph.vertex_properties['entity_id'],
+            'entity_name': self.graph.vertex_properties['entity_name'],
+            'entity_type': self.graph.vertex_properties['entity_type'],
+            'aliasis': self.graph.vertex_properties['aliasis'],
+            'topic': self.graph.vertex_properties['topic'],
+            'origin_msg': self.graph.vertex_properties['origin_msg'],
+            'community_id': self.graph.vertex_properties['community_id'],
+            'confidence_score': self.graph.vertex_properties['confidence_score'],
+            'mentioned_in': self.graph.vertex_properties['mentioned_in'],
+            'context_mentions': self.graph.vertex_properties['context_mentions'],
+            'page_rank_hist': self.graph.vertex_properties['page_rank_hist'],
+            'data': self.graph.vertex_properties['data']
+        }
+
+        self.e_property = {
+            'relation_type': self.graph.edge_properties['relation_type'],
+            'timestamp': self.graph.edge_properties['timestamp'],
+            'messages_connected': self.graph.edge_properties['messages_connected'],
+            'confidence_score': self.graph.edge_properties['confidence_score'],
+            'data': self.graph.edge_properties['data']
+        }
+
+        logger.info("Re-building ent_to_vertex map from loaded graph...")
+        self.ent_to_vertex = {}
+        entity_id_map = self.v_property['entity_id']
+        for v in self.graph.vertices():
+            entity_id = entity_id_map[v]
+            self.ent_to_vertex[entity_id] = v
+        logger.info(f"Re-built ent_to_vertex map with {len(self.ent_to_vertex)} entries.")
     
 
     def load_graph(self, file_path: Path):
@@ -66,8 +96,8 @@ class KnowGraph:
             return
 
         try:
-            self.graph = gt.load_graph(str(file_path), fmt="graphml")
-            self._properties()
+            self.graph = gt.load_graph(str(file_path), fmt="gt")
+            self.rebind_properties()
         except Exception as e:
             logger.critical(f"FATAL: Failed to load graph from {file_path}. Error: {e}", exc_info=True)
             raise
@@ -78,11 +108,11 @@ class KnowGraph:
         if entity_data["id"] in self.ent_to_vertex:
             return
         
-        v = list(self.graph.add_vertex())
+        v = self.graph.add_vertex()
         self.v_property['entity_id'][v] = entity_data["id"]
         self.v_property['entity_name'][v] = entity_data["name"]
         self.v_property['entity_type'][v] = entity_data["type"]
-        self.v_property['confidence_score'] = entity_data["confidence"]
+        self.v_property['confidence_score'][v] = entity_data["confidence"]
         self.v_property['data'][v] = entity_data
         
         self.ent_to_vertex[entity_data["id"]] = v
