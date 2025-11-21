@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from google import genai as genai # Updated import
+import google.generativeai as genai
 from .base import AbstractLLMClient
 from typing import Dict
 
