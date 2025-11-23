@@ -6,15 +6,16 @@ message Entity {
     string type = 3;
     float confidence = 4;
     repeated string aliases = 5;
-    repeated string mentioned_in = 6;
+    string summary = 7; 
+    string topic = 8;   
 }
+
 
 
 message Relationship {
     string source_text = 1;
     string target_text = 2;
-    string relation = 3;
-    float confidence = 4;
+    float confidence = 3;
 }
 
 message BatchMessage {

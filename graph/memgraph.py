@@ -89,7 +89,7 @@ class MemGraphStore:
     
 
     def add_relationship(self, source_name: str, target_name: str, 
-                        relation: str, confidence: float = 1.0):
+                        message_id: str, confidence: float = 1.0):
         
         """
         Handles relationship creation with generic head verb with specific verb property
@@ -98,37 +98,32 @@ class MemGraphStore:
         query = """
         MATCH (a:Entity {canonical_name: $source_name})
         MATCH (b:Entity {canonical_name: $target_name})
-        MERGE (a)-[r:RELATED_TO]->(b)
-        SET r.verb = $verb,
+        
+        MERGE (a)-[r:RELATED_TO]-(b)
+        
+        ON CREATE SET 
+            r.weight = 1,
             r.confidence = $confidence,
-            r.last_seen = timestamp()
-        """
+            r.last_seen = timestamp(),
+            r.message_ids = [$msg_id]
 
+        ON MATCH SET 
+            r.weight = r.weight + 1, 
+            r.confidence = CASE WHEN $confidence > r.confidence THEN $confidence ELSE r.confidence END,
+            r.last_seen = timestamp(),
+            r.message_ids = CASE 
+                WHEN NOT ($msg_id IN r.message_ids) THEN r.message_ids + $msg_id 
+                ELSE r.message_ids 
+            END
+        """
+        
         with self.driver.session() as session:
-            session.run(query, 
-                        {
-                            "source_name": source_name,
-                            "target_name": target_name,
-                            "verb": relation,
-                            "confidence": confidence
-                        })
-    
-    def correct_relationship(self, source_name: str, target_name: str, new_verb: str):
-        """
-        Handles atomically deleting old edges and creating new ones
-        """
-
-        query = """
-        MATCH (a:Entity {canonical_name: $source_name})-[r:RELATED_TO]-(b:Entity {canonical_name: $target_name})
-        DELETE r
-        WITH a, b
-        MERGE (a)-[new_r:RELATED_TO]->(b)
-        SET new_r.verb = $verb,
-            new_r.confidence = 1.0,  // User truth
-            new_r.last_seen = timestamp()
-        """
-        with self.driver.session() as session:
-            session.run(query, {"source_name": source_name, "target_name": target_name, "verb": new_verb})
+            session.run(query, {
+                "source_name": source_name,
+                "target_name": target_name,
+                "msg_id": message_id,
+                "confidence": confidence
+            })
     
 
     def set_topic_status(self, topic_name: str, status: str):
@@ -139,7 +134,8 @@ class MemGraphStore:
             session.run(query, {"name": topic_name, "status": status})
     
     def log_daily_mood(self, user_name: str, emotion_data: Dict):
-        """Part 2.5: Memory Management - Log Mood Time Series"""
+        """Handles Mood Time Series"""
+        
         query = """
         MATCH (u:Entity {canonical_name: $user_name, type: 'PERSON'})
         CREATE (m:DailyMood {
@@ -156,3 +152,90 @@ class MemGraphStore:
                 "emotion": emotion_data.get("label"), 
                 "score": emotion_data.get("score")
             })
+    
+
+    def get_subgraph_context(self, entity_ids: List[int], active_only: bool = True):
+        """
+        Handles generic context retrieval
+        """
+
+        query = """
+        MATCH (source:Entity) WHERE source.id IN $ids
+        MATCH (source)-[r:RELATED_TO]-(target:Entity)
+
+        OPTIONAL MATCH (target)-[:BELONGS_TO]->(t:Topic)
+
+        WITH source, r, target, t
+        WHERE
+            ($active_only = false) OR
+            (t IS NULL) OR
+            (t.status <> 'inactive')
+
+        RETURN
+            source.canonical_name as source,
+            target.canonical_name as target,
+            target.summary as target_summary,
+            r.weight as connection_strength,
+            r.message_ids as evidence_ids,
+            r.confidence as confidence,
+            r.last_seen as last_seen
+        
+        ORDER BY r.weight DESC, r.last_seen DESC
+        LIMIT 50
+        """
+
+        with self.driver.session() as session:
+            res = session.run(query, {
+                "ids": entity_ids,
+                "active_only": active_only
+            })
+
+            return [record.data() for record in res]
+        
+    
+    def get_recent_interaction(self, entity_id: int, hours: int = 24):
+        cutoff_ms = int((time.time() - (hours * 3600)) * 1000)
+        
+        query = """
+        MATCH (e:Entity {id: $id})-[r:RELATED_TO]-(target:Entity)
+        WHERE r.last_seen > $cutoff
+        RETURN target.canonical_name as entity, r.verb as action, r.last_seen as time
+        ORDER BY r.last_seen DESC
+        """
+        with self.driver.session() as session:
+            result = session.run(query, {"id": entity_id, "cutoff": cutoff_ms})
+            return [record.data() for record in result]
+    
+
+    def find_connection(self, start_id: int, end_id: int):
+        """Handles retrieval for main reasoning"""
+
+        query = """
+        MATCH (start:Entity {id: $start_id}), (end:Entity {id: $end_id})
+        // Shortest path based on fewer hops (unweighted breadth-first)
+        // Future optimization: Use Dijkstra with 'weight' to find 'Strongest Path'
+        MATCH p = shortestPath((start)-[:RELATED_TO*..4]-(end))
+        
+        RETURN [n in nodes(p) | n.canonical_name] as names, 
+               [r in relationships(p) | r.message_ids] as evidence_ids
+        """
+
+        with self.driver.session() as session:
+            result = session.run(query, {"start_id": start_id, "end_id": end_id})
+            record = result.single()
+            
+            if record:
+                path_data = []
+                names = record["names"]
+                evidence = record["evidence_ids"]
+                
+                for i in range(len(evidence)):
+                    path_data.append({
+                        "step": i,
+                        "entity_a": names[i],
+                        "entity_b": names[i+1],
+                        # We return the IDs, Python fetches the text from Redis
+                        "evidence_refs": evidence[i] 
+                    })
+                return path_data
+            return []

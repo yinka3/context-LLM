@@ -277,23 +277,3 @@ class NLP_PIPE:
         self._contextual_features(message_block=message_block, res=res)
         return res
     
-
-
-'''
-    def analyze_time(self, text: str) -> Dict:
-        """
-        Analyzes the text for temporal expressions.
-        """
-        if not text: 
-            return []
-            
-        found_dates = dateparser.parse(text, languages=['en'])
-        if not found_dates:
-            return []
-        
-        return {
-            "text": text,
-            "value": int(found_dates.timestamp()),
-            "type": "TIME"
-        }
-''' 
