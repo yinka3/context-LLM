@@ -1,61 +1,78 @@
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import pickle
-from typing import Any, Dict
+from typing import Any, Dict, List
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from rapidfuzz import process as fuzzy_process, fuzz
+
+from graph.memgraph import MemGraphStore
 
 logger = logging.getLogger(__name__)
 
 
 class EntityResolver:
 
-    def __init__(self, embedding_model_model='all-MiniLM-L6-v2', data_dir="./graph_data"):
+    def __init__(self, embedding_model_model='google/embeddinggemma-300m', data_dir="./graph_data"):
         self.embedding_model = SentenceTransformer(embedding_model_model)
-        self.embedding_dim = 384
+        self.embedding_dim = 768
         self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)
         self.index_id_map = faiss.IndexIDMap2(self.faiss_index)
         
-        self.fuzzy_choices: Dict[str, int] = {} # Alias -> Entity ID
-        self.entity_profiles: Dict[int, Dict] = {} # Entity ID -> Profile
+        self.fuzzy_choices: Dict[str, int] = {}
+        self.entity_profiles: Dict[int, Dict] = {}
         
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
     
-
-    def save(self):
+    def _init_from_db(self):
+        logger.info("Hydrating Resolver from Memgraph...")
         try:
-            faiss.write_index(self.index_id_map, str(self.data_dir / "resolver.index"))
-            with open(self.data_dir / "resolver_data.pkl", "wb") as f:
-                pickle.dump({
-                    "profiles": self.entity_profiles,
-                    "fuzzy": self.fuzzy_choices
-                }, f)
-        except Exception as e:
-            logger.warning(f"Error saving to disk: {e}")
-    
-    def load(self):
-        index_path = self.data_dir / "resolver.index"
-        data_path = self.data_dir / "resolver_data.pkl"
-
-        if index_path.exists() and data_path.exists():
-
-            try:
-                self.index_id_map = faiss.read_index(str(index_path))
-
-                with open(data_path, "rb") as f:
-
-                    data = pickle.load(f)
-                    self.entity_profiles = data["fuzzy"]
+            store = MemGraphStore()
+            
+            query = """
+            MATCH (n:Entity)
+            RETURN n.id, n.canonical_name, n.aliases, n.summary, n.type, n.embedding
+            """
+            
+            with store.driver.session() as session:
+                results = session.run(query)
                 
-                logger.info("Resolver state loaded")
-            except Exception as e:
-                logger.info(f"Failed to load resolver state: {e}")
+                vectors = []
+                ids = []
+
+                for r in results:
+                    e_id = r["n.id"]
+                    
+                    self.entity_profiles[e_id] = {
+                        "canonical_name": r["n.canonical_name"],
+                        "aliases": r["n.aliases"] if r["n.aliases"] else [],
+                        "summary": r["n.summary"],
+                        "type": r["n.type"]
+                    }
+                    
+                    names = [r["n.canonical_name"]] + (r["n.aliases"] or [])
+                    for n in names:
+                        self.fuzzy_choices[n] = e_id
+                    
+                    if r["n.embedding"]:
+                        vectors.append(r["n.embedding"])
+                        ids.append(e_id)
+                
+                if vectors:
+                    logger.info(f"Loading {len(vectors)} vectors into FAISS.")
+                    vec_np = np.array(vectors, dtype=np.float32)
+                    ids_np = np.array(ids, dtype=np.int64)
+                    faiss.normalize_L2(vec_np)
+                    self.index_id_map.add_with_ids(vec_np, ids_np)
+
+        except Exception as e:
+            logger.error(f"Failed to hydrate from DB: {e}")
 
 
-    def add_entity(self, entity_id: int, profile: Dict):
+    def add_entity(self, entity_id: int, profile: Dict) -> List[float]:
 
         if entity_id in self.entity_profiles:
             print(f"Entity {entity_id} already exists. Updating.")
@@ -63,21 +80,34 @@ class EntityResolver:
             return
         
         logger.info(f"Adding entity {entity_id} to resolver indexes.")
-        self.entity_profiles[entity_id] = profile
-        
 
+        profile.setdefault("topic", "General")
+        profile.setdefault("first_seen", datetime.now(timezone.utc).isoformat())
+        profile["last_seen"] = datetime.now(timezone.utc).isoformat()
+
+
+        summary_text = profile.get("summary", "") or "No information available."
+        embedding_np = self.embedding_model.encode([summary_text])[0]
+        
+        faiss.normalize_L2(embedding_np.reshape(1, -1))
+        
+        self.index_id_map.add_with_ids(
+            x=np.array([embedding_np]), 
+            xids=np.array([entity_id], dtype=np.int64)
+        )
+
+        self.entity_profiles[entity_id] = profile
         for name in [profile["canonical_name"]] + profile["aliases"]:
             self.fuzzy_choices[name] = entity_id
         
-        if "summary" in profile and profile["summary"]:
-            profile_emd = self.embedding_model.encode([profile["summary"]])
-            faiss.normalize_L2(profile_emd)
-            self.index_id_map.add_with_ids(x=profile_emd, xids=np.array([entity_id], dtype=np.int64))    
-        
+        return embedding_np.tolist()
     
-    def update_entity(self, entity_id: str, new_profile: Dict):
+    def update_entity(self, entity_id: int, new_profile: Dict) -> List[float]:
 
-        old_profile = self.entity_profiles.get(entity_id)
+        old_profile = self.entity_profiles.get(entity_id, {})
+
+        new_profile["first_seen"] = old_profile.get("first_seen", datetime.now(timezone.utc).isoformat())
+        new_profile["last_seen"] = datetime.now(timezone.utc).isoformat()
         
         if old_profile:
             old_aliases = [old_profile.get("canonical_name")] + old_profile.get("aliases", [])
@@ -96,10 +126,17 @@ class EntityResolver:
         except Exception:
             pass
 
-        if "summary" in new_profile and new_profile["summary"]:
-            profile_emd = self.embedding_model.encode([new_profile["summary"]])
-            faiss.normalize_L2(profile_emd)
-            self.index_id_map.add_with_ids(x=profile_emd, xids=np.array([entity_id], dtype=np.int64))   
+        summary_text = new_profile.get("summary", "") or "No information available."
+        embedding_np = self.embedding_model.encode([summary_text])[0]
+        
+        faiss.normalize_L2(embedding_np.reshape(1, -1))
+        
+        self.index_id_map.add_with_ids(
+            x=np.array([embedding_np]), 
+            xids=np.array([entity_id], dtype=np.int64)
+        ) 
+
+        return embedding_np.tolist()
 
 
     def resolve(self, text: str, context: str, top_k: int = 10, fuzzy_cutoff: int = 80):
@@ -121,10 +158,11 @@ class EntityResolver:
                         "score": score,
                         "norm_score": norm_score,
                         "matched_aliases": match_name
-                    }
+                    },
+                    "profile": self.entity_profiles.get(entity_id, {})
                 }
         
-        if self.faiss_index.ntotal > 0:
+        if self.index_id_map.ntotal > 0:
             query_text = f"{text} mentioned in context of: {context}"
             query_embedding = self.embedding_model.encode([query_text])
             faiss.normalize_L2(query_embedding)

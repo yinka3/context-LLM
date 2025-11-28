@@ -106,10 +106,9 @@ class GraphBuilder:
 
             for entity in batch_msg.list_ents:
 
-                if not entity.id:
+                if entity.id is None:
                     continue
                     
-
                 ent_data = {
                     "id": entity.id,
                     "name": entity.text,
@@ -117,7 +116,8 @@ class GraphBuilder:
                     "confidence": entity.confidence,
                     "aliases": list(entity.aliases),
                     "summary": entity.summary, 
-                    "topic": entity.topic     
+                    "topic": entity.topic,
+                    "embedding": list(entity.embedding)
                 }
 
                 self.store.upsert_entity(ent_data)
@@ -127,9 +127,9 @@ class GraphBuilder:
                 self.store.add_relationship(
                     source_name=rel.source_text,
                     target_name=rel.target_text,
+                    relation=rel.relation,
                     message_id=current_msg_ref,
-                    confidence=rel.confidence
-                )
+                    confidence=rel.confidence)
             
             self.redis_client.client.xack(STREAM_KEY, CONSUMER_GROUP, stream_id)
             self.processed_messages += 1

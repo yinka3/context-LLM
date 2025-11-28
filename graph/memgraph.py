@@ -63,7 +63,8 @@ class MemGraphStore:
             e.type = $type,
             e.summary = $summary,
             e.confidence = $confidence,
-            e.last_updated = timestamp()
+            e.last_updated = timestamp(),
+            e.embedding = $embedding
         
         SET e.aliases = $aliases
 
@@ -81,7 +82,8 @@ class MemGraphStore:
             "summary": entity_data.get("summary", "No Summary Provided Yet."),
             "confidence": entity_data.get("confidence", 1.0),
             "aliases": entity_data.get("aliases", []),
-            "topic_name": entity_data.get("topic", None)
+            "topic_name": entity_data.get("topic", None),
+            "embedding": entity_data.get("embedding", [])
         }
 
         with self.driver.session() as session:
@@ -89,7 +91,7 @@ class MemGraphStore:
     
 
     def add_relationship(self, source_name: str, target_name: str, 
-                        message_id: str, confidence: float = 1.0):
+                    relation: str, message_id: str, confidence: float = 1.0):
         
         """
         Handles relationship creation with generic head verb with specific verb property
@@ -102,6 +104,7 @@ class MemGraphStore:
         MERGE (a)-[r:RELATED_TO]-(b)
         
         ON CREATE SET 
+            r.verb = $relation,
             r.weight = 1,
             r.confidence = $confidence,
             r.last_seen = timestamp(),
@@ -121,6 +124,7 @@ class MemGraphStore:
             session.run(query, {
                 "source_name": source_name,
                 "target_name": target_name,
+                "relation": relation,
                 "msg_id": message_id,
                 "confidence": confidence
             })
@@ -175,6 +179,7 @@ class MemGraphStore:
             source.canonical_name as source,
             target.canonical_name as target,
             target.summary as target_summary,
+            r.verb as relation,
             r.weight as connection_strength,
             r.message_ids as evidence_ids,
             r.confidence as confidence,
@@ -217,7 +222,8 @@ class MemGraphStore:
         MATCH p = shortestPath((start)-[:RELATED_TO*..4]-(end))
         
         RETURN [n in nodes(p) | n.canonical_name] as names, 
-               [r in relationships(p) | r.message_ids] as evidence_ids
+            [r in relationships(p) | r.message_ids] as evidence_ids,
+            [r in relationships(p) | r.verb] as relations
         """
 
         with self.driver.session() as session:
@@ -228,13 +234,14 @@ class MemGraphStore:
                 path_data = []
                 names = record["names"]
                 evidence = record["evidence_ids"]
+                relations = record["relations"]
                 
                 for i in range(len(evidence)):
                     path_data.append({
                         "step": i,
                         "entity_a": names[i],
                         "entity_b": names[i+1],
-                        # We return the IDs, Python fetches the text from Redis
+                        "relation": relations[i],
                         "evidence_refs": evidence[i] 
                     })
                 return path_data

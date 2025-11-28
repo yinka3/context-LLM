@@ -3,42 +3,50 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import logging_setup
 import json
+import instructor
+from pydantic import BaseModel
+from openai import OpenAI
 from main.entity_resolve import EntityResolver
 from redisclient import RedisClient
 from redis import exceptions
-from typing import Dict, List, Tuple
-from main.nlp_pipe import NLP_PIPE
-from shared.dtypes import MessageData
-from models.factory import get_llm_client
+from typing import Dict, List, Tuple, TypeVar, Type
+from main.nlp_pipe import NLPPipeline
+from schema.dtypes import *
+
 from schema.common_pb2 import Entity, Relationship, BatchMessage
+from graph.memgraph import MemGraphStore
 
 logging_setup.setup_logging()
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar('T', bound=BaseModel)
 STREAM_KEY_AI_RESPONSE = "stream:ai_response"
 
+LLM_CLIENT = lambda: instructor.patch(OpenAI(base_url="http://localhost:11434/v1", api_key="ollama"))
 
 class Context:
 
-    def __init__(self, user_name: str = "Yinka"):
+    def __init__(self, user_name: str = "Yinka", topics: List[str] = ["General"]):
+        self.active_topics: List[str] = topics
         self.redis_client = RedisClient()
+        self.store = MemGraphStore()
         self.cpu_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ctx_worker")
         
-
-        self.nlp_pipe: NLP_PIPE = NLP_PIPE()
+        self.nlp_pipe = NLPPipeline()
         
         self.ent_resolver: EntityResolver = EntityResolver()
         self.ent_resolver.load()
         
         try:
-            self.llm_client = get_llm_client()
-        except ValueError as e:
+            self.llm_client = LLM_CLIENT()
+            self.llm_client.models.list()
+        except Exception as e:
             logger.critical(f"Failed to initialize LLM: {e}")
             raise
-
-        self.user_name = user_name
         
-        self.user_entity = self._get_or_create_user_entity(user_name)
+        self.user_name = user_name
+        self._get_or_create_user_entity(user_name)
 
 
     def get_next_msg_id(self) -> int:
@@ -55,19 +63,8 @@ class Context:
             logger.info(f"User {user_name} recognized with ID {existing_id}")
             return self.ent_resolver.entity_profiles.get(existing_id)
         
-        logger.info("Adding USER information to graph")
+        logger.info(f"Creating new USER entity for {user_name}")
         new_id = self.get_next_ent_id()
-        user_entity = Entity(
-            id=new_id,
-            text="USER",
-            type="PERSON",
-            confidence=1.0,
-            aliases=[user_name],
-            mentioned_in=[]
-        )
-
-        seriliazed_message = user_entity.SerializeToString()
-        self.redis_client.client.xadd("stream-direct:add_user", {'data': seriliazed_message})
 
         profile = {
             "canonical_name": "USER",
@@ -75,16 +72,34 @@ class Context:
             "summary": f"The primary user named {user_name}",
             "type": "PERSON"
         }
-        self.ent_resolver.add_entity(new_id, profile)
-        self.ent_resolver.save()
-        return user_entity
+
+        embedding_vector = self.ent_resolver.add_entity(new_id, profile)
+
+        user_entity = Entity(
+            id=new_id,
+            text="USER",
+            type="PERSON",
+            confidence=1.0,
+            aliases=[],
+            summary=profile["summary"],
+            topic="Meta",
+            embedding=embedding_vector
+        )
+
+        batch = BatchMessage(message_id=0)
+        batch.list_ents.append(user_entity)
+
+        try:
+            self.redis_client.client.xadd(STREAM_KEY_AI_RESPONSE, {'data': batch.SerializeToString()})
+        except Exception as e:
+            logger.error(f"Failed to push User Entity to stream: {e}")
         
     
     def add(self, msg: MessageData):
         asyncio.create_task(self.process_live_messages(msg))
 
     
-    def get_recent_context(self, num_messages: int = 10) -> Tuple[str, List[str]]:
+    def get_recent_context(self, num_messages: int = 10) -> List[str]:
         sorted_set_key = f"recent_messages:{self.user_name}"
         recent_msg_ids = self.redis_client.client.zrevrange(sorted_set_key, 0, num_messages-1)
         
@@ -96,310 +111,350 @@ class Context:
             if msg_data:
                 context_text.append(json.loads(msg_data)['message'])
         
-        return " ".join(context_text), context_text
+        return context_text
 
 
     def add_to_redis(self, msg: MessageData):
         msg_key = f"msg_{msg.id}"
         
         self.redis_client.client.hset(f"message_content:{self.user_name}", msg_key, json.dumps({
-            'message': msg.message,
-            'timestamp': msg.timestamp,
+            'message': msg.message.strip(),
+            'timestamp': msg.timestamp.isoformat(),
             'role': msg.role
         }))
 
-        self.redis_client.client.zadd(f"recent_messages:{self.user_name}", {msg_key: float(msg.timestamp)})
+        self.redis_client.client.zadd(f"recent_messages:{self.user_name}", {msg_key: msg.timestamp.timestamp()})
         self.redis_client.client.zremrangebyrank(f"recent_messages:{self.user_name}", 0, -76)
     
-    def _build_extraction_prompt(self, msg: MessageData, nlp_results: Dict, 
-                                    resolution_candidates: Dict[str, List[Dict]],
-                                    recent_history: List[str]) -> Tuple[str, str]:
-        """
-        PROMPT 1: The Graph Architect.
-        Focus: ID Resolution (Link vs Create), Relationship Extraction, and Significance Filtering.
-        """
-        
-        system_prompt = """You are a precise Knowledge Graph extraction engine. Your goal is to map entities and extract relationships without hallucinating details.
+    def _build_extraction_prompt(
+        self, 
+        msg: MessageData, 
+        resolution_candidates: Dict[str, List[Dict]],
+        recent_history: List[str]
+    ) -> Tuple[str, str]:
+    
+        topics_str = ", ".join(self.active_topics) if self.active_topics else "General"
 
-    **TASK 1: ENTITY RESOLUTION**
-    - I will provide `potential_entities` found in the text and `candidates` from the database.
-    - **LINKING:** If a potential entity refers to a candidate, you MUST use that candidate's `id` (Integer).
-    - **CREATING:** If it is completely new, use `null` for `id`.
-    - **SIGNIFICANCE:** Set `has_new_info`: true ONLY if the text provides specific, factual updates about the entity (e.g., "John moved to NY"). Set `false` for casual mentions (e.g., "Hi John").
+        system_prompt = f"""You are a Knowledge Graph extraction engine for a personal memory system.
 
-    **TASK 2: RELATIONSHIP EXTRACTION**
-    - Extract factual relationships between entities.
-    - Use the resolved `canonical_name` for source and target.
+            The user talks about their life - people they know, places they go, projects they work on.
+            Your job is to extract entities and relationships from their messages.
 
-    **OUTPUT JSON SCHEMA:**
-    {
-    "entities": [
-        {
-        "id": int | null,
-        "canonical_name": "string",
-        "type": "string", 
-        "has_new_info": boolean
-        }
-    ],
-    "relationships": [
-        {
-        "source": "string",
-        "target": "string",
-        "relation": "string",
-        "confidence": float
-        }
-    ]
-    }"""
-        
+            **AVAILABLE TOPICS**: {topics_str}
+
+            **TASK 1: ENTITY EXTRACTION & RESOLUTION**
+            - Extract entities (people, organizations, places, projects, events, etc.)
+            - Check if each entity matches a provided candidate. If yes, use the candidate's `id`. If new, use `null`.
+            - Assign each entity to one of the available topics. If none fit, use "General".
+            - Set `has_new_info: true` if the message reveals NEW facts about an existing entity.
+
+            **TASK 2: RELATIONSHIP EXTRACTION**
+            - Identify factual connections between entities.
+            - Use canonical names for source and target.
+
+            **EXAMPLES**
+
+            Input: "Jake started working at Stripe last week"
+            Candidates: {{"Jake": [{{"id": 7, "name": "Jake", "summary": "User's friend from college"}}]}}
+            Output:
+            {{
+            "entities": [
+                {{"id": 7, "canonical_name": "Jake", "type": "PERSON", "topic": "Friends", "confidence": 0.95, "has_new_info": true}},
+                {{"id": null, "canonical_name": "Stripe", "type": "ORG", "topic": "Work", "confidence": 0.9, "has_new_info": false}}
+            ],
+            "relationships": [
+                {{"source": "Jake", "target": "Stripe", "relation": "works_at", "confidence": 0.95}}
+            ]
+            }}
+
+            Input: "Had coffee with my sister"
+            Candidates: {{"sister": [{{"id": 3, "name": "Sarah", "summary": "User's older sister, lives in Boston"}}]}}
+            Output:
+            {{
+            "entities": [
+                {{"id": 3, "canonical_name": "Sarah", "type": "PERSON", "topic": "Family", "confidence": 0.9, "has_new_info": false}}
+            ],
+            "relationships": []
+            }}
+            """
+
         clean_candidates = {}
         for mention, c_list in resolution_candidates.items():
             clean_candidates[mention] = [
-                {"id": c["id"], "name": c["profile"]["canonical_name"], "summary": c["profile"]["summary"]}
+                {"id": c["id"], "name": c["profile"]["canonical_name"], "summary": c["profile"].get("summary", "")}
                 for c in c_list
             ]
 
         user_prompt_data = {
-            "conversation_history": recent_history[-5:], # Keep history short for extraction
-            "current_message": msg.message,
-            "nlp_analysis": self.clean_nlp_for_prompt(nlp_results),
+            "conversation_history": recent_history,
+            "current_message": msg.message.strip(),
             "candidates": clean_candidates
         }
         
         return system_prompt, json.dumps(user_prompt_data, indent=2)
     
-    def _build_profiling_prompt(self, entity_name: str, existing_profile: Dict, 
-                                new_observation: str) -> Tuple[str, str]:
-        """
-        PROMPT 2: The Biographer.
-        Focus: Synthesis, Summary Writing, and Alias Consolidation.
-        Only called if 'has_new_info' was True in the extraction step.
-        """
-        
-        system_prompt = """You are a Profile Refinement engine for a digital memory system.
-        
-**TASK:**
-1. Read the `existing_profile` and the `new_observation`.
-2. Update the `summary` to incorporate the new facts naturally.
-3. **CONSTRAINT:** Keep the summary concise (under 50 words). Focus on identity, role, and key facts.
-4. Consolidate `aliases` (add new ones, remove duplicates).
-5. Refine the `type` if the new info is more specific.
+    def _build_profiling_prompt(
+        self, 
+        entity_name: str, 
+        entity_type: str,
+        existing_profile: Dict, 
+        new_observation: str,
+        conversation_context: List[str]
+    ) -> Tuple[str, str]:
+    
+        system_prompt = """You are a Profile Refinement engine for a personal memory system.
 
-**OUTPUT JSON SCHEMA:**
-{
-  "canonical_name": "string",
-  "type": "string",
-  "aliases": ["string"],
-  "summary": "string"
-}"""
+        **TASK:**
+        1. Review the existing profile and new observation.
+        2. Update the summary ONLY if there are genuinely new facts.
+        3. Preserve existing facts unless contradicted.
+        4. Keep summaries concise (2-3 sentences max).
+        5. Consolidate any new aliases.
+
+        **EXAMPLE**
+
+        Existing profile:
+        {"canonical_name": "Jake", "aliases": [], "summary": "User's friend from college", "topic": "Personal"}
+
+        New observation: "Jake started his new job at Stripe as a backend engineer"
+
+        Updated profile:
+        {"canonical_name": "Jake", "aliases": [], "summary": "User's friend from college. Works at Stripe as a backend engineer.", "topic": "Personal"}
+        """
 
         user_prompt_data = {
             "entity_target": entity_name,
+            "entity_type": entity_type,
             "existing_profile": existing_profile,
-            "new_observation": new_observation
+            "new_observation": new_observation,
+            "recent_context": conversation_context
         }
 
         return system_prompt, json.dumps(user_prompt_data, indent=2)
 
     
-    async def _call_llm(self, prompt_tuple: Tuple[str, str]) -> Dict | None:
-        system, user = prompt_tuple
+    async def _call_llm(self, 
+                        prompt: Tuple[str, str], 
+                        response_model: Type[T]) -> T | None:
+        
+        system, user = prompt
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self.cpu_executor,
-            lambda: self.llm_client.generate_json_response(system, user)
-        )
-
-    def clean_nlp_for_prompt(self, result: Dict):
-        analysis_payload = {}
-
-        if result.get("high_confidence_entities"):
-            analysis_payload["high_confidence_entities"] = [
-                {"text": ent["text"], "type": ent["type"], "confidence": ent["confidence"], "contextual_mention": ent["contextual_mention"]}
-                for ent in result["high_confidence_entities"]
-            ]
-
-        if result.get("low_confidence_entities"):
-            analysis_payload["low_confidence_entities"] = [
-                {"text": ent["text"], "type": ent["type"], "confidence": ent["confidence"], "contextual_mention": ent["contextual_mention"]}
-                for ent in result["low_confidence_entities"]
-            ]
         
-
-        if result.get("emotion"):
-            analysis_payload["emotion"] = result["emotion"]
-
-        if result.get("coref_clusters"):
-            analysis_payload["coref_clusters"] = [
-                {
-                    "main": cluster.main.text,
-                    "mentions": [mention.text for mention in cluster.mentions]
-                }
-                for cluster in result["coref_clusters"]
-            ]
-        
-        return analysis_payload
-
-    async def _update_resolver_from_llm(self, response):
-        
-        if "resolved_entities" not in response:
-            logger.warning("LLM response missing 'resolved_entities'. Cannot update resolver")
-            return
-
-        for entity in response["resolved_entities"]:
-            ent_id = entity.get("id")
-
-            profile = {
-                "canonical_name": entity["canonical_name"],
-                "aliases": entity.get("aliases", []),
-                "summary": entity.get("summary", ""),
-                "type": entity.get("entity_type", "MISC")
-            }
-
-            if ent_id:
-                self.ent_resolver.update_entity(int(ent_id), profile)
-            else:
-                new_ent_id = self.get_next_ent_id()
-                entity["id"] = new_ent_id
-                logger.info(f"Adding new entity {new_ent_id} to resolver.")
-                self.ent_resolver.add_entity(
-                    entity_id=new_ent_id,
-                    profile=profile
+        try:
+            return await loop.run_in_executor(
+                self.cpu_executor,
+                lambda: self.llm_client.chat.completions.create(
+                    model="qwen2.5:14b",
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user}
+                    ],
+                    response_model=response_model,
+                    max_retries=2
                 )
-        
-        logger.info("Saving Entity Resolver state to disk...")
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self.cpu_executor, self.ent_resolver.save)
+            )
+        except Exception as e:
+            logger.error(f"LLM Generation Failed: {e}")
+            return None
     
-    async def _run_profile_updates(self, entities_list: List[Dict], context_text: str):
+    async def _run_profile_updates(self, 
+        entities_list: List[Dict], 
+        context_text: str,
+        recent_context_list: List[str]
+    ):
         """Background task to run Prompt 2 for specific entities"""
-        for ent in entities_list:
-            ent_id = ent.get("id")
-            name = ent.get("canonical_name")
-            
-            existing_profile = {}
-            if ent_id:
-                existing_profile = self.ent_resolver.entity_profiles.get(int(ent_id), {})
-            
-            prompt_profile = self._build_profiling_prompt(name, existing_profile, context_text)
-            updated_profile = await self._call_llm(prompt_profile)
 
-            if updated_profile:
-                final_id = int(ent_id) if ent_id else self.get_next_ent_id()
+        updates_for_graph = []
+
+        for ent in entities_list:
+            ent_id = ent["id"]
+            name = ent["canonical_name"]
+            
+            existing_profile = self.ent_resolver.entity_profiles.get(ent_id, {})
+            old_summary = existing_profile.get("summary", "No information provided")
+            
+            prompt_profile = self._build_profiling_prompt(
+                entity_name=name,
+                entity_type=ent["type"],
+                existing_profile=existing_profile,
+                new_observation=context_text,
+                conversation_context=recent_context_list
+            )
+            updated_profile = await self._call_llm(prompt_profile, response_model=ProfileUpdate)
+
+            if not updated_profile:
+                continue
+            
+            current_aliases = set(existing_profile.get("aliases", []))
+            current_aliases.update(updated_profile.aliases)
+            
+            old_name = existing_profile.get("canonical_name")
+            if old_name and old_name != updated_profile.canonical_name:
+                current_aliases.add(old_name)
+            
+            if updated_profile.canonical_name in current_aliases:
+                current_aliases.remove(updated_profile.canonical_name)
                 
-                self.ent_resolver.update_entity(final_id, updated_profile)
+            final_aliases_list = list(current_aliases)
+
+            new_summary = updated_profile.summary
         
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self.cpu_executor, self.ent_resolver.save)
+            if new_summary == old_summary:
+                continue
+
+            profile_dict = {
+                "canonical_name": updated_profile.canonical_name,
+                "aliases": final_aliases_list,
+                "summary": new_summary,
+                "topic": updated_profile.topic,
+            }
+            
+            new_embedding = self.ent_resolver.update_entity(ent_id, profile_dict)
+                
+            graph_update = Entity(
+                id=ent_id,
+                text=updated_profile.canonical_name,
+                type=ent["type"],
+                aliases=updated_profile.aliases,
+                summary=new_summary,
+                topic=updated_profile.topic,
+                embedding=new_embedding
+            )
+            updates_for_graph.append(graph_update)
+        
+        
+        if updates_for_graph:
+            self._send_batch_to_stream(
+                message_id=0,
+                entities=updates_for_graph,
+                relations=[]
+            )
+            logger.info(f"Refined {len(updates_for_graph)} profiles in background.")
+    
+
+    def _send_batch_to_stream(self, message_id: int, entities: List[Entity], relations: List[Relationship]):
+        """Helper to serialize and push to Redis Stream"""
+        batch = BatchMessage(
+            message_id=message_id,
+            list_ents=entities,
+            list_relations=relations
+        )
+        try:
+            self.redis_client.client.xadd(STREAM_KEY_AI_RESPONSE, {'data': batch.SerializeToString()})
+        except exceptions.RedisError as e:
+            logger.error(f"Failed to push batch to stream: {e}")
 
 
     async def process_live_messages(self, msg: MessageData):
         
         self.add_to_redis(msg)
-        recent_context = self.get_recent_context()
+        recent_context_list = self.get_recent_context()
 
         loop = asyncio.get_running_loop()
 
-        results = await loop.run_in_executor(
-            self.cpu_executor,
-            self.nlp_pipe.start_process,
-            recent_context,
-            msg,
-            0.65
-        )
-        
-        
-        potential_mentions = results.get("high_confidence_entities", [])
-        resolution_candidates = {}
+        mentions = await loop.run_in_executor(
+        self.cpu_executor,
+        self.nlp_pipe.extract_mentions,
+        msg.message.strip(),
+        0.5)
 
-        for mention in potential_mentions:
-            mention_text = mention["text"]
-            candidates = self.ent_resolver.resolve(text=mention_text, context=msg.message, top_k=3)
+        resolution_candidates = {}
+        for mention in mentions:
+            candidates = self.ent_resolver.resolve(text=mention, context=msg.message.strip(), top_k=3)
             if candidates:
-                resolution_candidates[mention_text] = candidates
+                resolution_candidates[mention] = candidates
 
         prompt_extract = self._build_extraction_prompt(
-            msg, results, resolution_candidates, recent_context[1]
-        )
-        extraction_response = await self._call_llm(prompt_extract)
+            msg, resolution_candidates, recent_context_list)
+        
+        extraction_response = await self._call_llm(prompt_extract, ExtractionResponse)
         
         if not extraction_response:
             return
         
-        self.publish_message(extraction_response, msg)
+        final_entities: List[Dict] = []
+        entities_needing_profile: List[Dict] = []
 
-        updates_needed = []
-        for ent in extraction_response.get("entities", []):
-            if ent["id"] is None or ent.get("has_new_info", False):
-                updates_needed.append(ent)
+        for ent in extraction_response.entities:
+            is_new = ent.id is None
+            
+            if is_new:
+                final_id = self.get_next_ent_id()
+                logger.info(f"Generated NEW ID {final_id} for entity '{ent.canonical_name}'")
+
+                stub_profile = {
+                    "canonical_name": ent.canonical_name,
+                    "aliases": [],
+                    "summary": f"No information on {ent.canonical_name}",
+                    "type": ent.type
+                }
+                embedding_vec = self.ent_resolver.add_entity(final_id, stub_profile)
+            else:
+                existing_profile = self.ent_resolver.entity_profiles.get(ent.id, {})
+                current_aliases = existing_profile.get("aliases", [])
+                final_id = ent.id
+            
+            entity_dict = {
+                "id": final_id,
+                "canonical_name": ent.canonical_name,
+                "type": ent.type,
+                "aliases": current_aliases,
+                "confidence": ent.confidence,
+                "embedding": embedding_vec,
+                "has_new_info": ent.has_new_info,
+            }
+            
+            final_entities.append(entity_dict)
+            
+            if is_new or ent.has_new_info:
+                entities_needing_profile.append(entity_dict)
         
-        if updates_needed:
+        relationships = [
+            {
+                "source": rel.source,
+                "target": rel.target,
+                "relation": rel.relation,
+                "confidence": rel.confidence
+            }
+            for rel in extraction_response.relationships
+        ]
+        
+        self.publish_structure(final_entities, relationships, msg.id)
+
+        if entities_needing_profile:
             asyncio.create_task(
-                self._run_profile_updates(updates_needed, msg.message)
+                self._run_profile_updates(entities_needing_profile, msg.message.strip(), recent_context_list)
             )
         
     
-    def publish_message(self, llm_response, msg=MessageData):
-        
-        batched_msg = BatchMessage(message_id=msg.id)
-        for ent in llm_response["resolved_entities"]:
-
-            raw_id = ent.get("id")
-            if raw_id is not None:
-                entity_id = int(raw_id)
-            else:
-                entity_id = self.get_next_ent_id()
-
+    def publish_structure(self, normalized_entities: List[Dict], relationships: List[Dict], msg_id: int):
+        """
+        Sends the Association Graph structure to Memgraph.
+        """
+        proto_ents = []
+        for ent in normalized_entities:
             new_ent = Entity(
-                id=entity_id,
-                text=ent.get("canonical_name"), 
-                type=ent.get("entity_type"),
+                id=ent["id"],
+                text=ent["canonical_name"],
+                type=ent["type"],
                 confidence=ent.get("confidence", 1.0),
-                aliases=ent.get("aliases", []),
-                mentioned_in=[str(msg.id)] 
+                topic=ent.get("topic", "General"),
+                embedding=ent["embedding"]
             )
-            
-            batched_msg.list_ents.append(new_ent)
+            proto_ents.append(new_ent)
         
-        for relationship in llm_response["relationships"]:
-
-            new_relation = Relationship(
-                source_text=relationship["source"],
-                target_text=relationship["target"],
-                relation=relationship["relation"],
-                confidence=relationship["confidence"]
+        proto_rels = []
+        for rel in relationships:
+            new_rel = Relationship(
+                source_text=rel["source"],
+                target_text=rel["target"],
+                confidence=rel.get("confidence", 1.0),
+                relation=rel.get("relation", "related")
             )
-            
-            batched_msg.list_relations.append(new_relation)
+            proto_rels.append(new_rel)
         
-        serialized_data = batched_msg.SerializeToString()
+        self._send_batch_to_stream(msg_id, proto_ents, proto_rels)
+        logger.info(f"Published structure for msg_{msg_id}: {len(proto_ents)} ents, {len(proto_rels)} rels")
 
-        try:
-            self.redis_client.client.xadd(STREAM_KEY_AI_RESPONSE, {'data': serialized_data})
-            logger.info(f"Added message for {msg.id} to stream '{STREAM_KEY_AI_RESPONSE}'")
-        except exceptions.RedisError as e:
-            logger.error(f"Failed to add message to Redis Stream: {e}")
-
-
-
-
-
-
-
-
-"""
-def track_active_entities(self, resolved_entities: Dict, timestamp: datetime):
-        Keep track of recently mentioned entities
-        active_key = f"active_entities:{self.user_name}"
-        
-        for entity in resolved_entities.values():
-            self.redis_client.client.zadd(
-                active_key,
-                {f"ent_{entity.id}": timestamp.timestamp()}
-            )
-        
-        # Keep only last hour's entities
-        cutoff = (timestamp - timedelta(hours=1)).timestamp()
-        self.redis_client.client.zremrangebyscore(active_key, 0, cutoff)
-"""
 
 

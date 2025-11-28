@@ -1,7 +1,7 @@
 import unittest
 from typing import Optional
 from main.context import Context 
-from shared.dtypes import MessageData, EntityData
+from schema.dtypes import MessageData, EntityData
 
 
 
