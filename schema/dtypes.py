@@ -13,10 +13,8 @@ class EntityType(str, Enum):
     TOPIC = "TOPIC"
 
 class MessageData(BaseModel):
-    id: int
-    role: str
+    id: int = -1
     message: str
-    sentiment: str
     timestamp: datetime = Field(default_factory=datetime.now)
     
 

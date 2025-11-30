@@ -2,6 +2,7 @@ import logging
 import sys
 from logging.handlers import RotatingFileHandler
 
+
 def setup_logging(log_level=logging.INFO, log_file="tier1_app.log"):
     """
     Configures a centralized logger for the application.

@@ -6,7 +6,7 @@ import time
 import signal
 from concurrent.futures import ThreadPoolExecutor
 from redis import exceptions
-from redisclient import RedisClient
+from redisclient import SyncRedisClient
 from schema.common_pb2 import BatchMessage
 from memgraph import MemGraphStore
 import logging_setup
@@ -22,7 +22,7 @@ CONSUMER_NAME = f"builder-{socket.gethostname()}-{os.getpid()}"
 class GraphBuilder:
 
     def __init__(self, max_workers: int = 2):
-        self.redis_client = RedisClient()
+        self.redis_client = SyncRedisClient().get_client()
         
         self.store = MemGraphStore() 
         
@@ -36,7 +36,7 @@ class GraphBuilder:
     def _ensure_consumer_group(self):
         try:
             logger.info(f"Ensuring consumer group '{CONSUMER_GROUP}' exists.")
-            self.redis_client.client.xgroup_create(STREAM_KEY, CONSUMER_GROUP, id='$', mkstream=True)
+            self.redis_client.xgroup_create(STREAM_KEY, CONSUMER_GROUP, id='$', mkstream=True)
         except exceptions.ResponseError as e:
             if "BUSYGROUP" in str(e):
                 logger.debug(f"Consumer group '{CONSUMER_GROUP}' already exists.")
@@ -70,7 +70,7 @@ class GraphBuilder:
 
         while self.running:
             try:
-                response = self.redis_client.client.xreadgroup(
+                response = self.redis_client.xreadgroup(
                     CONSUMER_GROUP,
                     CONSUMER_NAME,
                     {STREAM_KEY: '>'},
@@ -99,17 +99,19 @@ class GraphBuilder:
 
             if not batch_msg.message_id:
                 logger.warning(f"Skipping message {stream_id}: No internal message_id found in batch.")
-                self.redis_client.client.xack(STREAM_KEY, CONSUMER_GROUP, stream_id)
+                self.redis_client.xack(STREAM_KEY, CONSUMER_GROUP, stream_id)
                 return
 
             current_msg_ref = f"msg_{batch_msg.message_id}"
 
+            entities = []
+            relationships = []
             for entity in batch_msg.list_ents:
 
                 if entity.id is None:
                     continue
                     
-                ent_data = {
+                entities.append({
                     "id": entity.id,
                     "name": entity.text,
                     "type": entity.type,
@@ -118,27 +120,26 @@ class GraphBuilder:
                     "summary": entity.summary, 
                     "topic": entity.topic,
                     "embedding": list(entity.embedding)
-                }
-
-                self.store.upsert_entity(ent_data)
+                })
             
             for rel in batch_msg.list_relations:
 
-                self.store.add_relationship(
-                    source_name=rel.source_text,
-                    target_name=rel.target_text,
-                    relation=rel.relation,
-                    message_id=current_msg_ref,
-                    confidence=rel.confidence)
+                relationships.append({
+                "source_name": rel.source_text,
+                "target_name": rel.target_text,
+                "relation": rel.relation,
+                "message_id": current_msg_ref,
+                "confidence": rel.confidence
+            })
             
-            self.redis_client.client.xack(STREAM_KEY, CONSUMER_GROUP, stream_id)
+            self.store.write_batch(entities, relationships)
+            self.redis_client.xack(STREAM_KEY, CONSUMER_GROUP, stream_id)
             self.processed_messages += 1
         except Exception as e:
             logger.error(f"Failed to process message {stream_id}: {e}", exc_info=True)
-
             try:
-                self.redis_client.client.xadd(DEAD_QUEUE, {'original_id': stream_id, 'data': msg_data[b'data']})
-                self.redis_client.client.xack(STREAM_KEY, CONSUMER_GROUP, stream_id)
+                self.redis_client.xadd(DEAD_QUEUE, {'original_id': stream_id, 'data': msg_data[b'data']})
+                self.redis_client.xack(STREAM_KEY, CONSUMER_GROUP, stream_id)
                 self.failed_messages += 1
             except Exception as dlq_error:
                 logger.critical(f"Failed to move to DLQ: {dlq_error}")

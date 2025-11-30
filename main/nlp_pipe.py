@@ -12,7 +12,7 @@ class NLPPipeline:
     
     def __init__(
         self,
-        gliner_model: str = "urchade/gliner_large-v2.1",
+        gliner_model: str = "urchade/gliner_medium-v2.1",
         emotion_model: str = "j-hartmann/emotion-english-distilroberta-base",
         device: Optional[str] = None
     ):
@@ -32,7 +32,7 @@ class NLPPipeline:
         self.emotion_classifier = pipeline(
             "text-classification",
             model=model_name,
-            return_all_scores=True,
+            top_k=None,
             device=device_id
         )
     

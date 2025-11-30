@@ -6,24 +6,11 @@ from neo4j import GraphDatabase, Driver
 logger = logging.getLogger(__name__)
 
 class MemGraphStore:
-    _instance = None
-
-    def __new__(cls):
-        if not cls._instance:
-            cls._instance = super(MemGraphStore, cls).__new__(cls)
-        return cls._instance
-
     def __init__(self, uri: str = "bolt://localhost:7687", auth: tuple = ("admin", "password")):
-
-        if not hasattr(self, 'driver'):
-            try:
-                self.driver: Driver = GraphDatabase.driver(uri, auth=auth)
-                self.verify_conn()
-                self._setup_schema()
-                logger.info("Graph store initialized")
-            except Exception as e:
-                logger.error(f"Failed to connect to Memgraph: {e}")
-                raise
+        self.driver: Driver = GraphDatabase.driver(uri, auth=auth)
+        self.verify_conn()
+        self._setup_schema()
+        logger.info("Graph store initialized")
 
     def close(self):
         if self.driver:
@@ -32,7 +19,6 @@ class MemGraphStore:
     def verify_conn(self):
         self.driver.verify_connectivity()
     
-
     def _setup_schema(self):
         """
         Create indices and constraints to ensure performance and data integrity.
@@ -52,82 +38,46 @@ class MemGraphStore:
                     logger.debug(f"Schema setup note: {e}")
         logger.info("Memgraph schema indices verified.")
     
-    def upsert_entity(self, entity_data: Dict[str, Any]):
-        """
-        Handles atomic Create/Update and Topic Linkage
-        """
+    def write_batch(self, entities: List[Dict], relationships: List[Dict]):
+        def _run(tx):
+            for ent in entities:
+                tx.run("""
+                    MERGE (e:Entity {id: $id})
+                    SET e.canonical_name = $name,
+                        e.type = $type,
+                        e.summary = $summary,
+                        e.confidence = $confidence,
+                        e.last_updated = timestamp(),
+                        e.embedding = $embedding,
+                        e.aliases = $aliases
+                    WITH e
+                    FOREACH (_ IN CASE WHEN $topic IS NOT NULL AND $topic <> "" THEN [1] ELSE [] END |
+                        MERGE (t:Topic {name: $topic})
+                        MERGE (e)-[:BELONGS_TO]->(t)
+                    )
+                """, id=ent["id"], name=ent["name"], type=ent["type"],
+                    summary=ent.get("summary", ""), confidence=ent.get("confidence", 1.0),
+                    embedding=ent.get("embedding", []), aliases=ent.get("aliases", []),
+                    topic=ent.get("topic"))
 
-        query = """
-        MERGE (e:Entity {id: $id})
-        SET e.canonical_name = $name,
-            e.type = $type,
-            e.summary = $summary,
-            e.confidence = $confidence,
-            e.last_updated = timestamp(),
-            e.embedding = $embedding
-        
-        SET e.aliases = $aliases
-
-        WITH e AS entity
-        FOREACH (_ IN CASE WHEN $topic_name IS NOT NULL AND $topic_name <> "" THEN [1] ELSE [] END |
-                MERGE (t:Topic {name: $topic_name})
-                MERGE (e)-[:BELONGS_TO]->(t)
-        )
-        """
-
-        params = {
-            "id": entity_data["id"],
-            "name": entity_data["name"],
-            "type": entity_data["type"],
-            "summary": entity_data.get("summary", "No Summary Provided Yet."),
-            "confidence": entity_data.get("confidence", 1.0),
-            "aliases": entity_data.get("aliases", []),
-            "topic_name": entity_data.get("topic", None),
-            "embedding": entity_data.get("embedding", [])
-        }
+            for rel in relationships:
+                tx.run("""
+                    MATCH (a:Entity {canonical_name: $source_name})
+                    MATCH (b:Entity {canonical_name: $target_name})
+                    MERGE (a)-[r:RELATED_TO]-(b)
+                    ON CREATE SET 
+                        r.verb = $relation, r.weight = 1, r.confidence = $confidence,
+                        r.last_seen = timestamp(), r.message_ids = [$message_id]
+                    ON MATCH SET 
+                        r.weight = r.weight + 1,
+                        r.confidence = CASE WHEN $confidence > r.confidence THEN $confidence ELSE r.confidence END,
+                        r.last_seen = timestamp(),
+                        r.message_ids = CASE WHEN NOT ($message_id IN r.message_ids) 
+                            THEN r.message_ids + $message_id ELSE r.message_ids END
+                """, **rel)
 
         with self.driver.session() as session:
-            session.run(query, params)
-    
-
-    def add_relationship(self, source_name: str, target_name: str, 
-                    relation: str, message_id: str, confidence: float = 1.0):
-        
-        """
-        Handles relationship creation with generic head verb with specific verb property
-        """
-
-        query = """
-        MATCH (a:Entity {canonical_name: $source_name})
-        MATCH (b:Entity {canonical_name: $target_name})
-        
-        MERGE (a)-[r:RELATED_TO]-(b)
-        
-        ON CREATE SET 
-            r.verb = $relation,
-            r.weight = 1,
-            r.confidence = $confidence,
-            r.last_seen = timestamp(),
-            r.message_ids = [$msg_id]
-
-        ON MATCH SET 
-            r.weight = r.weight + 1, 
-            r.confidence = CASE WHEN $confidence > r.confidence THEN $confidence ELSE r.confidence END,
-            r.last_seen = timestamp(),
-            r.message_ids = CASE 
-                WHEN NOT ($msg_id IN r.message_ids) THEN r.message_ids + $msg_id 
-                ELSE r.message_ids 
-            END
-        """
-        
-        with self.driver.session() as session:
-            session.run(query, {
-                "source_name": source_name,
-                "target_name": target_name,
-                "relation": relation,
-                "msg_id": message_id,
-                "confidence": confidence
-            })
+            session.execute_write(_run)
     
 
     def set_topic_status(self, topic_name: str, status: str):
@@ -135,7 +85,7 @@ class MemGraphStore:
 
         query = "MERGE (t:Topic {name: $name}) SET t.status = $status"
         with self.driver.session() as session:
-            session.run(query, {"name": topic_name, "status": status})
+            session.run(query, {"name": topic_name, "status": status}).consume()
     
     def log_daily_mood(self, user_name: str, emotion_data: Dict):
         """Handles Mood Time Series"""
@@ -155,7 +105,7 @@ class MemGraphStore:
                 "user_name": user_name, 
                 "emotion": emotion_data.get("label"), 
                 "score": emotion_data.get("score")
-            })
+            }).consume()
     
 
     def get_subgraph_context(self, entity_ids: List[int], active_only: bool = True):
