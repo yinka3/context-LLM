@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Tuple, TypeVar, Type
 from functools import partial
 from schema.dtypes import *
 
-from schema.common_pb2 import Entity, Relationship, BatchMessage
+from schema.common_pb2 import Entity, Relationship, BatchMessage, MessageType
 if TYPE_CHECKING:
     from main.nlp_pipe import NLPPipeline
     from main.entity_resolve import EntityResolver
@@ -36,6 +36,7 @@ class Context:
     def __init__(self, user_name: str, topics: List[str], redis_client, llm_client):
         self.user_name: str = user_name
         self.active_topics: List[str] = topics
+        self.session_emotions: List[str] = []
         
         self.redis_client: redis.Redis = redis_client 
         self.llm_client: AsyncOpenAI = llm_client
@@ -112,7 +113,7 @@ class Context:
 
         user_entity = Entity(
             id=new_id,
-            text="USER",
+            canonical_name="USER",
             type="PERSON",
             confidence=1.0,
             aliases=[],
@@ -121,7 +122,7 @@ class Context:
             embedding=embedding_vector
         )
 
-        batch = BatchMessage(message_id=0)
+        batch = BatchMessage(type=MessageType.SYSTEM_ENTITY)
         batch.list_ents.append(user_entity)
 
         try:
@@ -183,52 +184,63 @@ class Context:
 
         system_prompt = f"""You are a Knowledge Graph extraction engine for a personal memory system.
 
-            The user talks about their life - people they know, places they go, projects they work on.
-            Your job is to extract entities and relationships from their messages.
+        The user talks about their life - people they know, places they go, things they work on.
+        Your job is to extract entities and relationships from their messages.
 
-            **AVAILABLE TOPICS**: {topics_str}
+        **TOPIC SUGGESTIONS FOR NEW ENTITIES**: {topics_str}
 
-            **TASK 1: ENTITY EXTRACTION & RESOLUTION**
-            - Extract entities (people, organizations, places, projects, events, etc.)
-            - Check if each entity matches a provided candidate. If yes, use the candidate's `id`. If new, use `null`.
-            - Assign each entity to one of the available topics. If none fit, use "General".
-            - Set `has_new_info: true` if the message reveals NEW facts about an existing entity.
+        **TASK 1: ENTITY EXTRACTION & RESOLUTION**
+        - Extract entities (people, organizations, places, projects, events, etc.)
+        - Check if each entity matches a provided candidate. If yes, use the candidate's `id`. If new, use `null`.
+        - Assign each entity to one of the available topics. If none fit, use "General".
+        - Set `has_new_info: true` if the message reveals NEW facts about an existing entity.
+        - Set `original_mention` to the exact text span from the message that refers to this entity. If the entity was inferred from context rather than explicitly mentioned, set to `null`.
 
-            **TASK 2: RELATIONSHIP EXTRACTION**
-            - Identify factual connections between entities.
-            - Use canonical names for source and target.
+        **TASK 2: RELATIONSHIP EXTRACTION**
+        - Identify factual connections between entities.
+        - Use canonical names for source and target.
 
-            **EXAMPLES**
+        **EXAMPLES**
 
-            Input: "Jake started working at Stripe last week"
-            Candidates: {{"Jake": [{{"id": 7, "name": "Jake", "summary": "User's friend from college"}}]}}
-            Output:
-            {{
-            "entities": [
-                {{"id": 7, "canonical_name": "Jake", "type": "PERSON", "topic": "Friends", "confidence": 0.95, "has_new_info": true}},
-                {{"id": null, "canonical_name": "Stripe", "type": "ORG", "topic": "Work", "confidence": 0.9, "has_new_info": false}}
-            ],
-            "relationships": [
-                {{"source": "Jake", "target": "Stripe", "relation": "works_at", "confidence": 0.95}}
-            ]
-            }}
+        Input: "Jake started working at Stripe last week"
+        Candidates: {{"Jake": [{{"id": 7, "name": "Jake", "summary": "User's friend from college"}}]}}
+        Output:
+        {{
+        "entities": [
+            {{"id": 7, "canonical_name": "Jake", "type": "PERSON", "topic": "Friends", "confidence": 0.95, "has_new_info": true, "original_mention": "Jake"}},
+            {{"id": null, "canonical_name": "Stripe", "type": "ORG", "topic": "Work", "confidence": 0.9, "has_new_info": false, "original_mention": "Stripe"}}
+        ],
+        "relationships": [
+            {{"source": "Jake", "target": "Stripe", "relation": "works_at", "confidence": 0.95}}
+        ]
+        }}
 
-            Input: "Had coffee with my sister"
-            Candidates: {{"sister": [{{"id": 3, "name": "Sarah", "summary": "User's older sister, lives in Boston"}}]}}
-            Output:
-            {{
-            "entities": [
-                {{"id": 3, "canonical_name": "Sarah", "type": "PERSON", "topic": "Family", "confidence": 0.9, "has_new_info": false}}
-            ],
-            "relationships": []
-            }}
-            """
+        Input: "Had coffee with my sister"
+        Candidates: {{"sister": [{{"id": 3, "name": "Sarah", "summary": "User's older sister, lives in Boston"}}]}}
+        Output:
+        {{
+        "entities": [
+            {{"id": 3, "canonical_name": "Sarah", "type": "PERSON", "topic": "Family", "confidence": 0.9, "has_new_info": false, "original_mention": "my sister"}}
+        ],
+        "relationships": []
+        }}
+
+        Input: "The CEO announced layoffs yesterday"
+        Candidates: {{}}
+        Output:
+        {{
+        "entities": [
+            {{"id": null, "canonical_name": "CEO", "type": "PERSON", "topic": "Work", "confidence": 0.6, "has_new_info": false, "original_mention": "The CEO"}}
+        ],
+        "relationships": []
+        }}
+        """
 
         clean_candidates = {}
         for mention, c_list in resolution_candidates.items():
             clean_candidates[mention] = [
                 {"id": c["id"], 
-                    "name": c.get("profile", {}).get("canonical_name", "Unknown"), 
+                    "canonical_name": c.get("profile", {}).get("canonical_name", "Unknown"), 
                     "summary": c.get("profile", {}).get("summary", "No information provided yet.")}
                 for c in c_list
             ]
@@ -301,10 +313,11 @@ class Context:
             logger.error(f"LLM Generation Failed: {e}")
             return None
     
-    async def _send_batch_to_stream(self, message_id: int, entities: List[Entity], relations: List[Relationship]):
+    async def _send_batch_to_stream(self, message_id: int, entities: List[Entity], relations: List[Relationship], type: MessageType):
         """Helper to serialize and push to Redis Stream"""
         batch = BatchMessage(
             message_id=message_id,
+            type=type,
             list_ents=entities,
             list_relations=relations
         )
@@ -383,7 +396,8 @@ class Context:
             await self._send_batch_to_stream(
                 message_id=0,
                 entities=updates_for_graph,
-                relations=[]
+                relations=[],
+                type=MessageType.PROFILE_UPDATE
             )
             logger.info(f"Refined {len(updates_for_graph)} profiles in background.")
 
@@ -394,11 +408,22 @@ class Context:
 
         loop = asyncio.get_running_loop()
 
-        mentions = await loop.run_in_executor(
+        mentions_future = loop.run_in_executor(
             self.cpu_executor,
             self.nlp_pipe.extract_mentions,
             msg.message.strip(),
             0.5)
+        
+        emotions_future = loop.run_in_executor(
+            self.cpu_executor,
+            self.nlp_pipe.analyze_emotion,
+            msg.message.strip())
+
+        mentions, emotions = await asyncio.gather(mentions_future, emotions_future)
+
+        if emotions:
+            dominant = max(emotions, key=lambda x: x["score"])
+            self.session_emotions.append(dominant["label"])
 
         resolution_candidates = {}
         tasks = [
@@ -439,11 +464,16 @@ class Context:
 
         for ent in new_entities:
             final_id = await self.get_next_ent_id()
-            id_map[id(ent)] = final_id
-            
+    
+            initial_aliases = []
+            if ent.original_mention and ent.original_mention.lower() != ent.canonical_name.lower():
+                initial_aliases.append(ent.original_mention)
+
+            id_map[id(ent)] = (final_id, initial_aliases)
+
             stub_profile = {
                 "canonical_name": ent.canonical_name,
-                "aliases": [],
+                "aliases": initial_aliases,
                 "summary": f"No information on {ent.canonical_name}",
                 "type": ent.type
             }
@@ -458,31 +488,42 @@ class Context:
         embedding_results = await asyncio.gather(*tasks) if tasks else []
 
         for i, ent in enumerate(new_entities):
-            final_id = id_map[id(ent)]
+            final_id, initial_aliases = id_map[id(ent)]
             entity_dict = {
                 "id": final_id,
                 "canonical_name": ent.canonical_name,
-                "topic": ent.topic,
                 "type": ent.type,
-                "aliases": [],
+                "aliases": initial_aliases,
                 "confidence": ent.confidence,
                 "embedding": embedding_results[i],
                 "has_new_info": ent.has_new_info,
+                "topic": ent.topic
             }
             final_entities.append(entity_dict)
             entities_needing_profile.append(entity_dict)
 
         for ent in existing_entities:
             existing_profile = self.ent_resolver.entity_profiles.get(ent.id, {})
+            existing_aliases = list(existing_profile.get("aliases", []))
+
+            if ent.original_mention and ent.original_mention.lower() != ent.canonical_name.lower():
+                if ent.original_mention not in existing_aliases:
+                    existing_aliases.append(ent.original_mention)
+                    
+                    loop.run_in_executor(
+                        self.cpu_executor,
+                        partial(self.ent_resolver.add_alias, ent.id, ent.original_mention)
+                    )
+
             entity_dict = {
                 "id": ent.id,
                 "canonical_name": ent.canonical_name,
-                "topic": ent.topic,
                 "type": ent.type,
-                "aliases": existing_profile.get("aliases", []),
+                "aliases": existing_aliases,
                 "confidence": ent.confidence,
                 "embedding": None,
                 "has_new_info": ent.has_new_info,
+                "topic": ent.topic
             }
             final_entities.append(entity_dict)
             if ent.has_new_info:
@@ -514,7 +555,7 @@ class Context:
         for ent in normalized_entities:
             new_ent = Entity(
                 id=ent["id"],
-                text=ent["canonical_name"],
+                canonical_name=ent["canonical_name"],
                 type=ent["type"],
                 confidence=ent.get("confidence", 1.0),
                 topic=ent.get("topic", "General"),
@@ -532,10 +573,26 @@ class Context:
             )
             proto_rels.append(new_rel)
         
-        await self._send_batch_to_stream(msg_id, proto_ents, proto_rels)
+        await self._send_batch_to_stream(msg_id, proto_ents, proto_rels, type=MessageType.USER_MESSAGE)
         logger.info(f"Published structure for msg_{msg_id}: {len(proto_ents)} ents, {len(proto_rels)} rels")
     
     async def shutdown(self):
+        if self.session_emotions:
+            from collections import Counter
+            counts = Counter(self.session_emotions)
+            top_two = counts.most_common(2)
+            
+            primary, primary_count = top_two[0]
+            secondary, secondary_count = top_two[1] if len(top_two) > 1 else ("neutral", 0)
+            
+            self.store.log_daily_mood(
+                user_name=self.user_name,
+                primary=primary,
+                primary_count=primary_count,
+                secondary=secondary,
+                secondary_count=secondary_count,
+                total=len(self.session_emotions)
+            )
         if self.cpu_executor:
             self.cpu_executor.shutdown(wait=True)
         if self.redis_client:

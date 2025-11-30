@@ -78,6 +78,13 @@ class EntityResolver:
             logger.error(f"Failed to hydrate from DB: {e}")
             return False
 
+    def add_alias(self, entity_id: int, alias: str):
+        with self._lock:
+            if entity_id in self.entity_profiles:
+                profile = self.entity_profiles[entity_id]
+                if alias not in profile.get("aliases", []):
+                    profile.setdefault("aliases", []).append(alias)
+                    self.fuzzy_choices[alias] = entity_id
 
     def add_entity(self, entity_id: int, profile: Dict) -> List[float]:
 

@@ -21,6 +21,7 @@ class MessageData(BaseModel):
 class ExtractedEntity(BaseModel):
     id: Optional[int] = Field(None, description="The Integer ID of the matching candidate. MUST be null if this is a new entity.")
     canonical_name: str = Field(..., description="The most precise, capitalized name of the entity.")
+    original_mention: Optional[str] = Field(..., description="The exact text span from the user's message that refers to this entity. Null if the entity was inferred from context rather than explicitly mentioned.")
     type: str = Field(..., description="The generic classification (PERSON, ORG, LOC, TOPIC, EVENT).")
     topic: str = Field(..., description="User-defined topic category this entity belongs to.")
     confidence: float = Field(..., description="Certainty score between 0.0 and 1.0.")
