@@ -7,7 +7,7 @@ import signal
 from concurrent.futures import ThreadPoolExecutor
 from redis import exceptions
 from redisclient import SyncRedisClient
-from schema.common_pb2 import BatchMessage
+from schema.common_pb2 import BatchMessage, MessageType
 from memgraph import MemGraphStore
 import logging_setup
 
@@ -97,8 +97,8 @@ class GraphBuilder:
             batch_msg = BatchMessage()
             batch_msg.ParseFromString(msg_data[b'data'])
 
-            if not batch_msg.message_id:
-                logger.warning(f"Skipping message {stream_id}: No internal message_id found in batch.")
+            if batch_msg.type == MessageType.USER_MESSAGE and batch_msg.message_id < 1:
+                logger.warning(f"Skipping USER_MESSAGE {stream_id}: invalid message_id")
                 self.redis_client.xack(STREAM_KEY, CONSUMER_GROUP, stream_id)
                 return
 
@@ -113,7 +113,7 @@ class GraphBuilder:
                     
                 entities.append({
                     "id": entity.id,
-                    "name": entity.text,
+                    "canonical_name": entity.canonical_name,
                     "type": entity.type,
                     "confidence": entity.confidence,
                     "aliases": list(entity.aliases),
@@ -132,7 +132,8 @@ class GraphBuilder:
                 "confidence": rel.confidence
             })
             
-            self.store.write_batch(entities, relationships)
+            is_user_msg = (batch_msg.type == MessageType.USER_MESSAGE)
+            self.store.write_batch(entities, relationships, is_user_message=is_user_msg)
             self.redis_client.xack(STREAM_KEY, CONSUMER_GROUP, stream_id)
             self.processed_messages += 1
         except Exception as e:
