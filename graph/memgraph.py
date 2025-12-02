@@ -1,16 +1,13 @@
-import logging
 import time
-from typing import Dict, List, TYPE_CHECKING
-from neo4j import GraphDatabase, Driver
+from loguru import logger
+from typing import Dict, List
+from neo4j import GraphDatabase, Driver, ManagedTransaction
 
-if TYPE_CHECKING:
-    from neo4j import ManagedTransaction
 
-logger = logging.getLogger(__name__)
 
 class MemGraphStore:
-    def __init__(self, uri: str = "bolt://localhost:7687", auth: tuple = ("admin", "password")):
-        self.driver: Driver = GraphDatabase.driver(uri, auth=auth)
+    def __init__(self, uri: str = "bolt://localhost:7687"):
+        self.driver: Driver = GraphDatabase.driver(uri)
         self.verify_conn()
         self._setup_schema()
         logger.info("Graph store initialized")

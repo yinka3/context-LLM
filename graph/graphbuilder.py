@@ -1,18 +1,15 @@
-import logging
 import os
 import socket
 import sys
 import time
 import signal
+from loguru import logger
 from concurrent.futures import ThreadPoolExecutor
 from redis import exceptions
 from redisclient import SyncRedisClient
 from schema.common_pb2 import BatchMessage, MessageType
-from memgraph import MemGraphStore
-import logging_setup
+from graph.memgraph import MemGraphStore
 
-logging_setup.setup_logging(log_file="graph_builder_service.log")
-logger = logging.getLogger(__name__)
 
 STREAM_KEY = "stream:ai_response"
 CONSUMER_GROUP = "group:graph_builders"

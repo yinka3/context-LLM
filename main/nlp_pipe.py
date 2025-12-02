@@ -2,11 +2,9 @@ from gliner import GLiNER
 import torch
 from schema.dtypes import *
 from typing import List
-import logging
+from loguru import logger
 from transformers import pipeline
-
-
-logger = logging.getLogger(__name__)
+from main.block_list import TEMPORAL_BLOCKLIST
 
 class NLPPipeline:
     
@@ -26,6 +24,7 @@ class NLPPipeline:
         if torch.cuda.is_available():
             self.gliner.model.half()
         self.gliner.model.eval()
+        logger.info("Gliner model initialized")
     
     def _init_emotion(self, model_name: str):
         device_id = 0 if torch.cuda.is_available() else -1
@@ -37,17 +36,22 @@ class NLPPipeline:
         )
     
     def extract_mentions(self, text: str, threshold: float = 0.5) -> List[str]:
-        """Just returns entity text for candidate lookup."""
         if not text or not text.strip():
             return []
-        
+
         with torch.no_grad():
             entities = self.gliner.predict_entities(
                 text=text.strip(),
                 labels=["person", "organization", "location", "event", "product", "topic"]
             )
-        
-        return list({ent["text"] for ent in entities if ent["score"] >= threshold})
+
+        mentions = set()
+        for ent in entities:
+            if ent["score"] >= threshold:
+                if ent["text"].lower() not in TEMPORAL_BLOCKLIST:
+                    mentions.add(ent["text"])
+
+        return list(mentions)
     
     def analyze_emotion(self, text: str) -> List[dict]:
         if not text or not text.strip():

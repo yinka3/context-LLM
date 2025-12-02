@@ -1,31 +1,29 @@
 import asyncio
+from dotenv import load_dotenv
+import os
 import redis.asyncio as redis
 from concurrent.futures import ThreadPoolExecutor
-import logging
-import logging_setup
+from loguru import logger
 import json
 import instructor
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 from redis import exceptions
 from redisclient import AsyncRedisClient
-from typing import TYPE_CHECKING, Dict, List, Tuple, TypeVar, Type
+from typing import Dict, List, Tuple, TypeVar, Type
 from functools import partial
 from schema.dtypes import *
-
 from schema.common_pb2 import Entity, Relationship, BatchMessage, MessageType
-if TYPE_CHECKING:
-    from main.nlp_pipe import NLPPipeline
-    from main.entity_resolve import EntityResolver
-    from graph.memgraph import MemGraphStore
-
-logging_setup.setup_logging()
-logger = logging.getLogger(__name__)
+from main.nlp_pipe import NLPPipeline
+from main.entity_resolve import EntityResolver
+from graph.memgraph import MemGraphStore
+load_dotenv()
 
 T = TypeVar('T', bound=BaseModel)
 STREAM_KEY_AI_RESPONSE = "stream:ai_response"
 LLM_CLIENT = lambda: instructor.from_openai(
-    AsyncOpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+    AsyncOpenAI(base_url="https://openrouter.ai/api/v1",
+                api_key=os.getenv("OPENROUTER_API_KEY"))
 )
 
 def _log_task_exception(task):
@@ -301,7 +299,7 @@ class Context:
         
         try:
             return await self.llm_client.chat.completions.create(
-                model="qwen2.5:14b",
+                model="qwen/qwen3-30b-a3b",
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user}
@@ -380,7 +378,7 @@ class Context:
                 
             return Entity(
                 id=ent_id,
-                text=updated_profile.canonical_name,
+                canonical_name=updated_profile.canonical_name,
                 type=ent["type"],
                 aliases=updated_profile.aliases,
                 summary=new_summary,
@@ -586,7 +584,6 @@ class Context:
             secondary, secondary_count = top_two[1] if len(top_two) > 1 else ("neutral", 0)
             
             self.store.log_daily_mood(
-                user_name=self.user_name,
                 primary=primary,
                 primary_count=primary_count,
                 secondary=secondary,

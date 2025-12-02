@@ -1,15 +1,13 @@
 from datetime import datetime, timezone
-import logging
+from loguru import logger
 import threading
 from typing import Dict, List
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from rapidfuzz import process as fuzzy_process, fuzz
-
 from graph.memgraph import MemGraphStore
 
-logger = logging.getLogger(__name__)
 
 
 class EntityResolver:
@@ -105,8 +103,8 @@ class EntityResolver:
             profile["last_seen"] = datetime.now(timezone.utc).isoformat()
             
             self.index_id_map.add_with_ids(
-                x=np.array([embedding_np]), 
-                xids=np.array([entity_id], dtype=np.int64)
+                np.array([embedding_np]), 
+                np.array([entity_id], dtype=np.int64)
             )
 
             self.entity_profiles[entity_id] = profile
@@ -149,8 +147,8 @@ class EntityResolver:
             pass
         
         self.index_id_map.add_with_ids(
-            x=np.array([embedding_np]), 
-            xids=np.array([entity_id], dtype=np.int64)
+            np.array([embedding_np]), 
+            np.array([entity_id], dtype=np.int64)
         )
 
         return embedding_np.tolist()
