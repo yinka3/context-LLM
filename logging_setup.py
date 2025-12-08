@@ -1,9 +1,8 @@
 import sys
 from loguru import logger
 
-def setup_logging(log_level="INFO", log_file="tier1_app.log"):
+def setup_logging(log_level="INFO", log_file="vestige.log"):
     logger.remove()
-    
     fmt = "{time:YYYY-MM-DD HH:mm:ss} - {file}:{line} - {level} - {message}"
     
     logger.add(sys.stdout, format=fmt, level=log_level)
