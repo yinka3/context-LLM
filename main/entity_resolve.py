@@ -15,8 +15,9 @@ class EntityResolver:
     def __init__(self, embedding_model_model='google/embeddinggemma-300m'):
         self.embedding_model = SentenceTransformer(embedding_model_model)
         self.embedding_dim = 768
-        self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)
-        self.index_id_map = faiss.IndexIDMap2(self.faiss_index)
+        self.faiss_index: faiss.IndexFlatIP = faiss.IndexFlatIP(self.embedding_dim)
+        self.index_id_map: faiss.IndexIDMap2 = faiss.IndexIDMap2(self.faiss_index)
+        self.ref = {"me", "i", "myself", "user"}
         
         self.fuzzy_choices: Dict[str, int] = {}
         self.entity_profiles: Dict[int, Dict] = {}
@@ -30,13 +31,13 @@ class EntityResolver:
         temp_fuzzy = {}
         vectors = []
         ids = []
-
+        self.ref = {"me", "i", "myself", "user"}
         try:
             store = MemGraphStore()
             
             query = """
             MATCH (n:Entity)
-            RETURN n.id, n.canonical_name, n.aliases, n.summary, n.type, n.embedding
+            RETURN n.id, n.canonical_name, n.aliases, n.summary, n.type, n.embedding, n.last_profiled_msg_id
             """
             
             with store.driver.session() as session:
@@ -44,12 +45,16 @@ class EntityResolver:
 
                 for r in results:
                     e_id = r["n.id"]
+                    raw_last_msg = r.get("n.last_profiled_msg_id")
+                    last_msg_id = raw_last_msg if raw_last_msg is not None else 0
+
                     
                     temp_profiles[e_id] = {
                         "canonical_name": r["n.canonical_name"],
                         "aliases": r["n.aliases"] if r["n.aliases"] else [],
                         "summary": r["n.summary"],
-                        "type": r["n.type"]
+                        "type": r["n.type"],
+                        "last_profiled_msg_id": last_msg_id
                     }
                     
                     names = [r["n.canonical_name"]] + (r["n.aliases"] or [])
@@ -61,13 +66,16 @@ class EntityResolver:
                         ids.append(e_id)
                 
             with self._lock:
-                self.entity_profiles.update(temp_profiles)
-                self.fuzzy_choices.update(temp_fuzzy)
+                self.entity_profiles = temp_profiles
+                self.fuzzy_choices = temp_fuzzy
+
+                self.index_id_map.reset()
 
                 if vectors:
                     logger.info(f"Loading {len(vectors)} vectors into FAISS.")
                     vec_np = np.array(vectors, dtype=np.float32)
                     ids_np = np.array(ids, dtype=np.int64)
+                    
                     faiss.normalize_L2(vec_np)
                     self.index_id_map.add_with_ids(vec_np, ids_np)
 
@@ -92,10 +100,6 @@ class EntityResolver:
 
 
         with self._lock:
-            if entity_id in self.entity_profiles:
-                logger.info(f"Entity {entity_id} already exists. Updating.")
-                return self._update_entity_inner(entity_id, profile, embedding_np)
-            
             logger.info(f"Adding entity {entity_id} to resolver indexes.")
 
             profile.setdefault("topic", "General")
@@ -113,61 +117,31 @@ class EntityResolver:
         
         return embedding_np.tolist()
     
-    def update_entity(self, entity_id: int, new_profile: Dict) -> List[float]:
-
-        summary_text = new_profile.get("summary", "") or "No information available."
-        embedding_np = self.embedding_model.encode([summary_text])[0]
-        faiss.normalize_L2(embedding_np.reshape(1, -1))
-
-        with self._lock:
-            return self._update_entity_inner(entity_id, new_profile, embedding_np)
     
-    def _update_entity_inner(self, entity_id: int, new_profile: Dict, embedding_np) -> List[float]:
-        """Assumes lock is already held."""
-        old_profile = self.entity_profiles.get(entity_id, {})
-
-        new_profile["first_seen"] = old_profile.get("first_seen", datetime.now(timezone.utc).isoformat())
-        new_profile["last_seen"] = datetime.now(timezone.utc).isoformat()
-        
-        if old_profile:
-            old_aliases = [old_profile.get("canonical_name")] + old_profile.get("aliases", [])
-            for old_alias in old_aliases:
-                if self.fuzzy_choices.get(old_alias) == entity_id:
-                    del self.fuzzy_choices[old_alias]
-
-        new_aliases = [new_profile["canonical_name"]] + new_profile.get("aliases", [])
-        for alias in new_aliases:
-            self.fuzzy_choices[alias] = entity_id
-        
-        self.entity_profiles[entity_id] = new_profile
-
-        try:
-            self.index_id_map.remove_ids(np.array([entity_id], dtype=np.int64))
-        except Exception:
-            pass
-        
-        self.index_id_map.add_with_ids(
-            np.array([embedding_np]), 
-            np.array([entity_id], dtype=np.int64)
-        )
-
-        return embedding_np.tolist()
-
-
-    def resolve(self, text: str, context: str, top_k: int = 10, fuzzy_cutoff: int = 80):
+    def resolve(self, text: str, context: str, fuzzy_cutoff: int = 80):
 
         with self._lock:
             has_data = bool(self.fuzzy_choices) or self.index_id_map.ntotal > 0
         
         if not has_data:
-            return []
+            return {"resolved": None, "ambiguous": [], "new": True, "mention": text}
         
         query_text = f"{text} mentioned in context of: {context}"
         query_embedding = self.embedding_model.encode([query_text])
         faiss.normalize_L2(query_embedding)
-
-        candidates_map: Dict[int, str | Dict] = {}
-
+        
+        set_text = set(word.strip(".,!'?") for word in text.split())
+        if any(word in self.ref for word in set_text):
+            if "USER" in self.fuzzy_choices:
+                _id = self.fuzzy_choices["USER"]
+                return {
+                    "resolved": {"id": _id, "profile": self.entity_profiles[_id]},
+                    "ambiguous": [],
+                    "new": False,
+                    "mention": text
+                }
+            
+        candidates_map: Dict[int, Dict] = {}
         with self._lock:
             if self.fuzzy_choices:
                 fuzzy_matches = fuzzy_process.extract(query=text, choices=self.fuzzy_choices.keys(),
@@ -188,12 +162,11 @@ class EntityResolver:
                     }
             
             if self.index_id_map.ntotal > 0:
-
-                search_k = min(top_k, self.faiss_index.ntotal)
-                scores, ann = self.index_id_map.search(query_embedding, k=search_k)
+                scores, ann = self.index_id_map.search(query_embedding, k=min(10, self.index_id_map.ntotal))
 
                 for index_id, score in zip(ann[0], scores[0]):
-                    if index_id != -1:
+                    logger.debug(f"FAISS result: query='{text}' -> id={index_id}, score={score:.3f}")
+                    if index_id != -1 and score >= 0.5:
                         entity_id = int(index_id)
                         norm_score = float((score + 1) / 2)
 
@@ -215,8 +188,20 @@ class EntityResolver:
                                 },
                                 "profile": self.entity_profiles[entity_id]
                             }
+        if not candidates_map:
+            return {"resolved": None, "ambiguous": [], "new": True, "mention": text}
+        
+        sorted_candidates = sorted(
+        candidates_map.values(),
+        key=lambda x: x["match_detail"]["norm_score"],
+        reverse=True)
 
-        candidates = list(candidates_map.values())
-        candidates.sort(key=lambda x: x["match_detail"]["norm_score"], reverse=True)
-
-        return candidates[:top_k]
+        best_score = sorted_candidates[0]["match_detail"]["norm_score"]
+    
+        if best_score >= 0.85:
+            return {"resolved": sorted_candidates[0], "ambiguous": [], "new": False, "mention": text}
+        elif best_score >= 0.5:
+            viable = [c for c in sorted_candidates if c["match_detail"]["norm_score"] >= 0.5]
+            return {"resolved": None, "ambiguous": viable, "new": False, "mention": text}
+        else:
+            return {"resolved": None, "ambiguous": [], "new": True, "mention": text}

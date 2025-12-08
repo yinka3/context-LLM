@@ -1,7 +1,7 @@
 from gliner import GLiNER
 import torch
 from schema.dtypes import *
-from typing import List
+from typing import List, Tuple
 from loguru import logger
 from transformers import pipeline
 from main.block_list import TEMPORAL_BLOCKLIST
@@ -35,7 +35,8 @@ class NLPPipeline:
             device=device_id
         )
     
-    def extract_mentions(self, text: str, threshold: float = 0.5) -> List[str]:
+    def extract_mentions(self, text: str, threshold: float = 0.5) -> List[Tuple[str, str]]:
+        """Returns list of (mention_text, entity_type) tuples."""
         if not text or not text.strip():
             return []
 
@@ -45,13 +46,15 @@ class NLPPipeline:
                 labels=["person", "organization", "location", "event", "product", "topic"]
             )
 
-        mentions = set()
+        mentions = {}
         for ent in entities:
             if ent["score"] >= threshold:
                 if ent["text"].lower() not in TEMPORAL_BLOCKLIST:
-                    mentions.add(ent["text"])
+                    text_key = ent["text"]
+                    if text_key not in mentions or ent["score"] > mentions[text_key][1]:
+                        mentions[text_key] = (ent["label"].upper(), ent["score"])
 
-        return list(mentions)
+        return [(text, type_score[0]) for text, type_score in mentions.items()]
     
     def analyze_emotion(self, text: str) -> List[dict]:
         if not text or not text.strip():

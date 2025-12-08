@@ -43,42 +43,99 @@ class MemGraphStore:
             for ent in entities:
                 tx.run("""
                     MERGE (e:Entity {id: $id})
-                    SET e.canonical_name = $name,
+                    ON CREATE SET
+                        e.canonical_name = $canonical_name,
                         e.type = $type,
                         e.summary = $summary,
                         e.confidence = $confidence,
                         e.last_updated = timestamp(),
-                        e.last_mentioned = CASE WHEN $is_user_message THEN timestamp() ELSE e.last_mentioned END,
+                        e.last_mentioned = timestamp(),
                         e.embedding = $embedding,
                         e.aliases = $aliases
+                    ON MATCH SET 
+                        e.canonical_name = $canonical_name,
+                        e.type = $type,
+                        e.confidence = $confidence,
+                        e.last_updated = timestamp(),
+                        e.last_mentioned = timestamp(),
+                        e.aliases = apoc.coll.toSet(COALESCE(e.aliases, []) + $aliases)
+
                     WITH e
                     FOREACH (_ IN CASE WHEN $topic IS NOT NULL AND $topic <> "" THEN [1] ELSE [] END |
                         MERGE (t:Topic {name: $topic})
                         MERGE (e)-[:BELONGS_TO]->(t)
                     )
-                """, id=ent["id"], name=ent["canonical_name"], type=ent["type"],
-                    summary=ent.get("summary", ""), confidence=ent.get("confidence", 1.0),
-                    embedding=ent.get("embedding", []), aliases=ent.get("aliases", []),
-                    topic=ent.get("topic"), is_user_message=is_user_message)
+                """, **ent, is_user_message=is_user_message)
 
             for rel in relationships:
                 tx.run("""
                     MATCH (a:Entity {canonical_name: $source_name})
                     MATCH (b:Entity {canonical_name: $target_name})
-                    MERGE (a)-[r:RELATED_TO]-(b)
+                    MERGE (a)-[r:RELATED_TO {verb: $relation}]->(b)
+                    
                     ON CREATE SET 
-                        r.verb = $relation, r.weight = 1, r.confidence = $confidence,
-                        r.last_seen = timestamp(), r.message_ids = [$message_id]
+                        r.weight = 1, 
+                        r.confidence = $confidence,
+                        r.last_seen = timestamp(), 
+                        r.message_ids = [$message_id]
+                        
                     ON MATCH SET 
                         r.weight = r.weight + 1,
-                        r.confidence = CASE WHEN $confidence > r.confidence THEN $confidence ELSE r.confidence END,
+                        r.confidence = $confidence,
                         r.last_seen = timestamp(),
-                        r.message_ids = CASE WHEN NOT ($message_id IN r.message_ids) 
-                            THEN r.message_ids + $message_id ELSE r.message_ids END
+                        r.message_ids = apoc.coll.toSet(r.message_ids + [$message_id])
                 """, **rel)
 
         with self.driver.session() as session:
             session.execute_write(_write)
+    
+
+    def update_entity_profile(self, entity_id: int, canonical_name: str, 
+                         summary: str, aliases: List[str], 
+                         embedding: List[float], last_msg_id: int, topic: str = "General"):
+        """
+        Update an existing entity's profile without touching relationships.
+        Called by GraphBuilder when processing PROFILE_UPDATE messages.
+        """
+        def _update(tx: 'ManagedTransaction'):
+            tx.run("""
+                MERGE (e:Entity {id: $id})
+                
+                ON CREATE SET
+                    e.canonical_name = $canonical_name,
+                    e.summary = $summary,
+                    e.embedding = $embedding,
+                    e.aliases = $aliases,
+                    e.last_profiled_msg_id = $last_msg_id,
+                    e.last_updated = timestamp(),
+                    e.created_by = 'profile_stream'
+
+                ON MATCH SET
+                    e.canonical_name = $canonical_name,
+                    e.summary = $summary,
+                    e.embedding = $embedding,
+                    e.last_updated = timestamp(),
+                    e.last_profiled_msg_id = $last_msg_id,
+                    e.aliases = apoc.coll.toSet(COALESCE(e.aliases, []) + $aliases)
+                
+                WITH e
+                FOREACH (_ IN CASE WHEN $topic IS NOT NULL AND $topic <> "" THEN [1] ELSE [] END |
+                    MERGE (t:Topic {name: $topic})
+                    MERGE (e)-[:BELONGS_TO]->(t)
+                )
+            """, 
+            id=entity_id, 
+            canonical_name=canonical_name, 
+            summary=summary, 
+            aliases=aliases, 
+            embedding=embedding,
+            last_msg_id=last_msg_id,
+            topic=topic
+            )
+        
+        with self.driver.session() as session:
+            session.execute_write(_update)
+            logger.info(f"Updated entity {entity_id} profile (checkpoint: msg_{last_msg_id})")
     
 
     def set_topic_status(self, topic_name: str, status: str):
