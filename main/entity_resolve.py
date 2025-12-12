@@ -32,12 +32,13 @@ class EntityResolver:
         vectors = []
         ids = []
         self.ref = {"me", "i", "myself", "user"}
+
         try:
             store = MemGraphStore()
             
             query = """
             MATCH (n:Entity)
-            RETURN n.id, n.canonical_name, n.aliases, n.summary, n.type, n.embedding, n.last_profiled_msg_id
+            RETURN n.id, n.canonical_name, n.summary, n.type, n.embedding, n.last_profiled_msg_id
             """
             
             with store.driver.session() as session:
@@ -47,23 +48,22 @@ class EntityResolver:
                     e_id = r["n.id"]
                     raw_last_msg = r.get("n.last_profiled_msg_id")
                     last_msg_id = raw_last_msg if raw_last_msg is not None else 0
-
+                    canonical_name = r["n.canonical_name"]
+                    summary = r["n.summary"] or ""
                     
                     temp_profiles[e_id] = {
-                        "canonical_name": r["n.canonical_name"],
-                        "aliases": r["n.aliases"] if r["n.aliases"] else [],
-                        "summary": r["n.summary"],
+                        "canonical_name": canonical_name,
+                        "summary": summary or "",
                         "type": r["n.type"],
                         "last_profiled_msg_id": last_msg_id
                     }
                     
-                    names = [r["n.canonical_name"]] + (r["n.aliases"] or [])
-                    for n in names:
-                        temp_fuzzy[n] = e_id
-                    
-                    if r["n.embedding"]:
-                        vectors.append(r["n.embedding"])
-                        ids.append(e_id)
+                    temp_fuzzy[canonical_name] = e_id
+                    summary = summary or ""
+                    resolution_text = f"{canonical_name}. {summary[:200]}"
+                    embedding = self.embedding_model.encode([resolution_text])[0]
+                    vectors.append(embedding)
+                    ids.append(e_id)
                 
             with self._lock:
                 self.entity_profiles = temp_profiles
@@ -84,18 +84,13 @@ class EntityResolver:
             logger.error(f"Failed to hydrate from DB: {e}")
             return False
 
-    def add_alias(self, entity_id: int, alias: str):
-        with self._lock:
-            if entity_id in self.entity_profiles:
-                profile = self.entity_profiles[entity_id]
-                if alias not in profile.get("aliases", []):
-                    profile.setdefault("aliases", []).append(alias)
-                    self.fuzzy_choices[alias] = entity_id
-
     def add_entity(self, entity_id: int, profile: Dict) -> List[float]:
 
-        summary_text = profile.get("summary", "") or "No information available."
-        embedding_np = self.embedding_model.encode([summary_text])[0]
+        canonical_name = profile.get("canonical_name", "")
+        summary = profile.get("summary", "") or ""
+
+        resolution_text = f"{canonical_name}. {summary[:200]}"
+        embedding_np = self.embedding_model.encode([resolution_text])[0]
         faiss.normalize_L2(embedding_np.reshape(1, -1))
 
 
@@ -112,8 +107,7 @@ class EntityResolver:
             )
 
             self.entity_profiles[entity_id] = profile
-            for name in [profile["canonical_name"]] + profile["aliases"]:
-                self.fuzzy_choices[name] = entity_id
+            self.fuzzy_choices[canonical_name] = entity_id
         
         return embedding_np.tolist()
     
@@ -126,21 +120,24 @@ class EntityResolver:
         if not has_data:
             return {"resolved": None, "ambiguous": [], "new": True, "mention": text}
         
+        
+        
+        set_text = set(word.lower().strip(".,!'?") for word in text.split())
+        if any(word in self.ref for word in set_text):
+            for _, _id in self.fuzzy_choices.items():
+                profile = self.entity_profiles.get(_id, {})
+                if profile.get("type") == "PERSON" and _id == 1:
+                    return {
+                        "resolved": {"id": _id, "profile": profile},
+                        "ambiguous": [],
+                        "new": False,
+                        "mention": text
+                    }
+        
         query_text = f"{text} mentioned in context of: {context}"
         query_embedding = self.embedding_model.encode([query_text])
         faiss.normalize_L2(query_embedding)
         
-        set_text = set(word.strip(".,!'?") for word in text.split())
-        if any(word in self.ref for word in set_text):
-            if "USER" in self.fuzzy_choices:
-                _id = self.fuzzy_choices["USER"]
-                return {
-                    "resolved": {"id": _id, "profile": self.entity_profiles[_id]},
-                    "ambiguous": [],
-                    "new": False,
-                    "mention": text
-                }
-            
         candidates_map: Dict[int, Dict] = {}
         with self._lock:
             if self.fuzzy_choices:

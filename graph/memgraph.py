@@ -50,15 +50,12 @@ class MemGraphStore:
                         e.confidence = $confidence,
                         e.last_updated = timestamp(),
                         e.last_mentioned = timestamp(),
-                        e.embedding = $embedding,
-                        e.aliases = $aliases
+                        e.embedding = $embedding
                     ON MATCH SET 
                         e.canonical_name = $canonical_name,
-                        e.type = $type,
                         e.confidence = $confidence,
                         e.last_updated = timestamp(),
-                        e.last_mentioned = timestamp(),
-                        e.aliases = apoc.coll.toSet(COALESCE(e.aliases, []) + $aliases)
+                        e.last_mentioned = timestamp()
 
                     WITH e
                     FOREACH (_ IN CASE WHEN $topic IS NOT NULL AND $topic <> "" THEN [1] ELSE [] END |
@@ -69,9 +66,9 @@ class MemGraphStore:
 
             for rel in relationships:
                 tx.run("""
-                    MATCH (a:Entity {canonical_name: $source_name})
-                    MATCH (b:Entity {canonical_name: $target_name})
-                    MERGE (a)-[r:RELATED_TO {verb: $relation}]->(b)
+                    MATCH (a:Entity {canonical_name: $entity_a})
+                    MATCH (b:Entity {canonical_name: $entity_b})
+                    MERGE (a)-[r:RELATED_TO]-(b)
                     
                     ON CREATE SET 
                         r.weight = 1, 
@@ -81,7 +78,7 @@ class MemGraphStore:
                         
                     ON MATCH SET 
                         r.weight = r.weight + 1,
-                        r.confidence = $confidence,
+                        r.confidence = CASE WHEN $confidence > r.confidence THEN $confidence ELSE r.confidence END,
                         r.last_seen = timestamp(),
                         r.message_ids = apoc.coll.toSet(r.message_ids + [$message_id])
                 """, **rel)
@@ -91,8 +88,8 @@ class MemGraphStore:
     
 
     def update_entity_profile(self, entity_id: int, canonical_name: str, 
-                         summary: str, aliases: List[str], 
-                         embedding: List[float], last_msg_id: int, topic: str = "General"):
+                        summary: str, embedding: List[float], 
+                        last_msg_id: int, topic: str = "General"):
         """
         Update an existing entity's profile without touching relationships.
         Called by GraphBuilder when processing PROFILE_UPDATE messages.
@@ -105,7 +102,6 @@ class MemGraphStore:
                     e.canonical_name = $canonical_name,
                     e.summary = $summary,
                     e.embedding = $embedding,
-                    e.aliases = $aliases,
                     e.last_profiled_msg_id = $last_msg_id,
                     e.last_updated = timestamp(),
                     e.created_by = 'profile_stream'
@@ -115,8 +111,7 @@ class MemGraphStore:
                     e.summary = $summary,
                     e.embedding = $embedding,
                     e.last_updated = timestamp(),
-                    e.last_profiled_msg_id = $last_msg_id,
-                    e.aliases = apoc.coll.toSet(COALESCE(e.aliases, []) + $aliases)
+                    e.last_profiled_msg_id = $last_msg_id
                 
                 WITH e
                 FOREACH (_ IN CASE WHEN $topic IS NOT NULL AND $topic <> "" THEN [1] ELSE [] END |
@@ -126,8 +121,7 @@ class MemGraphStore:
             """, 
             id=entity_id, 
             canonical_name=canonical_name, 
-            summary=summary, 
-            aliases=aliases, 
+            summary=summary,
             embedding=embedding,
             last_msg_id=last_msg_id,
             topic=topic
@@ -137,6 +131,22 @@ class MemGraphStore:
             session.execute_write(_update)
             logger.info(f"Updated entity {entity_id} profile (checkpoint: msg_{last_msg_id})")
     
+
+    def cleanup_null_entities(self) -> int:
+        """Remove entities with null type and their relationships."""
+        query = """
+        MATCH (e:Entity)
+        WHERE e.type IS NULL
+        DETACH DELETE e
+        RETURN count(e) as deleted
+        """
+        with self.driver.session() as session:
+            result = session.run(query)
+            record = result.single()
+            deleted = record["deleted"] if record else 0
+            if deleted > 0:
+                logger.info(f"Cleaned up {deleted} null-type entities")
+            return deleted
 
     def set_topic_status(self, topic_name: str, status: str):
         """Handles Topic State (active/inactive/hot)"""
@@ -240,10 +250,10 @@ class MemGraphStore:
 
     def get_related_entities(self, entity_names: List[str], active_only: bool = True):
         """
-        Find all entities connected to the given entities and how they relate.
+        Find all entities connected to the given entities.
         Use this when the user asks about someone's connections, relationships, network, or "who/what is related to X".
         Set active_only=False if the user wants to include entities from inactive topics.
-        Returns: connected entities with relationship type, connection strength, and supporting message references.
+        Returns: connected entities with connection strength and supporting message references.
         """
 
         query = """
@@ -259,7 +269,6 @@ class MemGraphStore:
             source.canonical_name as source,
             target.canonical_name as target,
             target.summary as target_summary,
-            r.verb as relation,
             r.weight as connection_strength,
             r.message_ids as evidence_ids,
             r.confidence as confidence,
@@ -277,13 +286,13 @@ class MemGraphStore:
         Get recent interactions involving an entity within a time window.
         Use this when the user asks "what happened with X recently" or "any updates on X" or wants time-filtered information.
         Adjust hours parameter based on user's timeframe (24 for "today", 168 for "this week", etc).
-        Returns: recent interactions with timestamps.
+        Returns: recent interactions with timestamps and evidence.
         """
         cutoff_ms = int((time.time() - (hours * 3600)) * 1000)
         query = """
         MATCH (e:Entity {canonical_name: $name})-[r:RELATED_TO]-(target:Entity)
         WHERE r.last_seen > $cutoff
-        RETURN target.canonical_name as entity, r.verb as action, r.last_seen as time
+        RETURN target.canonical_name as entity, r.message_ids as evidence_ids, r.last_seen as time
         ORDER BY r.last_seen DESC
         """
         with self.driver.session() as session:
@@ -295,14 +304,13 @@ class MemGraphStore:
         """
         Find the shortest path connecting two entities.
         Use this when the user asks "how is X connected to Y" or "what's the relationship between X and Y".
-        Returns: step-by-step path showing each entity and relationship in the chain, with message references as evidence.
+        Returns: step-by-step path showing each entity in the chain, with message references as evidence.
         """
         query = """
         MATCH (start:Entity {canonical_name: $start_name}), (end:Entity {canonical_name: $end_name})
         MATCH p = shortestPath((start)-[:RELATED_TO*..4]-(end))
         RETURN [n in nodes(p) | n.canonical_name] as names, 
-            [r in relationships(p) | r.message_ids] as evidence_ids,
-            [r in relationships(p) | r.verb] as relations
+            [r in relationships(p) | r.message_ids] as evidence_ids
         """
         with self.driver.session() as session:
             result = session.run(query, {"start_name": start_name, "end_name": end_name})
@@ -311,13 +319,11 @@ class MemGraphStore:
                 path_data = []
                 names = record["names"]
                 evidence = record["evidence_ids"]
-                relations = record["relations"]
                 for i in range(len(evidence)):
                     path_data.append({
                         "step": i,
                         "entity_a": names[i],
                         "entity_b": names[i+1],
-                        "relation": relations[i],
                         "evidence_refs": evidence[i]
                     })
                 return path_data

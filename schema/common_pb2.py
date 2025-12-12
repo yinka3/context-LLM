@@ -24,19 +24,19 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13schema/common.proto\"\x92\x01\n\x06\x45ntity\x12\n\n\x02id\x18\x01 \x01(\x05\x12\x16\n\x0e\x63\x61nonical_name\x18\x02 \x01(\t\x12\x0c\n\x04type\x18\x03 \x01(\t\x12\x12\n\nconfidence\x18\x04 \x01(\x02\x12\x0f\n\x07\x61liases\x18\x05 \x03(\t\x12\x0f\n\x07summary\x18\x07 \x01(\t\x12\r\n\x05topic\x18\x08 \x01(\t\x12\x11\n\tembedding\x18\t \x03(\x02\"^\n\x0cRelationship\x12\x13\n\x0bsource_text\x18\x01 \x01(\t\x12\x13\n\x0btarget_text\x18\x02 \x01(\t\x12\x12\n\nconfidence\x18\x03 \x01(\x02\x12\x10\n\x08relation\x18\x04 \x01(\t\"\x81\x01\n\x0c\x42\x61tchMessage\x12\x12\n\nmessage_id\x18\x01 \x01(\x05\x12\x1a\n\x04type\x18\x02 \x01(\x0e\x32\x0c.MessageType\x12\x1a\n\tlist_ents\x18\x03 \x03(\x0b\x32\x07.Entity\x12%\n\x0elist_relations\x18\x04 \x03(\x0b\x32\r.Relationship*F\n\x0bMessageType\x12\x10\n\x0cUSER_MESSAGE\x10\x00\x12\x12\n\x0ePROFILE_UPDATE\x10\x01\x12\x11\n\rSYSTEM_ENTITY\x10\x02\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13schema/common.proto\"\x9f\x01\n\x06\x45ntity\x12\n\n\x02id\x18\x01 \x01(\x05\x12\x16\n\x0e\x63\x61nonical_name\x18\x02 \x01(\t\x12\x0c\n\x04type\x18\x03 \x01(\t\x12\x12\n\nconfidence\x18\x04 \x01(\x02\x12\x0f\n\x07summary\x18\x05 \x01(\t\x12\r\n\x05topic\x18\x06 \x01(\t\x12\x11\n\tembedding\x18\x07 \x03(\x02\x12\x1c\n\x14last_profiled_msg_id\x18\x08 \x01(\x05\"Z\n\x0cRelationship\x12\x12\n\nmessage_id\x18\x01 \x01(\x05\x12\x10\n\x08\x65ntity_a\x18\x02 \x01(\t\x12\x10\n\x08\x65ntity_b\x18\x03 \x01(\t\x12\x12\n\nconfidence\x18\x04 \x01(\x02\"m\n\x0c\x42\x61tchMessage\x12\x1a\n\x04type\x18\x02 \x01(\x0e\x32\x0c.MessageType\x12\x1a\n\tlist_ents\x18\x03 \x03(\x0b\x32\x07.Entity\x12%\n\x0elist_relations\x18\x04 \x03(\x0b\x32\r.Relationship*F\n\x0bMessageType\x12\x10\n\x0cUSER_MESSAGE\x10\x00\x12\x12\n\x0ePROFILE_UPDATE\x10\x01\x12\x11\n\rSYSTEM_ENTITY\x10\x02\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'schema.common_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_MESSAGETYPE']._serialized_start=400
-  _globals['_MESSAGETYPE']._serialized_end=470
+  _globals['_MESSAGETYPE']._serialized_start=388
+  _globals['_MESSAGETYPE']._serialized_end=458
   _globals['_ENTITY']._serialized_start=24
-  _globals['_ENTITY']._serialized_end=170
-  _globals['_RELATIONSHIP']._serialized_start=172
-  _globals['_RELATIONSHIP']._serialized_end=266
-  _globals['_BATCHMESSAGE']._serialized_start=269
-  _globals['_BATCHMESSAGE']._serialized_end=398
+  _globals['_ENTITY']._serialized_end=183
+  _globals['_RELATIONSHIP']._serialized_start=185
+  _globals['_RELATIONSHIP']._serialized_end=275
+  _globals['_BATCHMESSAGE']._serialized_start=277
+  _globals['_BATCHMESSAGE']._serialized_end=386
 # @@protoc_insertion_point(module_scope)

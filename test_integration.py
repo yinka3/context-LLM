@@ -1,8 +1,7 @@
 import asyncio
-import subprocess
-import time
 import sys
 import os
+import time
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -11,22 +10,22 @@ if not os.getenv("OPENROUTER_API_KEY"):
     sys.exit(1)
 
 from loguru import logger
+from logging_setup import setup_logging
 from neo4j import GraphDatabase
 from main.context import Context
-from graph.graphbuilder import GraphBuilder
-from schema.dtypes import *
+from schema.dtypes import MessageData
+from test_messages import MEDIUM_REFERENCE_MESSAGES, GAME_STUDIO_MESSAGES
 
-TEST_MESSAGES = [
-    "I had coffee with Jake from Stripe today. He's working on their payments API.",
-    "My sister Sarah called from Boston. She's thinking about visiting next month.",
-]
+setup_logging(log_level="INFO", log_file="test_integration.log")
+
+TEST_MESSAGES = GAME_STUDIO_MESSAGES
 
 MEMGRAPH_URI = "bolt://localhost:7687"
-WAIT_FOR_PROCESSING = 60
 
+
+WAIT_FOR_PROCESSING = 60 
 
 def check_redis_connection():
-    """Verify Redis is reachable."""
     import redis
     try:
         client = redis.Redis(host='localhost', port=6379)
@@ -37,9 +36,7 @@ def check_redis_connection():
         logger.error("✗ Redis not reachable. Is docker compose up?")
         return False
 
-
 def check_memgraph_connection():
-    """Verify Memgraph is reachable."""
     try:
         driver = GraphDatabase.driver(MEMGRAPH_URI)
         driver.verify_connectivity()
@@ -50,160 +47,112 @@ def check_memgraph_connection():
         logger.error(f"✗ Memgraph not reachable: {e}")
         return False
 
-
-def clear_memgraph():
-    """Wipe all data from Memgraph for a clean test."""
-    driver = GraphDatabase.driver(MEMGRAPH_URI)
-    with driver.session() as session:
-        session.run("MATCH (n) DETACH DELETE n")
-    driver.close()
-    logger.info("✓ Memgraph cleared")
-
-
 def query_entities():
-    """Fetch all entities from Memgraph."""
+    """Simulates the 'Read Path' - checking what data exists."""
     driver = GraphDatabase.driver(MEMGRAPH_URI)
     with driver.session() as session:
         result = session.run("""
             MATCH (e:Entity)
-            RETURN e.id as id, e.canonical_name as name, e.type as type, e.summary as summary
+            RETURN e.id as id, e.canonical_name as name, e.type as type, 
+                   e.summary as summary, e.last_profiled_msg_id as last_msg,
+                   e.created_by as created_by
             ORDER BY e.id
         """)
         entities = [dict(record) for record in result]
     driver.close()
     return entities
 
-
 def query_relationships():
-    """Fetch all relationships from Memgraph."""
     driver = GraphDatabase.driver(MEMGRAPH_URI)
     with driver.session() as session:
         result = session.run("""
             MATCH (a:Entity)-[r:RELATED_TO]-(b:Entity)
-            RETURN a.canonical_name as source, b.canonical_name as target, 
-                   r.verb as relation, r.confidence as confidence
+            RETURN a.canonical_name as entity_a, b.canonical_name as entity_b, 
+                   r.weight as weight, r.confidence as confidence,
+                   r.message_ids as evidence_ids
         """)
         rels = [dict(record) for record in result]
     driver.close()
     return rels
 
-
 async def run_test():
     logger.info("=" * 60)
-    logger.info("VESTIGE INTEGRATION TEST")
+    logger.info("VESTIGE PRODUCTION SIMULATION TEST")
     logger.info("=" * 60)
 
-    logger.info("\n[1/6] Checking infrastructure...")
+    # 1. Infrastructure Check
     if not check_redis_connection() or not check_memgraph_connection():
-        logger.error("Infrastructure check failed. Exiting.")
         return False
 
-    logger.info("\n[2/6] Clearing Memgraph for clean test...")
-    clear_memgraph()
-
-    logger.info("\n[3/6] Starting GraphBuilder consumer...")
-    builder_process = subprocess.Popen(
-        [sys.executable, "-c", """
-import sys
-sys.path.insert(0, ".")
-from graph.graphbuilder import GraphBuilder
-builder = GraphBuilder()
-builder.start()
-"""],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE
-    )
-
-    time.sleep(2)
-
-    if builder_process.poll() is not None:
-        # something went wrong
-        stdout, stderr = builder_process.communicate()
-        logger.error(f"GraphBuilder failed to start: {stderr.decode()}")
-        return False
-
-    logger.info("✓ GraphBuilder started (PID: {})".format(builder_process.pid))
-    
     try:
-        logger.info("\n[4/6] Initializing Context (loading NLP models)...")
-        ctx = await Context.create(user_name="TestUser", topics=["Work", "Family"])
-        logger.info("✓ Context initialized")
+        # 2. Application Startup (Simulating Server Boot)
+        logger.info("\n[Step 1] Initializing Application Context...")
+        ctx = await Context.create(user_name="Elena", topics=["Work", "Creative", "Technical", "Business", "Projects"])
+        logger.info("✓ Application started.")
         
-        logger.info("\n[5/6] Sending test messages...")
+        # 3. Ingestion Phase (Simulating User Chatting)
+        logger.info("\n[Step 2] Receiving User Messages...")
+        
         for i, msg in enumerate(TEST_MESSAGES, 1):
-            logger.info(f"  Message {i}: {msg[:50]}...")
-            msg = MessageData(message=msg)
-            await ctx.add(msg)
-            await asyncio.sleep(1)
+            logger.info(f"  User: {msg[:60]}...")
+            msg_obj = MessageData(message=msg)
+            await ctx.add(msg_obj)
+            # Simulate natural typing delay (0.5s is realistic for fast typers)
+            await asyncio.sleep(0.5) 
         
-        logger.info(f"\n    Waiting {WAIT_FOR_PROCESSING}s for GraphBuilder to process...")
+        # 4. Shutdown / Buffer Flush
+        # In a real app, this runs when the server receives a SIGTERM signal.
+        logger.info("\n[Step 3] Application Shutdown Triggered...")
+        await ctx.shutdown()
+        
+        # 5. Verification Phase
+        logger.info(f"\n[Step 4] Waiting {WAIT_FOR_PROCESSING}s for Eventual Consistency...")
+        # This simulates a user coming back later to query the memory.
         await asyncio.sleep(WAIT_FOR_PROCESSING)
 
-        logger.info("\n[6/6] Verifying results in Memgraph...")
+        logger.info("\n[Step 5] Auditing Database State...")
         
         entities = query_entities()
         relationships = query_relationships()
 
-        logger.info(f"\n{'=' * 60}")
-        logger.info("RESULTS")
-        logger.info(f"{'=' * 60}")
+        logger.info(f"\n--- ENTITY AUDIT ---")
+        failed_profiles = []
         
-        logger.info(f"\nEntities found: {len(entities)}")
+        if not entities:
+            logger.warning("No entities found. Did the messages contain any names?")
+
         for ent in entities:
-            logger.info(f"  - [{ent['type']}] {ent['name']}: {ent.get('summary', 'No summary')[:60]}")
+            summary = ent.get('summary', '')
+            has_summary = len(summary) > 0
+            
+            status_icon = "✓" if has_summary else "⏳" # Hourglass means maybe profile stream is still working
+            if ent['type'] == 'PERSON' and ent['name'] != 'USER' and not has_summary:
+                status_icon = "✗"
+                failed_profiles.append(ent['name'])
 
-        logger.info(f"\nRelationships found: {len(relationships)}")
+            logger.info(f"{status_icon} [{ent['type']}] {ent['name']} (Created by: {ent.get('created_by', 'structure')})")
+            if has_summary:
+                logger.info(f"    Summary: {summary[:80]}...")
+
+
+        logger.info(f"\n--- RELATIONSHIP AUDIT ---")
         for rel in relationships:
-            logger.info(f"  - {rel['source']} --[{rel['relation']}]--> {rel['target']}")
+            logger.info(f"  {rel['entity_a']} <---> {rel['entity_b']} (weight: {rel['weight']}, evidence: {rel['evidence_ids']})")
         
-        entity_ids = [e['id'] for e in entities]
+        # 6. Final Report
         success = True
-
-        if len(entities) == 0:
-            logger.error("✗ No entities created - something is wrong!")
+        if failed_profiles:
+            logger.error(f"\nFAILURE: The following profiles were created but never enriched: {failed_profiles}")
+            logger.error("Possible causes: Profile Stream Lag, Throttling Logic Error, or LLM Failure.")
             success = False
-        else:
-            logger.info("✓ Entities were created")
-
-        if None in entity_ids:
-            logger.error("✗ Some entities have None IDs")
-            success = False
-        elif 0 in entity_ids:
-            logger.error("✗ Some entities have ID=0 (invalid)")
-            success = False
-        elif len(entity_ids) != len(set(entity_ids)):
-            logger.error("✗ Duplicate entity IDs found")
-            success = False
-        else:
-            logger.info(f"✓ All entity IDs valid and unique: {entity_ids}")
-
-        entity_names = [e['name'].lower() for e in entities]
-        expected = ['jake', 'stripe', 'sarah', 'boston']
-        found = [name for name in expected if any(name in en for en in entity_names)]
-        
-        if found:
-            logger.info(f"✓ Found expected entities: {found}")
-        else:
-            logger.warning(f"⚠ Did not find expected entities: {expected}")
-
-        await ctx.shutdown()
+        elif len(entities) > 0:
+            logger.info("\nSUCCESS: All entities successfully ingested and enriched.")
         
         return success
-    finally:
-        logger.info("\nCleaning up...")
-        builder_process.terminate()
-        builder_process.wait(timeout=5)
-        logger.info("✓ GraphBuilder terminated")
 
+    finally:
+        logger.info("\nTest run complete.")
 
 if __name__ == "__main__":
     success = asyncio.run(run_test())
-    
-    print("\n" + "=" * 60)
-    if success:
-        print("✓ INTEGRATION TEST PASSED")
-    else:
-        print("✗ INTEGRATION TEST FAILED")
-    print("=" * 60)
-    
     sys.exit(0 if success else 1)

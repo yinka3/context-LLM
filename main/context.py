@@ -24,12 +24,17 @@ load_dotenv()
 
 T = TypeVar('T', bound=BaseModel)
 STREAM_KEY_AI_RESPONSE = "stream:ai_response"
-LLM_CLIENT = lambda: instructor.from_openai(
+
+LLM_CLIENT_INSTRUCT = lambda: instructor.from_openai(
     AsyncOpenAI(base_url="https://openrouter.ai/api/v1",
                 api_key=os.getenv("OPENROUTER_API_KEY")),
                 mode=instructor.Mode.JSON
 )
 
+LLM_CLIENT = lambda: AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY")
+)
 BATCH_SIZE = 5
 PROFILE_INTERVAL = 15
 
@@ -39,12 +44,13 @@ BATCH_TIMEOUT_SECONDS = 60
 
 class Context:
 
-    def __init__(self, user_name: str, topics: List[str], redis_client, llm_client):
+    def __init__(self, user_name: str, topics: List[str], redis_client, llm_client_instruct, llm_client):
         self.user_name: str = user_name
         self.active_topics: List[str] = topics
         self.session_emotions: List[str] = []
         
         self.redis_client: redis.Redis = redis_client 
+        self.llm_instruct: AsyncOpenAI = llm_client_instruct
         self.llm_client: AsyncOpenAI = llm_client
         
         self.store: 'MemGraphStore' = None 
@@ -58,12 +64,14 @@ class Context:
         self._batch_queue_task: asyncio.Task = None
 
         self.trace_logger = get_trace_logger()
+
     @classmethod
-    async def create(cls, user_name: str = "Yinka", topics: List[str] = ["General"]) -> "Context":
+    async def create(cls, user_name: str, topics: List[str] = ["General"]) -> "Context":
         redis_conn = AsyncRedisClient().get_client()
         llm = LLM_CLIENT()
+        llm_instruct = LLM_CLIENT_INSTRUCT()
         
-        instance = cls(user_name, topics, redis_conn, llm)
+        instance = cls(user_name, topics, redis_conn, llm_instruct, llm)
         
         instance.store = MemGraphStore()
         instance.cpu_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ctx_worker")
@@ -127,7 +135,6 @@ class Context:
 
         profile = {
             "canonical_name": user_name,
-            "aliases": ["Me", "I", "Myself", "USER"],
             "summary": f"The primary user named {user_name}",
             "type": "PERSON"
         }
@@ -142,7 +149,6 @@ class Context:
             canonical_name=user_name,
             type="PERSON",
             confidence=1.0,
-            aliases=profile["aliases"],
             summary=profile["summary"],
             topic="Meta",
             embedding=embedding_vector
@@ -309,7 +315,7 @@ class Context:
         )
         
         try:
-            response = await self.llm_client.chat.completions.create(
+            response = await self.llm_instruct.chat.completions.create(
                 model="qwen/qwen-2.5-72b-instruct",
                 messages=[
                     {"role": "system", "content": system},
@@ -333,11 +339,68 @@ class Context:
             logger.error(f"LLM Generation Failed: {e}")
             return None
     
-    async def _send_batch_to_stream(self, message_id: int, entities: List[Entity], 
+    async def _call_reasoning(self, system: str, user: str) -> str | None:
+
+        self.trace_logger.debug(
+            f"MODEL: deepseek/deepseek-r1-distill-llama-70b\n"
+            f"SYSTEM PROMPT:\n{system}\n\n"
+        )
+
+        try:
+            response = await self.llm_client.chat.completions.create(
+            model="deepseek/deepseek-v3.2",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user}
+            ],
+            temperature=0.6,
+            extra_body={
+                    "provider": {
+                        "allow_fallbacks": True 
+                    }
+                }
+            )
+
+            content = response.choices[0].message.content
+            self.trace_logger.debug(f"RESPONSE:\n{content}")
+
+            return content
+        except Exception as e:
+            self.trace_logger.error(f"GENERATION FAILED: {e}")
+            logger.error(f"LLM Generation Failed: {e}")
+            return None
+    
+    async def _call_formatter(self, reasoning_output: str, response_model: Type[T]) -> T | None:
+
+        system = get_connection_formatter_prompt()
+
+        try:
+            response = await self.llm_instruct.chat.completions.create(
+                model="qwen/qwen-2.5-72b-instruct",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": reasoning_output}
+                ],
+                response_model=response_model,
+                max_retries=2,
+                temperature=0,
+                extra_body={
+                    "provider": {
+                        "allow_fallbacks": True 
+                    }
+                }
+            )
+
+            return response
+        except Exception as e:
+            logger.error(f"Formatter failed: {e}")
+            return None
+
+    
+    async def _send_batch_to_stream(self, entities: List[Entity], 
                                         relations: List[Relationship], type: MessageType, 
                                         stream_key: str = STREAM_KEY_STRUCTURE):
             batch = BatchMessage(
-                message_id=message_id,
                 type=type,
                 list_ents=entities,
                 list_relations=relations
@@ -347,126 +410,6 @@ class Context:
             except exceptions.RedisError as e:
                 logger.error(f"Failed to push batch to {stream_key}: {e}")
     
-    async def _extract_relationships_with_voting(
-        self,
-        entity_registry: Dict[str, Dict],
-        messages: List[Dict]
-    ) -> List[RelationshipExtractionResponse]:
-        """
-        Extract relationships using 3-way voting.
-        """
-        
-        system_prompt = get_relationship_prompt(", ".join(self.active_topics), self.user_name)
-        
-        user_prompt_data = {
-            "entity_registry": [
-                {
-                    "user_name": self.user_name, 
-                    "note": f"The speaker is {self.user_name}. First Person pronouns refers to the speaker who is USER.",
-                    "id": data["id"],
-                    "canonical_name": name,
-                    "type": data["type"],
-                    "mentions": data["mentions"]
-                }
-                for name, data in entity_registry.items()
-            ],
-            "messages": [
-                {"message_id": m["id"], "text": m["message"]}
-                for m in messages
-            ]
-        }
-        
-        prompt_tuple = (system_prompt, json.dumps(user_prompt_data, indent=2))
-        
-        logger.info("Running 3-way voting for relationship extraction...")
-        
-        tasks = [
-            self._call_slm(prompt_tuple, RelationshipExtractionResponse)
-            for _ in range(3)
-        ]
-        
-        results = await asyncio.gather(*tasks)
-        
-        valid_results = [r for r in results if r is not None]
-        
-        if not valid_results:
-            logger.error("All 3 relationship extraction calls failed")
-            return []
-        
-        logger.info(f"Relationship voting complete: {len(valid_results)}/3 valid responses")
-        
-        return valid_results
-    
-    async def _judge_relationships(
-        self,
-        voting_results: List[RelationshipExtractionResponse],
-        entity_registry: Dict[str, Dict],
-        messages: List[Dict]
-    ) -> RelationshipExtractionResponse:
-        """
-        Judge reconciles the voting results into final relationships.
-        """
-        
-        if len(voting_results) == 0:
-            logger.error("No voting results to judge")
-            return None
-        
-        if len(voting_results) == 1:
-            logger.warning("Only 1 valid voting result, skipping judge")
-            return voting_results[0]
-        
-        raw_messages_text = "\n".join([f"{m['id']}: \"{m['message']}\"" for m in messages])
-        
-        system_prompt = get_relationship_judge_prompt(
-            ", ".join(self.active_topics),
-            raw_messages_text,
-            self.user_name
-        )
-        
-        user_prompt_data = {
-            "entity_registry": [
-                {
-                    "id": data["id"],
-                    "canonical_name": name,
-                    "type": data["type"],
-                    "mentions": data["mentions"]
-                }
-                for name, data in entity_registry.items()
-            ]
-        }
-        
-        for i, result in enumerate(voting_results):
-            user_prompt_data[f"attempt_{i + 1}"] = json.loads(result.model_dump_json())
-        
-        self.trace_logger.debug(
-            f"MODEL: deepseek/deepseek-chat (JUDGE)\n"
-            f"SYSTEM PROMPT:\n{system_prompt}\n\n"
-        )
-        
-        try:
-            judge_result = await self.llm_client.chat.completions.create(
-                model="deepseek/deepseek-chat",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(user_prompt_data, indent=2)}
-                ],
-                response_model=RelationshipExtractionResponse,
-                max_retries=2,
-                temperature=0,
-                extra_body={
-                    "provider": {
-                        "allow_fallbacks": True
-                    }
-                }
-            )
-
-            self.trace_logger.debug(f"RESPONSE:\n{judge_result.model_dump_json(indent=2)}")
-            
-            return judge_result
-            
-        except Exception as e:
-            logger.error(f"Relationship judge failed: {e}. Falling back to first attempt.")
-            return voting_results[0]
 
     async def _disambiguate(
         self,
@@ -509,9 +452,19 @@ class Context:
             return entity_registry
         
         messages_text = "\n".join([f"{m['id']}: \"{m['message']}\"" for m in messages])
+        user_profile = self.ent_resolver.entity_profiles.get(1)
+        system_user_info = None
+        if user_profile:
+             system_user_info = {
+                 "id": 1,
+                 "canonical_name": user_profile.get("canonical_name"),
+                 "aliases": user_profile.get("aliases", [])
+             }
+
         system_prompt = get_disambiguation_prompt(messages_text, self.user_name)
         
         user_prompt_data = {
+            "system_user_context": system_user_info, 
             "ambiguous_mentions": [],
             "new_mentions": []
         }
@@ -566,11 +519,32 @@ class Context:
         
         for resolution in disambiguation_response.ambiguous_resolutions:
             mention = resolution.mention
+            if mention not in ambiguous:
+                logger.warning(f"LLM returned mention '{mention}' not found in ambiguous list. Skipping.")
+                continue
+
             if resolution.is_new:
                 if mention not in new:
                     new[mention] = {"type": ambiguous[mention]["type"]}
             else:
                 canonical = resolution.canonical_name
+                final_id = resolution.resolved_id
+                if final_id is None and canonical:
+
+                    for cand in ambiguous[mention]["candidates"]:
+                        if cand["profile"].get("canonical_name") == canonical:
+                            final_id = cand["id"]
+                            break
+
+                    if canonical == self.user_name:
+                        final_id = 1
+                
+                if final_id is None:
+                    logger.warning(f"LLM resolved '{mention}' to '{canonical}' but ID is Null. Treating as New.")
+                    if mention not in new:
+                        new[mention] = {"type": ambiguous[mention]["type"]}
+                    continue
+
                 if canonical not in entity_registry:
                     entity_registry[canonical] = {
                         "id": resolution.resolved_id,
@@ -604,15 +578,36 @@ class Context:
                 "is_new": True,
                 "embedding": embedding
             }
-            
-            for mention in group.mentions:
-                if mention != group.canonical_name:
-                    await loop.run_in_executor(
-                        self.cpu_executor,
-                        partial(self.ent_resolver.add_alias, new_id, mention)
-                    )
         
         return entity_registry
+    
+    async def _extract_connections(
+        self,
+        entity_registry: Dict[str, Dict],
+        messages: List[Dict]
+    ) -> ConnectionExtractionResponse | None:
+        """
+        Extract meaningful connections between entities in messages.
+        """
+    
+        candidate_entities = [
+            {"name": name, "type": data["type"], "mentions": data["mentions"]}
+            for name, data in entity_registry.items()
+        ]
+        
+        # Pass 1: Reasoning
+        reasoning_prompt = get_connection_reasoning_prompt(self.user_name)
+        user_content = json.dumps({"candidate_entities": candidate_entities, "messages": messages})
+        reasoning_output = await self._call_reasoning(reasoning_prompt, user_content)
+        
+        if not reasoning_output:
+            return None
+        
+        # Pass 2: Format
+        formatter_prompt = get_connection_formatter_prompt()
+        result = await self._call_formatter(reasoning_output, ConnectionExtractionResponse)
+        
+        return result
     
 
     async def _get_buffered_messages(self) -> List[Dict]:
@@ -632,7 +627,7 @@ class Context:
         loop = asyncio.get_running_loop()
         
         mention_tasks = [
-            loop.run_in_executor(self.cpu_executor, self.nlp_pipe.extract_mentions, m["message"], 0.5)
+            loop.run_in_executor(self.cpu_executor, self.nlp_pipe.extract_mentions, m["message"], 0.65)
             for m in messages
         ]
         emotion_tasks = [
@@ -727,17 +722,7 @@ class Context:
             if not updated_profile:
                 return None
             
-            current_aliases = set(existing_profile.get("aliases", []))
-            current_aliases.update(updated_profile.aliases)
-            
-            old_name = existing_profile.get("canonical_name")
-            if old_name and old_name != updated_profile.canonical_name:
-                current_aliases.add(old_name)
-            
-            if updated_profile.canonical_name in current_aliases:
-                current_aliases.remove(updated_profile.canonical_name)
-                
-            final_aliases_list = list(current_aliases)
+
             new_summary = updated_profile.summary
         
             if new_summary == old_summary:
@@ -757,7 +742,6 @@ class Context:
                 id=ent_id,
                 canonical_name=updated_profile.canonical_name,
                 type=ent["type"],
-                aliases=final_aliases_list,
                 summary=new_summary,
                 topic=updated_profile.topic,
                 embedding=new_embedding,
@@ -770,7 +754,6 @@ class Context:
         
         if updates_for_graph:
             await self._send_batch_to_stream(
-                message_id=checkpoint_msg_id,
                 entities=updates_for_graph,
                 relations=[],
                 type=MessageType.PROFILE_UPDATE,
@@ -795,21 +778,24 @@ class Context:
             current_batch_max_id = max([m['id'] for m in messages])
 
             mentions = await self._extract_mentions_batch(messages)
+            if not mentions:
+                logger.info("No mentions found in batch, skipping LLM calls")
+                return
+            
             resolution_result = await self._resolve_mentions(mentions, messages)
             entity_registry = await self._disambiguate(resolution_result, messages)
-            voting_results = await self._extract_relationships_with_voting(entity_registry, messages)
-            
-            if not voting_results:
-                logger.error("Relationship extraction failed - no valid results")
+
+            if not entity_registry:
+                logger.info("No entities after disambiguation, skipping connection extraction")
                 return
-            
-            final_result = await self._judge_relationships(voting_results, entity_registry, messages)
-            
-            if not final_result:
-                logger.error("Relationship judging failed")
+        
+            connection_result = await self._extract_connections(entity_registry, messages)
+
+            if not connection_result:
+                logger.error("Connection extraction failed")
                 return
 
-            await self._publish_batch(entity_registry, final_result)
+            await self._publish_batch(entity_registry, connection_result)
 
             entities_needing_profile = []
 
@@ -831,7 +817,7 @@ class Context:
                     logger.debug(f"Skipping Profile for {name}: Only {current_batch_max_id - last_profiled_id} msgs since last update.")
             
             if entities_needing_profile:
-                recent_context = await self.get_recent_context(num_messages=PROFILE_INTERVAL) # Fetch larger context
+                recent_context = await self.get_recent_context(num_messages=PROFILE_INTERVAL)
                 batch_context = " ".join(m["message"] for m in messages)
                 
                 self._fire_and_forget(
@@ -849,7 +835,7 @@ class Context:
     async def _publish_batch(
         self,
         entity_registry: Dict[str, Dict],
-        extraction_result: RelationshipExtractionResponse
+        extraction_result: ConnectionExtractionResponse
         ):
         """
         Publish entities and relationships to graph via Redis stream.
@@ -860,7 +846,6 @@ class Context:
                 "id": data["id"],
                 "canonical_name": name,
                 "type": data["type"],
-                "aliases": [m for m in data["mentions"] if m != name],
                 "summary": "",
                 "topic": "General",
                 "embedding": data.get("embedding", [])
@@ -868,60 +853,51 @@ class Context:
             for name, data in entity_registry.items()
         }
         
-        for msg_extraction in extraction_result.message_extractions:
-            msg_id = msg_extraction.message_id
+        for msg_result in extraction_result.message_results:
+            msg_id = msg_result.message_id
             
-            msg_entities = []
-            name_correction_map = {}
-
-            for mention in msg_extraction.entity_mentions:
-                key = mention.canonical_name.lower()
-                entity_data = entity_lookup.get(key)
-                
-                if entity_data:
-                    msg_entities.append(entity_data)
-                    name_correction_map[mention.canonical_name] = entity_data["canonical_name"]
-                    name_correction_map[entity_data["canonical_name"]] = entity_data["canonical_name"]
-                else:
-                    logger.warning(f"Entity '{mention.canonical_name}' (msg_{msg_id}) not found in registry")
+            mentioned_entities = set()
+            for pair in msg_result.entity_pairs:
+                mentioned_entities.add(pair.entity_a.lower())
+                mentioned_entities.add(pair.entity_b.lower())
             
-
-            proto_rels = []
-            for rel in msg_extraction.relationships:
-                
-                real_source = name_correction_map.get(rel.source)
-                real_target = name_correction_map.get(rel.target)
-
-                if real_source and real_target:
-                    proto_rels.append(Relationship(
-                        source_text=real_source, 
-                        target_text=real_target,
-                        confidence=rel.confidence,
-                        relation=rel.relation
-                    ))
-                else:
-                    logger.warning(f"Skipping orphan rel: {rel.source} -> {rel.target} (Entities not found in this batch context)")
 
             proto_ents = []
             seen_ids = set()
-            for ent in msg_entities:
-                if ent["id"] not in seen_ids:
+            for entity_key in mentioned_entities:
+                ent = entity_lookup.get(entity_key)
+      
+                if ent and ent["id"] not in seen_ids and ent["type"]:
                     proto_ents.append(Entity(
                         id=ent["id"],
                         canonical_name=ent["canonical_name"],
                         type=ent["type"],
                         confidence=1.0,
-                        aliases=ent["aliases"],
                         summary="",
                         topic=ent["topic"],
                         embedding=ent["embedding"]
                     ))
                     seen_ids.add(ent["id"])
             
+
+            proto_rels = []
+            for pair in msg_result.entity_pairs:
+                ent_a = entity_lookup.get(pair.entity_a.lower())
+                ent_b = entity_lookup.get(pair.entity_b.lower())
+                
+                if ent_a and ent_b:
+                    proto_rels.append(Relationship(
+                        entity_a=ent_a["canonical_name"],
+                        entity_b=ent_b["canonical_name"],
+                        confidence=pair.confidence,
+                        message_id=msg_id
+                    ))
+                else:
+                    logger.warning(f"Skipping pair: {pair.entity_a} - {pair.entity_b} (entity not found)")
+        
             await self._send_batch_to_stream(
-                message_id=msg_id, 
-                entities=proto_ents, 
-                relations=proto_rels, 
+                entities=proto_ents,
+                relations=proto_rels,
                 type=MessageType.USER_MESSAGE,
                 stream_key=STREAM_KEY_STRUCTURE
             )

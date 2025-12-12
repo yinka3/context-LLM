@@ -55,6 +55,9 @@ class GraphBuilder:
     def stop(self):
         logger.info("Stopping GraphBuilder...")
         self.running = False
+        deleted = self.store.cleanup_null_entities()
+        if deleted:
+            logger.info(f"Final cleanup: removed {deleted} null-type entities")
         self.store.close()
         logger.info(f"Service stopped. Processed: {self.processed_messages}, Failed: {self.failed_messages}")
 
@@ -125,12 +128,6 @@ class GraphBuilder:
             logger.debug(f"Processing {batch_msg.type} from {stream_key}")
 
             if batch_msg.type == MessageType.USER_MESSAGE:
-                if batch_msg.message_id < 1:
-                    logger.warning(f"Skipping USER_MESSAGE {stream_id}: invalid message_id")
-                    self.redis_client.xack(stream_key, CONSUMER_GROUP, stream_id)
-                    return
-
-                current_msg_ref = f"msg_{batch_msg.message_id}"
 
                 entities = []
                 relationships = []
@@ -143,7 +140,6 @@ class GraphBuilder:
                         "canonical_name": entity.canonical_name,
                         "type": entity.type,
                         "confidence": entity.confidence,
-                        "aliases": list(entity.aliases),
                         "summary": entity.summary, 
                         "topic": entity.topic,
                         "embedding": list(entity.embedding)
@@ -152,16 +148,17 @@ class GraphBuilder:
                 for rel in batch_msg.list_relations:
 
                     relationships.append({
-                    "source_name": rel.source_text,
-                    "target_name": rel.target_text,
-                    "relation": rel.relation,
-                    "message_id": current_msg_ref,
-                    "confidence": rel.confidence
-                })
+                        "entity_a": rel.entity_a,
+                        "entity_b": rel.entity_b,
+                        "message_id": f"msg_{rel.message_id}",
+                        "confidence": rel.confidence
+                    })
                 
                 self.store.write_batch(entities, relationships, is_user_message=True)
                 self.redis_client.xack(stream_key, CONSUMER_GROUP, stream_id)
                 self.processed_messages += 1
+
+                self.store.cleanup_null_entities()
 
             elif batch_msg.type == MessageType.PROFILE_UPDATE:
                 logger.info(f"Processing PROFILE_UPDATE message {stream_id}")
@@ -171,20 +168,18 @@ class GraphBuilder:
                         logger.warning(f"Skipping PROFILE_UPDATE: entity has no id")
                         continue
                     
-                    checkpoint_id = batch_msg.message_id
                     logger.info(f"PROFILE_UPDATE: id={entity.id}, name={entity.canonical_name}, summary_len={len(entity.summary)}, embedding_len={len(list(entity.embedding))}, embedding_type={type(list(entity.embedding))}")
                     self.store.update_entity_profile(
                         entity_id=entity.id,
                         canonical_name=entity.canonical_name,
                         summary=entity.summary,
-                        aliases=list(entity.aliases),
                         embedding=list(entity.embedding),
-                        last_msg_id=checkpoint_id
+                        last_msg_id=entity.last_profiled_msg_id
                     )
                 
                 self.redis_client.xack(stream_key, CONSUMER_GROUP, stream_id)
                 self.processed_messages += 1
-                logger.info(f"Profile Batch {batch_msg.message_id} processed")
+                logger.info(f"Profile update batch processed for {len(batch_msg.list_ents)} entities")
             elif batch_msg.type == MessageType.SYSTEM_ENTITY:
                 logger.info(f"Processing SYSTEM_ENTITY message {stream_id}")
                 
@@ -195,7 +190,6 @@ class GraphBuilder:
                         "canonical_name": entity.canonical_name,
                         "type": entity.type,
                         "confidence": entity.confidence,
-                        "aliases": list(entity.aliases),
                         "summary": entity.summary,
                         "topic": entity.topic,
                         "embedding": list(entity.embedding)
@@ -217,6 +211,7 @@ class GraphBuilder:
                 self.failed_messages += 1
             except Exception as dlq_error:
                 logger.critical(f"Failed to move to DLQ: {dlq_error}")
+
 
 if __name__ == "__main__":
     builder = GraphBuilder()

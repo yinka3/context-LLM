@@ -10,7 +10,7 @@ class NLPPipeline:
     
     def __init__(
         self,
-        gliner_model: str = "urchade/gliner_medium-v2.1",
+        gliner_model: str = "urchade/gliner_largev2",
         emotion_model: str = "j-hartmann/emotion-english-distilroberta-base",
         device: Optional[str] = None
     ):
