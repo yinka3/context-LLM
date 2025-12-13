@@ -4,7 +4,7 @@ import threading
 from typing import Dict, List
 import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from rapidfuzz import process as fuzzy_process, fuzz
 from graph.memgraph import MemGraphStore
 
@@ -12,9 +12,10 @@ from graph.memgraph import MemGraphStore
 
 class EntityResolver:
 
-    def __init__(self, embedding_model_model='google/embeddinggemma-300m'):
-        self.embedding_model = SentenceTransformer(embedding_model_model)
-        self.embedding_dim = 768
+    def __init__(self, embedding_model='dunzhang/stella_en_1.5B_v5'):
+        self.embedding_model = SentenceTransformer(embedding_model, trust_remote_code=True, device='cpu')
+        self.cross_encoder = CrossEncoder('BAAI/bge-reranker-v2-m3', device='cpu')
+        self.embedding_dim = 1024
         self.faiss_index: faiss.IndexFlatIP = faiss.IndexFlatIP(self.embedding_dim)
         self.index_id_map: faiss.IndexIDMap2 = faiss.IndexIDMap2(self.faiss_index)
         self.ref = {"me", "i", "myself", "user"}
@@ -120,8 +121,6 @@ class EntityResolver:
         if not has_data:
             return {"resolved": None, "ambiguous": [], "new": True, "mention": text}
         
-        
-        
         set_text = set(word.lower().strip(".,!'?") for word in text.split())
         if any(word in self.ref for word in set_text):
             for _, _id in self.fuzzy_choices.items():
@@ -165,16 +164,16 @@ class EntityResolver:
                     logger.debug(f"FAISS result: query='{text}' -> id={index_id}, score={score:.3f}")
                     if index_id != -1 and score >= 0.5:
                         entity_id = int(index_id)
-                        norm_score = float((score + 1) / 2)
+                        norm_score = float(score)
 
-                        exisiting = candidates_map.get(entity_id)
+                        existing = candidates_map.get(entity_id)
 
-                        if exisiting:
-                            exisiting["match_detail"]["source"] = "hybrid"
-                            exisiting["match_detail"]["vector_store"] = float(score)
+                        if existing:
+                            existing["match_detail"]["source"] = "hybrid"
+                            existing["match_detail"]["vector_store"] = float(score)
 
-                            if norm_score > exisiting["match_detail"]["norm_score"]:
-                                exisiting["match_detail"]["norm_score"] = norm_score
+                            if norm_score > existing["match_detail"]["norm_score"]:
+                                existing["match_detail"]["norm_score"] = norm_score
                         else:
                             candidates_map[entity_id] = {
                                 "id": entity_id,
@@ -195,10 +194,104 @@ class EntityResolver:
 
         best_score = sorted_candidates[0]["match_detail"]["norm_score"]
     
-        if best_score >= 0.85:
+        if best_score >= 0.70:
             return {"resolved": sorted_candidates[0], "ambiguous": [], "new": False, "mention": text}
-        elif best_score >= 0.5:
-            viable = [c for c in sorted_candidates if c["match_detail"]["norm_score"] >= 0.5]
+        elif best_score >= 0.50:
+            viable = [c for c in sorted_candidates if c["match_detail"]["norm_score"] >= 0.50]
             return {"resolved": None, "ambiguous": viable, "new": False, "mention": text}
         else:
             return {"resolved": None, "ambiguous": [], "new": True, "mention": text}
+
+
+    def detect_merge_candidates(self) -> list:
+        """Detect potential entity merges based on summary similarity."""
+        
+        if not self._init_from_db():
+            logger.error("Failed to refresh from database, aborting merge detection")
+            return []
+    
+        logger.info(f"Merge detection started, {len(self.entity_profiles)} entities to scan")
+        
+        candidates = []
+        seen_pairs = set()
+        
+        for entity_id, profile in self.entity_profiles.items():
+            summary = profile.get("summary", "")
+            entity_type = profile.get("type")
+            canonical_name = profile.get("canonical_name", "Unknown")
+            if not summary:
+                continue
+            
+            import re
+            match = re.match(r'^(.+?[.!?])(?:\s+[A-Z]|$)', summary)
+            first_sentence = match.group(1).strip() if match else summary[:200].strip()
+            
+            s2s_prompt = "Instruct: Retrieve semantically similar text.\nQuery: "
+            embedding = self.embedding_model.encode([s2s_prompt + first_sentence])
+            faiss.normalize_L2(embedding)
+            
+            with self._lock:
+                if self.index_id_map.ntotal == 0:
+                    continue
+                
+                scores, indices = self.index_id_map.search(embedding, k=5)
+            
+            for match_id, faiss_score in zip(indices[0], scores[0]):
+                match_id = int(match_id)
+                
+                if match_id == -1 or match_id == entity_id:
+                    continue
+                
+                match_profile = self.entity_profiles.get(match_id)
+                if not match_profile:
+                    continue
+
+                match_type = match_profile.get("type")
+                match_name = match_profile.get("canonical_name", "Unknown")
+        
+                if entity_type != match_type:
+                    logger.debug(f"Type mismatch: {canonical_name} ({entity_type}) vs {match_name} ({match_type}), skipping")
+                    continue
+
+                if canonical_name == match_name:
+                    pair = tuple(sorted([entity_id, match_id]))
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    
+                    logger.info(f"Merge verification: ({entity_id}, {match_id}) {canonical_name} <- {match_name} | "
+                                f"Exact name match Decision=APPROVED")
+                    continue
+                
+                if faiss_score < 0.50:
+                    continue
+
+                primary_text = f"{canonical_name}. {profile.get('summary', '')[:150]}"
+                secondary_text = f"{match_name}. {match_profile.get('summary', '')[:150]}"
+                cross_score = float(self.cross_encoder.predict([[primary_text, secondary_text]])[0])
+                
+                pair = tuple(sorted([entity_id, match_id]))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                
+                decision = "APPROVED" if cross_score >= 0.65 else "REJECTED"
+                logger.info(
+                    f"Merge verification: ({entity_id}, {match_id}) {canonical_name} <- {match_name} | "
+                    f"FAISS={faiss_score:.3f} CrossEncoder={cross_score:.3f} Decision={decision}"
+                )
+                
+                if cross_score >= 0.65:
+                    primary_id, secondary_id = pair
+                    candidates.append({
+                        "primary_id": primary_id,
+                        "secondary_id": secondary_id,
+                        "primary_name": self.entity_profiles[primary_id].get("canonical_name", "Unknown"),
+                        "secondary_name": self.entity_profiles[secondary_id].get("canonical_name", "Unknown"),
+                        "faiss_score": float(faiss_score),
+                        "cross_score": cross_score
+                    })
+        
+        logger.info(f"Merge detection complete: {len(candidates)} candidates found")
+        
+        return candidates

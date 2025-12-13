@@ -35,7 +35,7 @@ class NLPPipeline:
             device=device_id
         )
     
-    def extract_mentions(self, text: str, threshold: float = 0.5) -> List[Tuple[str, str]]:
+    def extract_mentions(self, text: str, threshold: float) -> List[Tuple[str, str]]:
         """Returns list of (mention_text, entity_type) tuples."""
         if not text or not text.strip():
             return []

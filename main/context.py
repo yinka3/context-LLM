@@ -603,10 +603,7 @@ class Context:
         if not reasoning_output:
             return None
         
-        # Pass 2: Format
-        formatter_prompt = get_connection_formatter_prompt()
         result = await self._call_formatter(reasoning_output, ConnectionExtractionResponse)
-        
         return result
     
 
@@ -627,7 +624,7 @@ class Context:
         loop = asyncio.get_running_loop()
         
         mention_tasks = [
-            loop.run_in_executor(self.cpu_executor, self.nlp_pipe.extract_mentions, m["message"], 0.65)
+            loop.run_in_executor(self.cpu_executor, self.nlp_pipe.extract_mentions, m["message"], 0.80)
             for m in messages
         ]
         emotion_tasks = [
@@ -909,6 +906,15 @@ class Context:
         if self._background_tasks:
             logger.info(f"Waiting for {len(self._background_tasks)} background tasks...")
             await asyncio.wait(self._background_tasks, timeout=60)
+        
+        loop = asyncio.get_running_loop()
+        candidates = await loop.run_in_executor(
+            self.cpu_executor,
+            self.ent_resolver.detect_merge_candidates
+        )
+
+        if candidates:
+            logger.info(f"Detected {len(candidates)} merge candidates at shutdown")
 
         if self.session_emotions:
             from collections import Counter
