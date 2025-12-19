@@ -839,8 +839,8 @@ class Context:
             logger.info(f"Waiting for {len(self._background_tasks)} background tasks...")
             await asyncio.wait(self._background_tasks, timeout=60)
         
-        # if self._session_entity_ids:
-        #     await self._run_session_profile_updates()
+        if self._session_entity_ids:
+            await self._run_session_profile_updates()
         
         logger.info("Waiting for graph consumer to sync...")
         await asyncio.sleep(20)
