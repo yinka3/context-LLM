@@ -2,6 +2,7 @@ import asyncio
 import time
 from dotenv import load_dotenv
 import os
+import re
 import redis.asyncio as redis
 from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
@@ -19,6 +20,7 @@ from main.nlp_pipe import NLPPipeline
 from main.entity_resolve import EntityResolver
 from graph.memgraph import MemGraphStore
 from main.prompts import *
+from rapidfuzz import process as fuzzy_process, fuzz
 from main.llm_trace import get_trace_logger
 load_dotenv()
 
@@ -40,7 +42,7 @@ PROFILE_INTERVAL = 15
 
 STREAM_KEY_STRUCTURE = "stream:structure"
 STREAM_KEY_PROFILE = "stream:profile"
-BATCH_TIMEOUT_SECONDS = 60
+BATCH_TIMEOUT_SECONDS = 180.0
 
 class Context:
 
@@ -48,6 +50,7 @@ class Context:
         self.user_name: str = user_name
         self.active_topics: List[str] = topics
         self.session_emotions: List[str] = []
+        self._session_entity_ids: Set[int] = set()
         
         self.redis_client: redis.Redis = redis_client 
         self.llm_instruct: AsyncOpenAI = llm_client_instruct
@@ -79,21 +82,12 @@ class Context:
         loop = asyncio.get_running_loop()
         
         instance.nlp_pipe = await loop.run_in_executor(
-            instance.cpu_executor, NLPPipeline
+            instance.cpu_executor, NLPPipeline, llm_instruct
         )
         
         instance.ent_resolver = await loop.run_in_executor(
             instance.cpu_executor, EntityResolver
         )
-
-        initialized = await loop.run_in_executor(
-            instance.cpu_executor, 
-            instance.ent_resolver._init_from_db 
-        )
-
-        if not initialized:
-            logger.critical("Entity resolver is not hydrated, STOP PROGRAM")
-            raise RuntimeError("Failed to initialize EntityResolver from DB")
 
         await instance._get_or_create_user_entity(user_name)
         
@@ -107,7 +101,6 @@ class Context:
             logger.error(f"Background task failed: {exc}")
     
     def _fire_and_forget(self, coroutine):
-        """Safely schedule background task with strong reference."""
         task = asyncio.create_task(coroutine)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
@@ -119,39 +112,64 @@ class Context:
 
     async def get_next_ent_id(self) -> int:
         return await self.redis_client.incr("global:next_ent_id")
+    
+    def _format_relative_time(self, now: datetime, ts: datetime) -> str:
+        delta = now - ts
+        seconds = delta.total_seconds()
+        
+        if seconds < 3600:
+            mins = int(seconds // 60)
+            return f"{mins}m ago" if mins > 1 else "just now"
+        elif seconds < 86400:
+            hours = int(seconds // 3600)
+            return f"{hours}h ago"
+        elif seconds < 604800:
+            days = int(seconds // 86400)
+            return f"{days}d ago"
+        else:
+            weeks = int(seconds // 604800)
+            return f"{weeks}w ago"
 
 
-    async def _get_or_create_user_entity(self, user_name):
+    async def _get_or_create_user_entity(self, user_name: str):
+        loop = asyncio.get_running_loop()
 
-        profile = self.ent_resolver.entity_profiles.get(
-            self.ent_resolver.fuzzy_choices.get(user_name))
+        entity_id = await loop.run_in_executor(
+                    self.cpu_executor,
+                    self.ent_resolver.get_id,
+                    user_name
+                )
 
-        if profile:
+        if entity_id:
             logger.info(f"User {user_name} recognized.")
-            return profile
+            return entity_id
         
         logger.info(f"Creating new USER entity for {user_name}")
         new_id = await self.get_next_ent_id()
-
+        
         profile = {
             "canonical_name": user_name,
             "summary": f"The primary user named {user_name}",
-            "type": "PERSON"
+            "type": "person",
+            "topic": "Personal"
         }
 
-        embedding_vector = await asyncio.get_running_loop().run_in_executor(
-            self.cpu_executor, 
-            partial(self.ent_resolver.add_entity, new_id, profile)
+        embedding = await loop.run_in_executor(
+            self.cpu_executor,
+            partial(self.ent_resolver.register_entity, new_id, user_name, [user_name], "person", "Personal")
         )
-
+        
+        self.ent_resolver.entity_profiles[new_id]["summary"] = profile["summary"]
+        self._session_entity_ids.add(new_id)
         user_entity = Entity(
             id=new_id,
             canonical_name=user_name,
-            type="PERSON",
+            type="person",
             confidence=1.0,
             summary=profile["summary"],
-            topic="Meta",
-            embedding=embedding_vector
+            topic="Personal",
+            embedding=embedding,
+            aliases=[user_name]
         )
 
         batch = BatchMessage(type=MessageType.SYSTEM_ENTITY)
@@ -161,6 +179,8 @@ class Context:
             await self.redis_client.xadd(STREAM_KEY_STRUCTURE, {'data': batch.SerializeToString()})
         except Exception as e:
             logger.error(f"Failed to push User Entity to stream: {e}")
+        
+        return new_id
         
     async def _flush_batch_timeout(self):
         try:
@@ -180,8 +200,11 @@ class Context:
             self._batch_timer_task = None
         
         buffer_key = f"buffer:{self.user_name}"
+        wait_count = 0
         while await self.redis_client.llen(buffer_key) > 0:
-            logger.info("Shutdown: Waiting for buffer to drain...")
+            if wait_count % 20 == 0:
+                logger.info(f"Shutdown: Waiting for buffer to drain... ({wait_count}s)")
+            wait_count += 1
             await asyncio.sleep(1)
             await self._trigger_batch_process() 
 
@@ -212,10 +235,10 @@ class Context:
         while True:
             buffer_len = await self.redis_client.llen(f"buffer:{self.user_name}")
             
-            if buffer_len > 0:
+            if buffer_len >= BATCH_SIZE:
                 await self.process_batch()
                 if self._background_tasks:
-                    await asyncio.wait(self._background_tasks, timeout=90)
+                    await asyncio.wait(self._background_tasks, timeout=180)
             else:
                 await asyncio.sleep(0.5)
 
@@ -243,7 +266,8 @@ class Context:
             self._batch_timer_task = asyncio.create_task(self._flush_batch_timeout())
 
     
-    async def get_recent_context(self, num_messages: int = 10) -> List[str]:
+    async def get_recent_context(self, num_messages: int = 10) -> List[Tuple[str, str]]:
+        """Returns list of (formatted_message, raw_message) tuples."""
         sorted_set_key = f"recent_messages:{self.user_name}"
         recent_msg_ids = await self.redis_client.zrevrange(sorted_set_key, 0, num_messages-1)
         
@@ -257,12 +281,18 @@ class Context:
             *recent_msg_ids
         )
         
-        context_text = []
+        results = []
+        now = datetime.now()
+        
         for msg_data in msg_data_list:
             if msg_data:
-                context_text.append(json.loads(msg_data)['message'])
-    
-        return context_text
+                parsed = json.loads(msg_data)
+                raw = parsed['message']
+                ts = datetime.fromisoformat(parsed['timestamp'])
+                relative = self._format_relative_time(now, ts)
+                results.append((f"({relative}) {raw}", raw))
+
+        return results
 
 
     async def add_to_redis(self, msg: MessageData):
@@ -279,30 +309,6 @@ class Context:
         await pipe.execute()
 
     
-    def _build_profiling_prompt(
-        self, 
-        entity_name: str, 
-        entity_type: str,
-        existing_profile: Dict, 
-        new_observation: str,
-        conversation_context: List[str]
-    ) -> Tuple[str, str]:
-        
-        system_prompt = get_profile_update_prompt()
-
-        user_prompt_data = {
-            "user_name": self.user_name,
-            "entity_target": entity_name,
-            "entity_type": entity_type,
-            "existing_profile": existing_profile,
-            "new_observation": new_observation,
-            "recent_context": conversation_context,
-            "valid_topics": self.active_topics
-        }
-
-        return system_prompt, json.dumps(user_prompt_data, indent=2)
-
-    
     async def _call_slm(self, 
                         prompt: Tuple[str, str], 
                         response_model: Type[T]) -> T | None:
@@ -310,13 +316,13 @@ class Context:
         system, user = prompt
 
         self.trace_logger.debug(
-            f"MODEL: qwen/qwen-2.5-72b-instruct\n"
+            f"MODEL: meta-llama/llama-3.3-70b-instruct\n"
             f"SYSTEM PROMPT:\n{system}\n\n"
         )
         
         try:
             response = await self.llm_instruct.chat.completions.create(
-                model="qwen/qwen-2.5-72b-instruct",
+                model="meta-llama/llama-3.3-70b-instruct",
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user}
@@ -342,22 +348,20 @@ class Context:
     async def _call_reasoning(self, system: str, user: str) -> str | None:
 
         self.trace_logger.debug(
-            f"MODEL: deepseek/deepseek-r1-distill-llama-70b\n"
+            f"MODEL: anthropic/claude-sonnet-4.5\n"
             f"SYSTEM PROMPT:\n{system}\n\n"
         )
 
         try:
             response = await self.llm_client.chat.completions.create(
-            model="deepseek/deepseek-v3.2",
+            model="anthropic/claude-sonnet-4",
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
             ],
-            temperature=0.6,
+            temperature=1,
             extra_body={
-                    "provider": {
-                        "allow_fallbacks": True 
-                    }
+                    "provider": {"allow_fallbacks": True}
                 }
             )
 
@@ -376,7 +380,7 @@ class Context:
 
         try:
             response = await self.llm_instruct.chat.completions.create(
-                model="qwen/qwen-2.5-72b-instruct",
+                model="meta-llama/llama-3.3-70b-instruct",
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": reasoning_output}
@@ -405,201 +409,166 @@ class Context:
                 list_ents=entities,
                 list_relations=relations
             )
+            serialized_data = batch.SerializeToString()
+        
             try:
-                await self.redis_client.xadd(stream_key, {'data': batch.SerializeToString()})
+                batch_id = f"batch_{int(time.time())}_{os.urandom(4).hex()}"
+                snapshot_key = f"snapshot:{batch_id}"
+
+                await self.redis_client.setex(snapshot_key, 3600, serialized_data)
+
+                stream_payload = {
+                    'data': serialized_data,
+                    'batch_id': batch_id,
+                    'timestamp': str(time.time())
+                }
+                
+                await self.redis_client.xadd(STREAM_KEY_STRUCTURE, stream_payload)
+                logger.info(f"Published batch {batch_id} to stream (Snapshot secured)")
+
             except exceptions.RedisError as e:
-                logger.error(f"Failed to push batch to {stream_key}: {e}")
+                logger.critical(f"Redis WRITE failure in _publish_batch. Data potentially lost: {e}")
     
-
-    async def _disambiguate(
-        self,
-        resolution_result: Dict,
-        messages: List[Dict]
-    ) -> Dict[str, Dict]:
+    async def _build_known_entities(self, mentions: List[Tuple[str, str, str]]) -> List[Dict]:
         """
-        Disambiguate ambiguous mentions and deduplicate new entities.
+        Tiered lookup: exact then fuzzy against _name_to_id.
+        Returns known entities for VEGAPUNK-02 context.
         """
-        resolved = resolution_result["resolved"]
-        ambiguous = resolution_result["ambiguous"]
-        new = resolution_result["new"]
+        matched_ids = set()
         
-        entity_registry: Dict[str, Dict] = {}
-        
-        for mention, data in resolved.items():
-            canonical = data["canonical_name"]
-            if canonical not in entity_registry:
-                entity_registry[canonical] = {
-                    "id": data["id"],
-                    "type": data["type"],
-                    "mentions": [mention]
-                }
-            else:
-                if mention not in entity_registry[canonical]["mentions"]:
-                    entity_registry[canonical]["mentions"].append(mention)
-        
-        needs_disambiguation = bool(ambiguous) or len(new) > 1
-        
-        if not needs_disambiguation:
-            if new:
-                mention, data = next(iter(new.items()))
-                new_id = await self.get_next_ent_id()
-                entity_registry[mention] = {
-                    "id": new_id,
-                    "type": data["type"],
-                    "mentions": [mention],
-                    "is_new": True
-                }
-            return entity_registry
-        
-        messages_text = "\n".join([f"{m['id']}: \"{m['message']}\"" for m in messages])
-        user_profile = self.ent_resolver.entity_profiles.get(1)
-        system_user_info = None
-        if user_profile:
-             system_user_info = {
-                 "id": 1,
-                 "canonical_name": user_profile.get("canonical_name"),
-                 "aliases": user_profile.get("aliases", [])
-             }
-
-        system_prompt = get_disambiguation_prompt(messages_text, self.user_name)
-        
-        user_prompt_data = {
-            "system_user_context": system_user_info, 
-            "ambiguous_mentions": [],
-            "new_mentions": []
-        }
-        
-        for mention, data in ambiguous.items():
-            candidates_info = [
-                {
-                    "id": c["id"],
-                    "canonical_name": c["profile"].get("canonical_name", "Unknown"),
-                    "type": c["profile"].get("type", "UNKNOWN"),
-                    "summary": c["profile"].get("summary", "No summary available.")
-                }
-                for c in data["candidates"]
-            ]
-            user_prompt_data["ambiguous_mentions"].append({
-                "mention": mention,
-                "type": data["type"],
-                "candidates": candidates_info
-            })
-        
-        for mention, data in new.items():
-            user_prompt_data["new_mentions"].append({
-                "mention": mention,
-                "type": data["type"]
-            })
-        
-        disambiguation_response = await self._call_slm(
-            prompt=(system_prompt, json.dumps(user_prompt_data, indent=2)),
-            response_model=DisambiguationResponse
-        )
-        
-        if not disambiguation_response:
-            logger.error("Disambiguation LLM call failed, falling back to treating all as new")
-
-            for mention, data in ambiguous.items():
-                new_id = await self.get_next_ent_id()
-                entity_registry[mention] = {
-                    "id": new_id,
-                    "type": data["type"],
-                    "mentions": [mention],
-                    "is_new": True
-                }
-            for mention, data in new.items():
-                new_id = await self.get_next_ent_id()
-                entity_registry[mention] = {
-                    "id": new_id,
-                    "type": data["type"],
-                    "mentions": [mention],
-                    "is_new": True
-                }
-            return entity_registry
-        
-        for resolution in disambiguation_response.ambiguous_resolutions:
-            mention = resolution.mention
-            if mention not in ambiguous:
-                logger.warning(f"LLM returned mention '{mention}' not found in ambiguous list. Skipping.")
+        for mention_name, _, _ in mentions:
+            entity_id = self.ent_resolver._name_to_id.get(mention_name)
+            if entity_id:
+                matched_ids.add(entity_id)
                 continue
 
-            if resolution.is_new:
-                if mention not in new:
-                    new[mention] = {"type": ambiguous[mention]["type"]}
-            else:
-                canonical = resolution.canonical_name
-                final_id = resolution.resolved_id
-                if final_id is None and canonical:
-
-                    for cand in ambiguous[mention]["candidates"]:
-                        if cand["profile"].get("canonical_name") == canonical:
-                            final_id = cand["id"]
-                            break
-
-                    if canonical == self.user_name:
-                        final_id = 1
-                
-                if final_id is None:
-                    logger.warning(f"LLM resolved '{mention}' to '{canonical}' but ID is Null. Treating as New.")
-                    if mention not in new:
-                        new[mention] = {"type": ambiguous[mention]["type"]}
-                    continue
-
-                if canonical not in entity_registry:
-                    entity_registry[canonical] = {
-                        "id": resolution.resolved_id,
-                        "type": ambiguous[mention]["type"],
-                        "mentions": [mention]
-                    }
-                else:
-                    if mention not in entity_registry[canonical]["mentions"]:
-                        entity_registry[canonical]["mentions"].append(mention)
+            if self.ent_resolver._name_to_id:
+                result = fuzzy_process.extractOne(
+                    query=mention_name,
+                    choices=self.ent_resolver._name_to_id.keys(),
+                    scorer=fuzz.WRatio,
+                    score_cutoff=85
+                )
+                if result:
+                    matched_name, score, _ = result
+                    logger.debug(f"Fuzzy matched '{mention_name}' -> '{matched_name}' (score={score})")
+                    matched_ids.add(self.ent_resolver._name_to_id[matched_name])
         
-        for group in disambiguation_response.new_entity_groups:
-            new_id = await self.get_next_ent_id()
-            
-            stub_profile = {
-                "canonical_name": group.canonical_name,
-                "aliases": [m for m in group.mentions if m != group.canonical_name],
-                "summary": "",
-                "type": group.type
-            }
-            
-            loop = asyncio.get_running_loop()
-            embedding = await loop.run_in_executor(
-                self.cpu_executor,
-                partial(self.ent_resolver.add_entity, new_id, stub_profile)
-            )
-            
-            entity_registry[group.canonical_name] = {
-                "id": new_id,
-                "type": group.type,
-                "mentions": group.mentions,
-                "is_new": True,
-                "embedding": embedding
-            }
+        known_entities = []
+        for ent_id in matched_ids:
+            profile = self.ent_resolver.entity_profiles.get(ent_id)
+            if profile:
+                known_entities.append({
+                    "canonical_name": profile.get("canonical_name"),
+                    "type": profile.get("type"),
+                    "aliases": self.ent_resolver.get_mentions_for_id(ent_id)
+                })
         
-        return entity_registry
+        return known_entities
     
+    async def _disambiguate_reasoning(
+        self,
+        mentions: List[Tuple[str, str, str]],
+        messages: List[Dict],
+        known_entities: List[Dict]
+    ) -> DisambiguationResult:
+        """
+        Two-phase disambiguation: VEGAPUNK-02 (reasoning) → VEGAPUNK-03 (structuring).
+        """
+
+        messages_text = "\n".join([f"{m['id']}: \"{m['message']}\"" for m in messages])
+        mentions_formatted = [{"name": m[0], "type": m[1], "topic": m[2]} for m in mentions]
+        
+        system_prompt_02 = get_disambiguation_reasoning_prompt(self.user_name, messages_text)
+        user_content_02 = json.dumps({
+            "mentions": mentions_formatted,
+            "known_entities": known_entities
+        }, indent=2)
+        
+        reasoning_output = await self._call_reasoning(system_prompt_02, user_content_02)
+        
+        if not reasoning_output:
+            logger.error("VEGAPUNK-02 failed, returning empty result")
+            return DisambiguationResult(entries=[])
+        
+        if "<resolution>" not in reasoning_output:
+            logger.warning("No <resolution> block found in VEGAPUNK-02 output")
+        
+        system_prompt_03 = get_disambiguation_formatter_prompt()
+        user_content_03 = json.dumps({
+            "mentions": mentions_formatted,
+            "reasoning_output": reasoning_output
+        }, indent=2)
+        
+        result = await self._call_slm(
+            prompt=(system_prompt_03, user_content_03),
+            response_model=DisambiguationResult
+        )
+        
+        if not result:
+            logger.error("VEGAPUNK-03 failed, returning empty result")
+            return DisambiguationResult(entries=[])
+        
+        return result
+    
+    async def _resolve(self, disambiguation_result: DisambiguationResult) -> Tuple[List[int], Set[int]]:
+        """
+        Validate disambiguation results, update ER.
+        Returns list of entity IDs touched.
+        """
+        entity_ids = []
+        new_entity_ids = set()
+        loop = asyncio.get_running_loop()
+        
+        for entry in disambiguation_result.entries:
+            if entry.verdict == "EXISTING":
+                entity_id = self.ent_resolver.validate_existing(entry.canonical_name, entry.mentions)
+                if entity_id is None:
+                    logger.warning(f"EXISTING '{entry.canonical_name}' not found, demoting")
+                    canonical = entry.mentions[0]
+                    entity_id = await self.get_next_ent_id()
+                    await loop.run_in_executor(
+                        self.cpu_executor,
+                        partial(self.ent_resolver.register_entity, entity_id, canonical, entry.mentions, entry.entity_type, "General")
+                    )
+                    new_entity_ids.add(entity_id)
+            else:
+                canonical = max(entry.mentions, key=lambda m: (len(m), m)) if entry.verdict == "NEW_GROUP" else entry.mentions[0]
+                entity_id = await self.get_next_ent_id()
+                await loop.run_in_executor(
+                    self.cpu_executor,
+                    partial(self.ent_resolver.register_entity, entity_id, canonical, entry.mentions, entry.entity_type, "General")
+                )
+                new_entity_ids.add(entity_id)
+            
+            entity_ids.append(entity_id)
+        
+        return entity_ids, new_entity_ids
+
     async def _extract_connections(
         self,
-        entity_registry: Dict[str, Dict],
+        entity_ids: List[int],
         messages: List[Dict]
     ) -> ConnectionExtractionResponse | None:
         """
         Extract meaningful connections between entities in messages.
         """
     
-        candidate_entities = [
-            {"name": name, "type": data["type"], "mentions": data["mentions"]}
-            for name, data in entity_registry.items()
-        ]
-        
-        # Pass 1: Reasoning
-        reasoning_prompt = get_connection_reasoning_prompt(self.user_name)
+        candidate_entities = []
+        for ent_id in entity_ids:
+            profile = self.ent_resolver.entity_profiles.get(ent_id)
+            if profile:
+                mentions = self.ent_resolver.get_mentions_for_id(ent_id)
+                candidate_entities.append({
+                    "name": profile["canonical_name"],
+                    "type": profile["type"],
+                    "mentions": mentions
+                })
+        messages_text = "\n".join([f"{m['id']}: \"{m['message']}\"" for m in messages])
+        reasoning_prompt = get_connection_reasoning_prompt(self.user_name, messages_text)
         user_content = json.dumps({"candidate_entities": candidate_entities, "messages": messages})
+
         reasoning_output = await self._call_reasoning(reasoning_prompt, user_content)
-        
         if not reasoning_output:
             return None
         
@@ -608,14 +577,8 @@ class Context:
     
 
     async def _get_buffered_messages(self) -> List[Dict]:
-        """Atomically grab batch from buffer."""
         buffer_key = f"buffer:{self.user_name}"
-        pipe = self.redis_client.pipeline()
-        pipe.lrange(buffer_key, 0, BATCH_SIZE - 1)
-        pipe.ltrim(buffer_key, BATCH_SIZE, -1)
-        results = await pipe.execute()
-        
-        raw_messages = results[0]
+        raw_messages = await self.redis_client.lrange(buffer_key, 0, BATCH_SIZE - 1)
         return [json.loads(m) for m in raw_messages] if raw_messages else []
 
 
@@ -624,9 +587,14 @@ class Context:
         loop = asyncio.get_running_loop()
         
         mention_tasks = [
-            loop.run_in_executor(self.cpu_executor, self.nlp_pipe.extract_mentions, m["message"], 0.80)
+            self.nlp_pipe.extract_mentions(
+                self.user_name, 
+                self.active_topics, 
+                m["message"]
+            )
             for m in messages
         ]
+
         emotion_tasks = [
             loop.run_in_executor(self.cpu_executor, self.nlp_pipe.analyze_emotion, m["message"])
             for m in messages
@@ -635,11 +603,14 @@ class Context:
         all_mentions_results = await asyncio.gather(*mention_tasks)
         all_emotions = await asyncio.gather(*emotion_tasks)
 
-        all_unique_mentions: Dict[str, str] = {}
+        all_unique_mentions: Dict[str, Dict] = {}
         for mentions in all_mentions_results:
-            for mention_text, mention_type in mentions:
+            for mention_text, mention_type, mention_topic in mentions:
                 if mention_text not in all_unique_mentions:
-                    all_unique_mentions[mention_text] = mention_type
+                    all_unique_mentions[mention_text] = {
+                        "type": mention_type,
+                        "topic": mention_topic
+                    }
 
         for emotions in all_emotions:
             if emotions:
@@ -649,104 +620,76 @@ class Context:
         return all_unique_mentions
 
 
-    async def _resolve_mentions(self, mentions: Dict[str, str], messages: List[Dict]) -> Dict[str, Dict]:
-        """Phase 2: Resolve all unique mentions against existing entities."""
-        if not mentions:
-            return {"resolved": {}, "ambiguous": {}, "new": {}}
 
-        loop = asyncio.get_running_loop()
-        context = " ".join(m["message"] for m in messages)
+    async def _run_session_profile_updates(self):
+
+        logger.info(f"Profiling {len(self._session_entity_ids)} session entities...")
         
-        tasks = [
-            loop.run_in_executor(
-                self.cpu_executor,
-                partial(self.ent_resolver.resolve, text=mention, context=context)
-            )
-            for mention in mentions
-        ]
-        results = await asyncio.gather(*tasks)
+        recent_context = await self.get_recent_context(num_messages=75)
         
-        resolved = {}
-        ambiguous = {}
-        new = {}
+        current_msg_id = await self.redis_client.get("global:next_msg_id")
+        current_msg_id = int(current_msg_id) if current_msg_id else 0
         
-        for mention_text, result in zip(mentions.keys(), results):
-            mention_type = mentions[mention_text]
-            
-            if result["resolved"]:
-                resolved[mention_text] = {
-                    "id": result["resolved"]["id"],
-                    "type": mention_type,
-                    "canonical_name": result["resolved"]["profile"]["canonical_name"]
-                }
-            elif result["ambiguous"]:
-                ambiguous[mention_text] = {
-                    "type": mention_type,
-                    "candidates": result["ambiguous"]
-                }
-            elif result["new"]:
-                new[mention_text] = {
-                    "type": mention_type
-                }
-        
-        return {"resolved": resolved, "ambiguous": ambiguous, "new": new}
-
-
-    async def _run_profile_updates(self, 
-        entities_list: List[Dict], 
-        context_text: str,
-        recent_context_list: List[str],
-        checkpoint_msg_id: int):
-        
-        """Background task to run Prompt 2 for specific entities"""
-
-        async def update_single_entity(ent):
-            ent_id = ent["id"]
-            existing_profile = self.ent_resolver.entity_profiles.get(ent_id, {})
-            old_summary = existing_profile.get("summary", "No information provided")
-
-            logger.info(f"Profile update for {ent_id}: old_summary='{old_summary[:50] if old_summary else 'EMPTY'}'")
-            
-            prompt_profile = self._build_profiling_prompt(
-                entity_name=ent["canonical_name"],
-                entity_type=ent["type"],
-                existing_profile=existing_profile,
-                new_observation=context_text,
-                conversation_context=recent_context_list
-            )
-            updated_profile = await self._call_slm(prompt_profile, response_model=ProfileUpdate)
-
-            if not updated_profile:
+        async def update_single(ent_id: int) -> Optional[Entity]:
+            profile = self.ent_resolver.entity_profiles.get(ent_id)
+            if not profile:
                 return None
             
+            canonical_name = profile.get("canonical_name", "Unknown")
+            entity_type = profile.get("type", "unknown")
+            existing_summary = profile.get("summary", "")
 
-            new_summary = updated_profile.summary
-        
-            if new_summary == old_summary:
+
+            mentions = self.ent_resolver.get_mentions_for_id(ent_id)
+            if not mentions:
+                logger.debug(f"No mentions for {canonical_name}, skipping profile")
                 return None
 
+            pattern = re.compile(
+                r'\b(' + '|'.join(re.escape(m) for m in mentions) + r')\b', 
+                re.IGNORECASE
+            )
+            
+            observations = [formatted for formatted, raw in recent_context if pattern.search(raw)]
+
+            if not observations:
+                logger.debug(f"No observations for {canonical_name}, skipping profile")
+                return None
+            
+            context_text = "\n".join(observations)
+            system_prompt = get_profile_update_prompt(self.user_name)
+            user_content = json.dumps({
+                "entity_name": canonical_name,
+                "entity_type": entity_type,
+                "existing_summary": existing_summary,
+                "new_observations": context_text,
+                "known_aliases": mentions
+            }, indent=2)
+            
+            new_summary = await self._call_reasoning(system_prompt, user_content)
+            
+            if not new_summary or new_summary == existing_summary:
+                return None
+            
             loop = asyncio.get_running_loop()
-            embedding_array = await loop.run_in_executor(
+            embedding = await loop.run_in_executor(
                 self.cpu_executor,
-                partial(
-                    self.ent_resolver.embedding_model.encode,
-                    [new_summary]
-                )
+                partial(self.ent_resolver.update_profile_summary, ent_id, new_summary)
             )
-            new_embedding = embedding_array[0].tolist() if embedding_array is not None else []
-                    
+            
+            logger.info(f"Profiled entity {ent_id}: {canonical_name}")
+            
             return Entity(
                 id=ent_id,
-                canonical_name=updated_profile.canonical_name,
-                type=ent["type"],
+                canonical_name=canonical_name,
+                type=entity_type,
                 summary=new_summary,
-                topic=updated_profile.topic,
-                embedding=new_embedding,
-                last_profiled_msg_id=checkpoint_msg_id
+                topic=profile.get("topic", "General"),
+                embedding=embedding,
+                last_profiled_msg_id=current_msg_id
             )
         
-        tasks = [update_single_entity(ent) for ent in entities_list]
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*[update_single(ent_id) for ent_id in self._session_entity_ids])
         updates_for_graph = [r for r in results if r is not None]
         
         if updates_for_graph:
@@ -756,128 +699,117 @@ class Context:
                 type=MessageType.PROFILE_UPDATE,
                 stream_key=STREAM_KEY_PROFILE
             )
-            logger.info(f"Pushed Profile Batch {checkpoint_msg_id} to {STREAM_KEY_PROFILE}")
+            logger.info(f"Sent {len(updates_for_graph)} profile updates to stream")
 
+    async def _move_to_dead_letter(self, messages: List[Dict], error_reason: str):
+        dlq_key = f"dlq:{self.user_name}"
+        failure_entry = {
+            "timestamp": time.time(),
+            "error": error_reason,
+            "batch_size": len(messages),
+            "messages": messages
+        }
+        
+        try:
+            await self.redis_client.rpush(dlq_key, json.dumps(failure_entry))
+            logger.warning(f"Failed batch stored in DLQ: {dlq_key}: {failure_entry['messages']} ")
+        except Exception as redis_err:
+            logger.critical(f"DLQ STORAGE FAILED: {redis_err}. Raw data: {messages}")
 
     async def process_batch(self):
         async with self._batch_processing_lock:
             logger.info("Starting batch processing...")
 
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self.cpu_executor, self.ent_resolver._init_from_db)
-            logger.info("Refreshed Entity resolver from DB")
-
             messages = await self._get_buffered_messages()
             if not messages:
                 return
 
-            logger.info(f"Processing batch of {len(messages)} messages: {[m['id'] for m in messages]}")
-            current_batch_max_id = max([m['id'] for m in messages])
-
-            mentions = await self._extract_mentions_batch(messages)
-            if not mentions:
-                logger.info("No mentions found in batch, skipping LLM calls")
-                return
-            
-            resolution_result = await self._resolve_mentions(mentions, messages)
-            entity_registry = await self._disambiguate(resolution_result, messages)
-
-            if not entity_registry:
-                logger.info("No entities after disambiguation, skipping connection extraction")
-                return
-        
-            connection_result = await self._extract_connections(entity_registry, messages)
-
-            if not connection_result:
-                logger.error("Connection extraction failed")
-                return
-
-            await self._publish_batch(entity_registry, connection_result)
-
-            entities_needing_profile = []
-
-            for name, data in entity_registry.items():
-                ent_id = data["id"]
-                curr_profile = self.ent_resolver.entity_profiles.get(ent_id, {})
-                raw_last_profiled = curr_profile.get("last_profiled_msg_id")
-                last_profiled_id = raw_last_profiled if raw_last_profiled is not None else 0
-
-                is_new = data.get("is_new", False)
-                update_time = (current_batch_max_id - last_profiled_id) >= PROFILE_INTERVAL
-
-                if is_new or update_time:
-                    profile_data = data.copy()
-                    profile_data["canonical_name"] = name 
-                    entities_needing_profile.append(profile_data)
-                    logger.info(f"Triggering Profile for {name} (ID: {ent_id}). New={is_new}, Gap={current_batch_max_id - last_profiled_id}")
-                else:
-                    logger.debug(f"Skipping Profile for {name}: Only {current_batch_max_id - last_profiled_id} msgs since last update.")
-            
-            if entities_needing_profile:
-                recent_context = await self.get_recent_context(num_messages=PROFILE_INTERVAL)
-                batch_context = " ".join(m["message"] for m in messages)
+            logger.debug(f"Processing batch of {len(messages)} messages: {[m['id'] for m in messages]}")
+            try:
+                mentions_dict = await self._extract_mentions_batch(messages)
+                if not mentions_dict:
+                    logger.info("No mentions found in batch, skipping LLM calls")
+                    
                 
-                self._fire_and_forget(
-                    self._run_profile_updates(
-                        entities_needing_profile, 
-                        batch_context, 
-                        recent_context, 
-                        current_batch_max_id
-                    )
-                )
+                mentions = [(name, data["type"], data["topic"]) for name, data in mentions_dict.items()]
+                known_entities = await self._build_known_entities(mentions)
+            
+                disambiguation_result = await self._disambiguate_reasoning(mentions, messages, known_entities)
+                if not disambiguation_result.entries:
+                    logger.info("No disambiguation results, skipping")
+                    
+                
+                entity_ids, new_entity_ids = await self._resolve(disambiguation_result)
 
-            logger.info(f"Batch complete: Max ID: {current_batch_max_id}, {len(entity_registry)} entities, {len(messages)} messages processed")
+                user_id = self.ent_resolver._name_to_id.get(self.user_name)
+                if user_id and user_id not in entity_ids:
+                    entity_ids.append(user_id)
+
+
+                self._session_entity_ids.update(entity_ids)
+            
+                connection_result = await self._extract_connections(entity_ids, messages)
+
+                if not connection_result:
+                    logger.error("Connection extraction failed")
+                    
+                await self._publish_batch(entity_ids, new_entity_ids, connection_result)
+            except Exception as e:
+                logger.error(f"batch processing field: {e}")
+                await self._move_to_dead_letter(messages, str(e))
+            finally:
+                buffer_key = f"buffer:{self.user_name}"
+                await self.redis_client.ltrim(buffer_key, len(messages), -1)
+                logger.debug(f"Trimmed {len(messages)} from {buffer_key}")
+
         
     
     async def _publish_batch(
         self,
-        entity_registry: Dict[str, Dict],
+        entity_ids: List[int],
+        new_entity_ids: Set[int],
         extraction_result: ConnectionExtractionResponse
         ):
         """
         Publish entities and relationships to graph via Redis stream.
         """
     
-        entity_lookup = {
-            name.lower(): {
-                "id": data["id"],
-                "canonical_name": name,
-                "type": data["type"],
-                "summary": "",
-                "topic": "General",
-                "embedding": data.get("embedding", [])
-            }
-            for name, data in entity_registry.items()
-        }
+        entity_lookup = {}
+        for ent_id in entity_ids:
+            profile = self.ent_resolver.entity_profiles.get(ent_id)
+            if profile:
+                canonical = profile["canonical_name"]
+                entity_lookup[canonical.lower()] = {
+                    "id": ent_id,
+                    "canonical_name": canonical,
+                    "type": profile.get("type"),
+                    "topic": profile.get("topic", "General")
+                }
+                for mention in self.ent_resolver.get_mentions_for_id(ent_id):
+                    entity_lookup[mention.lower()] = entity_lookup[canonical.lower()]
         
+
+        proto_ents = []
+        for ent_id in new_entity_ids:
+            profile = self.ent_resolver.entity_profiles.get(ent_id)
+            if profile:
+                embedding = self.ent_resolver.get_embedding_for_id(ent_id)
+                aliases = self.ent_resolver.get_mentions_for_id(ent_id)
+                proto_ents.append(Entity(
+                    id=ent_id,
+                    canonical_name=profile["canonical_name"],
+                    type=profile.get("type", ""),
+                    confidence=1.0,
+                    summary="",
+                    topic=profile.get("topic", "General"),
+                    embedding=embedding,
+                    aliases=aliases
+                ))
+
+        proto_rels = []
         for msg_result in extraction_result.message_results:
             msg_id = msg_result.message_id
             
-            mentioned_entities = set()
-            for pair in msg_result.entity_pairs:
-                mentioned_entities.add(pair.entity_a.lower())
-                mentioned_entities.add(pair.entity_b.lower())
-            
-
-            proto_ents = []
-            seen_ids = set()
-            for entity_key in mentioned_entities:
-                ent = entity_lookup.get(entity_key)
-      
-                if ent and ent["id"] not in seen_ids and ent["type"]:
-                    proto_ents.append(Entity(
-                        id=ent["id"],
-                        canonical_name=ent["canonical_name"],
-                        type=ent["type"],
-                        confidence=1.0,
-                        summary="",
-                        topic=ent["topic"],
-                        embedding=ent["embedding"]
-                    ))
-                    seen_ids.add(ent["id"])
-            
-
-            proto_rels = []
             for pair in msg_result.entity_pairs:
                 ent_a = entity_lookup.get(pair.entity_a.lower())
                 ent_b = entity_lookup.get(pair.entity_b.lower())
@@ -891,14 +823,14 @@ class Context:
                     ))
                 else:
                     logger.warning(f"Skipping pair: {pair.entity_a} - {pair.entity_b} (entity not found)")
+
+        await self._send_batch_to_stream(
+            entities=proto_ents,
+            relations=proto_rels,
+            type=MessageType.USER_MESSAGE,
+            stream_key=STREAM_KEY_STRUCTURE
+        )
         
-            await self._send_batch_to_stream(
-                entities=proto_ents,
-                relations=proto_rels,
-                type=MessageType.USER_MESSAGE,
-                stream_key=STREAM_KEY_STRUCTURE
-            )
-    
     async def shutdown(self):
 
         await self._flush_batch_shutdown()
@@ -906,6 +838,12 @@ class Context:
         if self._background_tasks:
             logger.info(f"Waiting for {len(self._background_tasks)} background tasks...")
             await asyncio.wait(self._background_tasks, timeout=60)
+        
+        # if self._session_entity_ids:
+        #     await self._run_session_profile_updates()
+        
+        logger.info("Waiting for graph consumer to sync...")
+        await asyncio.sleep(20)
         
         loop = asyncio.get_running_loop()
         candidates = await loop.run_in_executor(
@@ -915,6 +853,11 @@ class Context:
 
         if candidates:
             logger.info(f"Detected {len(candidates)} merge candidates at shutdown")
+        
+        mentions = self.ent_resolver.get_mentions()
+        if mentions:
+            await self.redis_client.hset("entity_mentions", mapping=mentions)
+            logger.info(f"Persisted {len(mentions)} mention mappings to Redis")
 
         if self.session_emotions:
             from collections import Counter

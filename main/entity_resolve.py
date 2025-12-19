@@ -1,89 +1,188 @@
 from datetime import datetime, timezone
 from loguru import logger
 import threading
-from typing import Dict, List
+from typing import Dict, List, Optional
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from rapidfuzz import process as fuzzy_process, fuzz
 from graph.memgraph import MemGraphStore
-
+from redisclient import SyncRedisClient
 
 
 class EntityResolver:
 
     def __init__(self, embedding_model='dunzhang/stella_en_1.5B_v5'):
+
+ 
+        self.redis_client = SyncRedisClient().get_client()
+        
         self.embedding_model = SentenceTransformer(embedding_model, trust_remote_code=True, device='cpu')
         self.cross_encoder = CrossEncoder('BAAI/bge-reranker-v2-m3', device='cpu')
-        self.embedding_dim = 1024
-        self.faiss_index: faiss.IndexFlatIP = faiss.IndexFlatIP(self.embedding_dim)
-        self.index_id_map: faiss.IndexIDMap2 = faiss.IndexIDMap2(self.faiss_index)
-        self.ref = {"me", "i", "myself", "user"}
-        
-        self.fuzzy_choices: Dict[str, int] = {}
-        self.entity_profiles: Dict[int, Dict] = {}
 
+        self.embedding_dim = 1024
+        self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)
+        self.index_id_map = faiss.IndexIDMap2(self.faiss_index)
+        self.entity_profiles = {}
+        self._name_to_id = {}
         self._lock = threading.RLock()
     
-    def _init_from_db(self):
-        logger.info("Hydrating Resolver from Memgraph...")
+        self._hydrate_aliases()
+        self.store = MemGraphStore()
+        self._hydrate_vectors()
 
-        temp_profiles = {}
-        temp_fuzzy = {}
-        vectors = []
-        ids = []
-        self.ref = {"me", "i", "myself", "user"}
-
+    def _hydrate_aliases(self):
         try:
-            store = MemGraphStore()
-            
-            query = """
-            MATCH (n:Entity)
-            RETURN n.id, n.canonical_name, n.summary, n.type, n.embedding, n.last_profiled_msg_id
-            """
-            
-            with store.driver.session() as session:
-                results = session.run(query)
-
-                for r in results:
-                    e_id = r["n.id"]
-                    raw_last_msg = r.get("n.last_profiled_msg_id")
-                    last_msg_id = raw_last_msg if raw_last_msg is not None else 0
-                    canonical_name = r["n.canonical_name"]
-                    summary = r["n.summary"] or ""
-                    
-                    temp_profiles[e_id] = {
-                        "canonical_name": canonical_name,
-                        "summary": summary or "",
-                        "type": r["n.type"],
-                        "last_profiled_msg_id": last_msg_id
-                    }
-                    
-                    temp_fuzzy[canonical_name] = e_id
-                    summary = summary or ""
-                    resolution_text = f"{canonical_name}. {summary[:200]}"
-                    embedding = self.embedding_model.encode([resolution_text])[0]
-                    vectors.append(embedding)
-                    ids.append(e_id)
-                
+            stored_mentions = self.redis_client.hgetall("entity_mentions")
             with self._lock:
-                self.entity_profiles = temp_profiles
-                self.fuzzy_choices = temp_fuzzy
-
-                self.index_id_map.reset()
-
-                if vectors:
-                    logger.info(f"Loading {len(vectors)} vectors into FAISS.")
-                    vec_np = np.array(vectors, dtype=np.float32)
-                    ids_np = np.array(ids, dtype=np.int64)
+                if stored_mentions:
+                    self._name_to_id = {k.decode(): int(v) for k, v in stored_mentions.items()}
+                    logger.info(f"Hydrated EntityResolver with {len(self._name_to_id)} aliases from Redis.")
+                else:
+                    logger.warning("Redis alias cache is empty. Attempting Cold Sync from Memgraph...")
                     
-                    faiss.normalize_L2(vec_np)
-                    self.index_id_map.add_with_ids(vec_np, ids_np)
+                    if not hasattr(self, 'store'):
+                        self.store = MemGraphStore()
 
-            return True
+                    full_mapping = self.store.get_all_aliases_map()
+                    
+                    if full_mapping:
+                        self._name_to_id = full_mapping
+                        
+                        try:
+                            self.redis_client.hset("entity_mentions", mapping=full_mapping)
+                            logger.info(f"Cold Sync Successful: Restored {len(full_mapping)} aliases from Memgraph to Redis.")
+                        except Exception as e:
+                            logger.error(f"Failed to refill Redis after Cold Sync: {e}")
+                    else:
+                        logger.info("Memgraph is also empty. Starting with fresh Identity Map.")
+                          
         except Exception as e:
-            logger.error(f"Failed to hydrate from DB: {e}")
-            return False
+            logger.critical(f"Failed to hydrate from Redis: {e}")
+    
+    def _hydrate_vectors(self):
+        try:
+            logger.info("Hydrating FAISS vectors from Memgraph...")
+            embeddings_map = self.store.get_all_embeddings()
+            
+            if not embeddings_map:
+                logger.info("No vectors found in Memgraph.")
+                return
+
+            ids = []
+            vectors = []
+            
+            for eid, vec in embeddings_map.items():
+                if len(vec) == self.embedding_dim:
+                    ids.append(eid)
+                    vectors.append(vec)
+            
+            if ids:
+                self.index_id_map.add_with_ids(
+                    np.array(vectors, dtype=np.float32),
+                    np.array(ids, dtype=np.int64)
+                )
+            logger.info(f"Restored {len(ids)} vectors to FAISS.")
+            
+        except Exception as e:
+            logger.error(f"Failed to hydrate vectors: {e}")
+
+    def set_mentions(self, mentions: Dict[str, int]):
+        """Set _name_to_id from external source (Redis)."""
+        with self._lock:
+            self._name_to_id.update(mentions)
+    
+    def get_mentions(self) -> Dict[str, int]:
+        """Get copy of _name_to_id for persistence."""
+        with self._lock:
+            return self._name_to_id.copy()
+    
+    def get_id(self, name: str) -> Optional[int]:
+        if name in self._name_to_id:
+            return self._name_to_id[name]
+        
+        redis_id = self.redis_client.hget("entity_mentions", name)
+        if redis_id:
+            entity_id = int(redis_id)
+            with self._lock:
+                self._name_to_id[name] = entity_id
+            return entity_id
+            
+        return None
+    
+    def get_mentions_for_id(self, entity_id: int) -> List[str]:
+        return [mention for mention, eid in self._name_to_id.items() if eid == entity_id]
+    
+    def get_embedding_for_id(self, entity_id: int) -> List[float]:
+        """Retrieve embedding from FAISS by ID."""
+        with self._lock:
+            try:
+                embedding = self.index_id_map.reconstruct(entity_id)
+                return embedding.tolist()
+            except Exception as e:
+                logger.warning(f"Could not retrieve embedding for {entity_id}: {e}")
+                return []
+    
+    def validate_existing(self, canonical_name: str, mentions: List[str]) -> Optional[int]:
+        """
+        Check if canonical_name exists. If yes, register mention aliases and return ID.
+        If no, return None (caller handles demotion).
+        """
+        with self._lock:
+            entity_id = self.get_id(canonical_name)
+            logger.debug(f"validate_existing: '{canonical_name}' -> id={entity_id}")
+            if entity_id is None:
+                return None
+            
+            new_aliases = {}
+            for mention in mentions:
+                if mention not in self._name_to_id:
+                    self._name_to_id[mention] = entity_id
+                    new_aliases[mention] = entity_id
+            
+            if new_aliases:
+                try:
+                    self.redis_client.hset("entity_mentions", mapping=new_aliases)
+                    logger.debug(f"Sent {len(new_aliases)} to Redis store for entity {entity_id}")
+                except Exception as e:
+                    logger.error(f"Failed to persist new aliases: {e}")
+
+            return entity_id
+    
+    def register_entity(
+        self, 
+        entity_id: int, 
+        canonical_name: str, 
+        mentions: List[str], 
+        entity_type: str, 
+        topic: str
+    ) -> List[float]:
+        """
+        Register new entity: update all indexes and return embedding.
+        """
+        profile = {
+            "canonical_name": canonical_name,
+            "type": entity_type,
+            "topic": topic,
+            "summary": ""
+        }
+        
+        embedding = self.add_entity(entity_id, profile)
+        
+        with self._lock:
+            self._name_to_id[canonical_name] = entity_id
+            for mention in mentions:
+                self._name_to_id[mention] = entity_id
+
+            mapping_update = {m: entity_id for m in mentions}
+            mapping_update[canonical_name] = entity_id
+
+            try:
+                self.redis_client.hset("entity_mentions", mapping=mapping_update)
+                logger.debug(f"Persisted {len(mapping_update)} aliases for {canonical_name} to Redis.")
+            except Exception as e:
+                logger.error(f"CRITICAL: Failed to persist entity mappings to Redis: {e}")
+
+        return embedding
 
     def add_entity(self, entity_id: int, profile: Dict) -> List[float]:
 
@@ -96,7 +195,7 @@ class EntityResolver:
 
 
         with self._lock:
-            logger.info(f"Adding entity {entity_id} to resolver indexes.")
+            logger.info(f"Adding entity {entity_id}-{profile["canonical_name"]} to resolver indexes.")
 
             profile.setdefault("topic", "General")
             profile.setdefault("first_seen", datetime.now(timezone.utc).isoformat())
@@ -108,108 +207,40 @@ class EntityResolver:
             )
 
             self.entity_profiles[entity_id] = profile
-            self.fuzzy_choices[canonical_name] = entity_id
         
         return embedding_np.tolist()
     
-    
-    def resolve(self, text: str, context: str, fuzzy_cutoff: int = 80):
 
+    def update_profile_summary(self, entity_id: int, new_summary: str) -> List[float]:
+        """
+        Update entity summary and recompute embedding.
+        Returns new embedding.
+        """
         with self._lock:
-            has_data = bool(self.fuzzy_choices) or self.index_id_map.ntotal > 0
-        
-        if not has_data:
-            return {"resolved": None, "ambiguous": [], "new": True, "mention": text}
-        
-        set_text = set(word.lower().strip(".,!'?") for word in text.split())
-        if any(word in self.ref for word in set_text):
-            for _, _id in self.fuzzy_choices.items():
-                profile = self.entity_profiles.get(_id, {})
-                if profile.get("type") == "PERSON" and _id == 1:
-                    return {
-                        "resolved": {"id": _id, "profile": profile},
-                        "ambiguous": [],
-                        "new": False,
-                        "mention": text
-                    }
-        
-        query_text = f"{text} mentioned in context of: {context}"
-        query_embedding = self.embedding_model.encode([query_text])
-        faiss.normalize_L2(query_embedding)
-        
-        candidates_map: Dict[int, Dict] = {}
-        with self._lock:
-            if self.fuzzy_choices:
-                fuzzy_matches = fuzzy_process.extract(query=text, choices=self.fuzzy_choices.keys(),
-                                                    scorer=fuzz.WRatio, score_cutoff=fuzzy_cutoff, limit=10)
-                for match_name, score, _ in fuzzy_matches:
-                    entity_id = self.fuzzy_choices[match_name]
-                    norm_score = score / 100.0
-
-                    candidates_map[entity_id] = {
-                        "id": entity_id,
-                        "match_detail" : {
-                            "source": "fuzzy",
-                            "score": score,
-                            "norm_score": norm_score,
-                            "matched_aliases": match_name
-                        },
-                        "profile": self.entity_profiles.get(entity_id, {})
-                    }
+            profile = self.entity_profiles.get(entity_id)
+            if not profile:
+                logger.warning(f"Cannot update profile for unknown entity {entity_id}")
+                return []
             
-            if self.index_id_map.ntotal > 0:
-                scores, ann = self.index_id_map.search(query_embedding, k=min(10, self.index_id_map.ntotal))
+            canonical_name = profile.get("canonical_name", "")
+            profile["summary"] = new_summary
+            profile["last_seen"] = datetime.now(timezone.utc).isoformat()
+            
+            resolution_text = f"{canonical_name}. {new_summary[:200]}"
+            embedding_np = self.embedding_model.encode([resolution_text])[0]
+            faiss.normalize_L2(embedding_np.reshape(1, -1))
 
-                for index_id, score in zip(ann[0], scores[0]):
-                    logger.debug(f"FAISS result: query='{text}' -> id={index_id}, score={score:.3f}")
-                    if index_id != -1 and score >= 0.5:
-                        entity_id = int(index_id)
-                        norm_score = float(score)
-
-                        existing = candidates_map.get(entity_id)
-
-                        if existing:
-                            existing["match_detail"]["source"] = "hybrid"
-                            existing["match_detail"]["vector_store"] = float(score)
-
-                            if norm_score > existing["match_detail"]["norm_score"]:
-                                existing["match_detail"]["norm_score"] = norm_score
-                        else:
-                            candidates_map[entity_id] = {
-                                "id": entity_id,
-                                "match_detail": {
-                                    "source": "faiss",
-                                    "score": float(score),
-                                    "norm_score": norm_score
-                                },
-                                "profile": self.entity_profiles[entity_id]
-                            }
-        if not candidates_map:
-            return {"resolved": None, "ambiguous": [], "new": True, "mention": text}
-        
-        sorted_candidates = sorted(
-        candidates_map.values(),
-        key=lambda x: x["match_detail"]["norm_score"],
-        reverse=True)
-
-        best_score = sorted_candidates[0]["match_detail"]["norm_score"]
-    
-        if best_score >= 0.70:
-            return {"resolved": sorted_candidates[0], "ambiguous": [], "new": False, "mention": text}
-        elif best_score >= 0.50:
-            viable = [c for c in sorted_candidates if c["match_detail"]["norm_score"] >= 0.50]
-            return {"resolved": None, "ambiguous": viable, "new": False, "mention": text}
-        else:
-            return {"resolved": None, "ambiguous": [], "new": True, "mention": text}
-
+            self.index_id_map.remove_ids(np.array([entity_id], dtype=np.int64))
+            self.index_id_map.add_with_ids(
+                np.array([embedding_np]),
+                np.array([entity_id], dtype=np.int64)
+            )
+            
+            return embedding_np.tolist()
 
     def detect_merge_candidates(self) -> list:
         """Detect potential entity merges based on summary similarity."""
-        
-        if not self._init_from_db():
-            logger.error("Failed to refresh from database, aborting merge detection")
-            return []
-    
+
         logger.info(f"Merge detection started, {len(self.entity_profiles)} entities to scan")
         
         candidates = []
@@ -226,8 +257,8 @@ class EntityResolver:
             match = re.match(r'^(.+?[.!?])(?:\s+[A-Z]|$)', summary)
             first_sentence = match.group(1).strip() if match else summary[:200].strip()
             
-            s2s_prompt = "Instruct: Retrieve semantically similar text.\nQuery: "
-            embedding = self.embedding_model.encode([s2s_prompt + first_sentence])
+            query_text = f"{canonical_name}. {first_sentence}"
+            embedding = self.embedding_model.encode([query_text])
             faiss.normalize_L2(embedding)
             
             with self._lock:
@@ -261,8 +292,17 @@ class EntityResolver:
                     
                     logger.info(f"Merge verification: ({entity_id}, {match_id}) {canonical_name} <- {match_name} | "
                                 f"Exact name match Decision=APPROVED")
+                    primary_id, secondary_id = pair
+                    candidates.append({
+                        "primary_id": primary_id,
+                        "secondary_id": secondary_id,
+                        "primary_name": canonical_name,
+                        "secondary_name": match_name,
+                        "faiss_score": float(faiss_score),
+                        "cross_score": 1.0  # Exact match
+                    })
                     continue
-                
+
                 if faiss_score < 0.50:
                     continue
 

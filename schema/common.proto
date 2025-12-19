@@ -9,6 +9,7 @@ message Entity {
     string topic = 6;
     repeated float embedding = 7;
     int32 last_profiled_msg_id = 8;
+    repeated string aliases = 9;
 }
 
 

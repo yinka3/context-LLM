@@ -45,6 +45,7 @@ class MemGraphStore:
                     MERGE (e:Entity {id: $id})
                     ON CREATE SET
                         e.canonical_name = $canonical_name,
+                        e.aliases = $aliases,
                         e.type = $type,
                         e.summary = $summary,
                         e.confidence = $confidence,
@@ -53,6 +54,7 @@ class MemGraphStore:
                         e.embedding = $embedding
                     ON MATCH SET 
                         e.canonical_name = $canonical_name,
+                        e.aliases = apoc.coll.toSet(coalesce(e.aliases, []) + $aliases),
                         e.confidence = $confidence,
                         e.last_updated = timestamp(),
                         e.last_mentioned = timestamp()
@@ -180,6 +182,41 @@ class MemGraphStore:
                 "secondary_count": secondary_count,
                 "total": total
             }).consume()
+    
+    def get_all_embeddings(self) -> Dict[int, List[float]]:
+        """
+        Fetch all entity embeddings to hydrate FAISS at startup.
+        Returns: {entity_id: [float, float, ...]}
+        """
+        query = "MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN e.id as id, e.embedding as vec"
+        with self.driver.session() as session:
+            result = session.run(query)
+            return {record["id"]: record["vec"] for record in result}
+    
+    def get_all_aliases_map(self) -> Dict[str, int]:
+        """
+        Rebuild the Name->ID map from the database.
+        Used for Cold Sync when Redis is empty.
+        Returns: {'Destiny': 50, 'Des': 50, ...}
+        """
+        query = """
+        MATCH (e:Entity) 
+        RETURN e.id as id, e.canonical_name as name, e.aliases as aliases
+        """
+        mapping = {}
+        with self.driver.session() as session:
+            result = session.run(query)
+            for record in result:
+                entity_id = record["id"]
+                
+                if record["name"]:
+                    mapping[record["name"]] = entity_id
+                
+                if record["aliases"]:
+                    for alias in record["aliases"]:
+                        mapping[alias] = entity_id
+                        
+        return mapping
     
     def get_hot_topic_context(self, hot_topic_names: List[str]):
         """

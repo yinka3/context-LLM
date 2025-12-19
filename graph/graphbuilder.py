@@ -45,11 +45,34 @@ class GraphBuilder:
                 sys.exit(1)
     
 
+    def _recover(self):
+        logger.info("Checking for pending messages from previous run...")
+        
+        for stream_key in [STREAM_KEY_STRUCTURE, STREAM_KEY_PROFILE]:
+            while True:
+                response = self.redis_client.xreadgroup(
+                    CONSUMER_GROUP,
+                    CONSUMER_NAME,
+                    {stream_key: '0'},
+                    count=10
+                )
+                
+                if not response or not response[0][1]:
+                    break
+                    
+                for msg_id, msg_data in response[0][1]:
+                    logger.warning(f"Recovering pending message {msg_id} from {stream_key}")
+                    self._process_message(stream_key, msg_id, msg_data)
+        
+        logger.info("Recovery complete")
+    
+
     def start(self):
         logger.info("Starting GraphBuilder service...")
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
+        self._recover()
         self._message_loop()
 
     def stop(self):
@@ -65,6 +88,22 @@ class GraphBuilder:
         logger.info(f"Received signal {signum}, shutting down...")
         self.stop()
         sys.exit(0)
+    
+    def _is_valid_entity(self, entity) -> bool:
+        if not entity.canonical_name or not entity.canonical_name.strip():
+            return False
+        if not entity.type:
+            return False
+        if entity.canonical_name.lower() in ["unknown", "none", "n/a"]:
+            return False
+        return True
+
+    def _is_valid_relationship(self, rel) -> bool:
+        if rel.entity_a == rel.entity_b:
+            return False
+        if not (0.0 <= rel.confidence <= 1.0):
+            return False
+        return True
     
     def _message_loop(self):
 
@@ -129,36 +168,50 @@ class GraphBuilder:
 
             if batch_msg.type == MessageType.USER_MESSAGE:
 
-                entities = []
-                relationships = []
+                valid_entities = []
+                valid_entity_names = set()
 
-                
                 for entity in batch_msg.list_ents:
-                        
-                    entities.append({
-                        "id": entity.id,
-                        "canonical_name": entity.canonical_name,
-                        "type": entity.type,
-                        "confidence": entity.confidence,
-                        "summary": entity.summary, 
-                        "topic": entity.topic,
-                        "embedding": list(entity.embedding)
-                    })
+                    
+                    try:
+                        valid_entities.append({
+                            "id": entity.id,
+                            "canonical_name": entity.canonical_name,
+                            "type": entity.type,
+                            "confidence": entity.confidence,
+                            "summary": entity.summary, 
+                            "topic": entity.topic,
+                            "embedding": list(entity.embedding),
+                            "aliases": list(entity.aliases)
+                        })
+                        valid_entity_names.add(entity.canonical_name)
+                    except Exception as e:
+                        logger.error(f"Skipping malformed entity in batch {stream_id}: {e}")
                 
+                valid_relationships = []
+
                 for rel in batch_msg.list_relations:
-
-                    relationships.append({
-                        "entity_a": rel.entity_a,
-                        "entity_b": rel.entity_b,
-                        "message_id": f"msg_{rel.message_id}",
-                        "confidence": rel.confidence
-                    })
+                    
+                    try:
+                        valid_relationships.append({
+                            "entity_a": rel.entity_a,
+                            "entity_b": rel.entity_b,
+                            "message_id": f"msg_{rel.message_id}",
+                            "confidence": rel.confidence
+                        })
+                    except Exception as e:
+                        logger.error(f"Skipping malformed relationship: {e}")
                 
-                self.store.write_batch(entities, relationships, is_user_message=True)
-                self.redis_client.xack(stream_key, CONSUMER_GROUP, stream_id)
-                self.processed_messages += 1
-
-                self.store.cleanup_null_entities()
+                if valid_entities:
+                    try:
+                        self.store.write_batch(valid_entities, valid_relationships, is_user_message=True)
+                        self.processed_messages += 1
+                        self.redis_client.xack(stream_key, CONSUMER_GROUP, stream_id)
+                    except Exception as db_err:
+                        logger.critical(f"Database write failed for batch {stream_id}: {db_err}")
+                else:
+                    logger.warning(f"Batch {stream_id} contained 0 valid entities. Acknowledging anyway.")
+                    self.redis_client.xack(stream_key, CONSUMER_GROUP, stream_id)
 
             elif batch_msg.type == MessageType.PROFILE_UPDATE:
                 logger.info(f"Processing PROFILE_UPDATE message {stream_id}")
@@ -192,7 +245,8 @@ class GraphBuilder:
                         "confidence": entity.confidence,
                         "summary": entity.summary,
                         "topic": entity.topic,
-                        "embedding": list(entity.embedding)
+                        "embedding": list(entity.embedding),
+                        "aliases": list(entity.aliases)
                     })
                 
                 self.store.write_batch(entities, [], is_user_message=False)
@@ -203,10 +257,22 @@ class GraphBuilder:
                 logger.warning(f"Unknown message type: {batch_msg.type}")
                 self.redis_client.xack(stream_key, CONSUMER_GROUP, stream_id)
         except Exception as e:
-            logger.error("Failed to process message {}: {}", stream_id, str(e), exc_info=True)
-            logger.error(f"Full traceback:\n{traceback.format_exc()}")
+            logger.error(f"Failed to process message {stream_id}: {e}")
             try:
-                self.redis_client.xadd(DEAD_QUEUE, {'original_id': stream_id, 'data': msg_data[b'data']})
+                batch_id = msg_data.get(b'batch_id', b'').decode() or None
+                
+                self.redis_client.xadd(DEAD_QUEUE, {
+                    'original_id': stream_id,
+                    'stream_key': stream_key,
+                    'batch_id': batch_id,
+                    'data': msg_data[b'data'],
+                    'failed_at': str(time.time()),
+                    'retry_count': 0
+                })
+                
+                if batch_id:
+                    self.redis_client.expire(f"snapshot:{batch_id}", 86400)
+                
                 self.redis_client.xack(stream_key, CONSUMER_GROUP, stream_id)
                 self.failed_messages += 1
             except Exception as dlq_error:
