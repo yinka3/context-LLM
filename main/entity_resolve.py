@@ -1,8 +1,9 @@
 from datetime import datetime, timezone
 from loguru import logger
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import faiss
+import re
 import numpy as np
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from graph.memgraph import MemGraphStore
@@ -122,7 +123,7 @@ class EntityResolver:
                 logger.warning(f"Could not retrieve embedding for {entity_id}: {e}")
                 return []
     
-    def validate_existing(self, canonical_name: str, mentions: List[str]) -> Optional[int]:
+    def validate_existing(self, canonical_name: str, mentions: List[str]) -> Tuple[Optional[int], bool]:
         """
         Check if canonical_name exists. If yes, register mention aliases and return ID.
         If no, return None (caller handles demotion).
@@ -131,7 +132,7 @@ class EntityResolver:
             entity_id = self.get_id(canonical_name)
             logger.debug(f"validate_existing: '{canonical_name}' -> id={entity_id}")
             if entity_id is None:
-                return None
+                return None, False
             
             new_aliases = {}
             for mention in mentions:
@@ -146,7 +147,7 @@ class EntityResolver:
                 except Exception as e:
                     logger.error(f"Failed to persist new aliases: {e}")
 
-            return entity_id
+            return entity_id, len(new_aliases) > 0
     
     def register_entity(
         self, 
@@ -253,7 +254,7 @@ class EntityResolver:
             if not summary:
                 continue
             
-            import re
+            
             match = re.match(r'^(.+?[.!?])(?:\s+[A-Z]|$)', summary)
             first_sentence = match.group(1).strip() if match else summary[:200].strip()
             
@@ -299,7 +300,7 @@ class EntityResolver:
                         "primary_name": canonical_name,
                         "secondary_name": match_name,
                         "faiss_score": float(faiss_score),
-                        "cross_score": 1.0  # Exact match
+                        "cross_score": 1.0 
                     })
                     continue
 

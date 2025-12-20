@@ -227,7 +227,8 @@ class GraphBuilder:
                         canonical_name=entity.canonical_name,
                         summary=entity.summary,
                         embedding=list(entity.embedding),
-                        last_msg_id=entity.last_profiled_msg_id
+                        last_msg_id=entity.last_profiled_msg_id,
+                        topic=entity.topic
                     )
                 
                 self.redis_client.xack(stream_key, CONSUMER_GROUP, stream_id)

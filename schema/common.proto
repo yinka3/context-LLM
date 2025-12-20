@@ -27,9 +27,9 @@ enum MessageType {
 }
 
 message BatchMessage {
-    MessageType type = 2;
-    repeated Entity list_ents = 3;
-    repeated Relationship list_relations = 4;
+    MessageType type = 1;
+    repeated Entity list_ents = 2;
+    repeated Relationship list_relations = 3;
 }
 
 

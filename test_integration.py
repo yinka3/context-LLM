@@ -1,7 +1,6 @@
 import asyncio
 import sys
 import os
-import time
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -105,11 +104,9 @@ async def run_test():
     try:
         logger.info("\n[Step 1] Initializing Application Context...")
         TOPICS = [
-            "Academics",
-            "Career",
+            "School",
             "Fitness",
-            "Social Life",
-            "Family"
+            "Social Life"
         ]
         ctx = await Context.create(user_name="Alex", topics=TOPICS)
         logger.info("✓ Application started.")

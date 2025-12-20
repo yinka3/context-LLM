@@ -1,6 +1,6 @@
 import time
 from loguru import logger
-from typing import Dict, List
+from typing import Dict, List, Optional
 from neo4j import GraphDatabase, Driver, ManagedTransaction
 
 
@@ -132,7 +132,6 @@ class MemGraphStore:
         with self.driver.session() as session:
             session.execute_write(_update)
             logger.info(f"Updated entity {entity_id} profile (checkpoint: msg_{last_msg_id})")
-    
 
     def cleanup_null_entities(self) -> int:
         """Remove entities with null type and their relationships."""
@@ -365,3 +364,142 @@ class MemGraphStore:
                     })
                 return path_data
             return []
+    
+
+    def _fetch_entity(self, entity_id: int) -> Optional[Dict]:
+        """Fetch entity properties by ID."""
+        query = """
+        MATCH (e:Entity {id: $entity_id})
+        RETURN e.id as id,
+            e.canonical_name as canonical_name,
+            e.aliases as aliases,
+            e.type as type,
+            e.summary as summary,
+            e.embedding as embedding,
+            e.confidence as confidence,
+            e.last_mentioned as last_mentioned,
+            e.last_updated as last_updated
+        """
+        with self.driver.session() as session:
+            result = session.run(query, {"entity_id": entity_id})
+            record = result.single()
+            return dict(record) if record else None
+    
+    def merge_entities(self, primary_id: int, secondary_id: int, merged_summary: str) -> bool:
+        """
+        Merge secondary entity into primary (single transaction).
+        Primary survives with combined data, secondary is deleted.
+        
+        Args:
+            primary_id: Entity that survives
+            secondary_id: Entity that gets merged and deleted
+            merged_summary: Pre-computed summary (from LLM or concat)
+        """
+        
+        def _execute_merge(tx: ManagedTransaction) -> bool:
+            primary = tx.run("""
+                MATCH (e:Entity {id: $id})
+                RETURN e.canonical_name as canonical_name,
+                    e.aliases as aliases,
+                    e.confidence as confidence,
+                    e.last_mentioned as last_mentioned
+            """, {"id": primary_id}).single()
+            
+            secondary = tx.run("""
+                MATCH (e:Entity {id: $id})
+                RETURN e.canonical_name as canonical_name,
+                    e.aliases as aliases,
+                    e.confidence as confidence,
+                    e.last_mentioned as last_mentioned
+            """, {"id": secondary_id}).single()
+            
+            if not primary or not secondary:
+                return False
+            
+            primary_aliases = set(primary["aliases"] or [])
+            secondary_aliases = set(secondary["aliases"] or [])
+            secondary_aliases.add(secondary["canonical_name"])
+            merged_aliases = list(primary_aliases | secondary_aliases)
+            
+            merged_confidence = max(
+                primary["confidence"] or 0,
+                secondary["confidence"] or 0
+            )
+            merged_last_mentioned = max(
+                primary["last_mentioned"] or 0,
+                secondary["last_mentioned"] or 0
+            )
+            
+            tx.run("""
+                MATCH (e:Entity {id: $id})
+                SET e.aliases = $aliases,
+                    e.summary = $summary,
+                    e.confidence = $confidence,
+                    e.last_mentioned = $last_mentioned,
+                    e.last_updated = timestamp()
+            """, {
+                "id": primary_id,
+                "aliases": merged_aliases,
+                "summary": merged_summary,
+                "confidence": merged_confidence,
+                "last_mentioned": merged_last_mentioned
+            })
+            
+            rels_result = tx.run("""
+                MATCH (e:Entity {id: $id})-[r:RELATED_TO]-(target:Entity)
+                RETURN target.id as target_id,
+                    r.weight as weight,
+                    r.confidence as confidence,
+                    r.message_ids as message_ids,
+                    r.last_seen as last_seen
+            """, {"id": secondary_id})
+            
+            relationships = [dict(record) for record in rels_result]
+            
+            for rel in relationships:
+                if rel["target_id"] == primary_id:
+                    continue
+                
+                tx.run("""
+                    MATCH (a:Entity {id: $primary_id})
+                    MATCH (b:Entity {id: $target_id})
+                    MERGE (a)-[r:RELATED_TO]-(b)
+                    ON CREATE SET
+                        r.weight = $weight,
+                        r.confidence = $confidence,
+                        r.message_ids = $message_ids,
+                        r.last_seen = $last_seen
+                    ON MATCH SET
+                        r.weight = r.weight + $weight,
+                        r.confidence = CASE WHEN $confidence > r.confidence 
+                                            THEN $confidence ELSE r.confidence END,
+                        r.message_ids = apoc.coll.toSet(
+                            coalesce(r.message_ids, []) + $message_ids
+                        ),
+                        r.last_seen = CASE WHEN $last_seen > r.last_seen 
+                                        THEN $last_seen ELSE r.last_seen END
+                """, {
+                    "primary_id": primary_id,
+                    "target_id": rel["target_id"],
+                    "weight": rel["weight"] or 1,
+                    "confidence": rel["confidence"] or 0.5,
+                    "message_ids": rel["message_ids"] or [],
+                    "last_seen": rel["last_seen"] or 0
+                })
+            
+            tx.run("""
+                MATCH (e:Entity {id: $id})
+                DETACH DELETE e
+            """, {"id": secondary_id})
+            
+            return True
+        
+        with self.driver.session() as session:
+            try:
+                result = session.execute_write(_execute_merge)
+                if result:
+                    logger.info(f"Merged entity {secondary_id} into {primary_id}")
+                return result
+            except Exception as e:
+                logger.error(f"Merge transaction failed: {e}")
+                return False
