@@ -1,7 +1,6 @@
 import asyncio
 import sys
 import os
-import time
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -14,11 +13,11 @@ from logging_setup import setup_logging
 from neo4j import GraphDatabase
 from main.context import Context
 from schema.dtypes import MessageData
-from test_messages import FOUNDER_MESSAGES
+from test_messages import ALEX_MESSAGES
 
 setup_logging(log_level="INFO", log_file="test_integration.log")
 
-TEST_MESSAGES = FOUNDER_MESSAGES
+TEST_MESSAGES = ALEX_MESSAGES
 
 MEMGRAPH_URI = "bolt://localhost:7687"
 
@@ -105,14 +104,11 @@ async def run_test():
     try:
         logger.info("\n[Step 1] Initializing Application Context...")
         TOPICS = [
-            "Startup",
-            "Fundraising",
-            "Product Development",
-            "Team Building",
-            "Customers",
-            "Networking"
+            "School",
+            "Fitness",
+            "Social Life"
         ]
-        ctx = await Context.create(user_name="Adeola", topics=TOPICS)
+        ctx = await Context.create(user_name="Alex", topics=TOPICS)
         logger.info("✓ Application started.")
         
         logger.info("\n[Step 2] Receiving User Messages...")

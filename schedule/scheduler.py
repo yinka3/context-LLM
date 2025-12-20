@@ -1,0 +1,134 @@
+import asyncio
+from datetime import datetime, timezone
+from typing import Dict, Optional
+
+from loguru import logger
+from redisclient import AsyncRedisClient
+from schedule.base import BaseJob, JobContext
+
+
+class Scheduler:
+    """
+    Generic job scheduler with inactivity-based triggering.
+    Jobs register themselves and define their own trigger conditions.
+    """
+    
+    CHECK_INTERVAL = 60
+    
+    def __init__(self, user_name: str):
+        self.user_name = user_name
+        self.redis = AsyncRedisClient().get_client()
+        self._jobs: Dict[str, BaseJob] = {}
+        self._last_runs: Dict[str, datetime] = {}
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._is_running = False
+    
+    def register(self, job: BaseJob) -> "Scheduler":
+        """Register a job. Returns self for chaining."""
+        self._jobs[job.name] = job
+        logger.info(f"Registered job: {job.name}")
+        return self
+    
+    async def start(self):
+        """Start the scheduler loop."""
+        self._is_running = True
+        
+        await self._run_pending_checks()
+        
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+        logger.info(f"Scheduler started with {len(self._jobs)} jobs: {list(self._jobs.keys())}")
+    
+    async def stop(self):
+        """Graceful shutdown - notify all jobs."""
+        self._is_running = False
+        
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
+        
+        ctx = await self._build_context()
+        for job in self._jobs.values():
+            try:
+                await job.on_shutdown(ctx)
+            except Exception as e:
+                logger.error(f"Job {job.name} shutdown failed: {e}")
+        
+        logger.info("Scheduler stopped")
+    
+    async def record_activity(self):
+        """Record user activity timestamp. Call on each user message."""
+        await self.redis.set(
+            f"last_activity:{self.user_name}", 
+            datetime.now(timezone.utc).isoformat()
+        )
+    
+    async def _build_context(self) -> JobContext:
+        """Build context for job execution."""
+        idle_seconds = await self._get_idle_seconds()
+        return JobContext(
+            user_name=self.user_name,
+            redis=self.redis,
+            idle_seconds=idle_seconds
+        )
+    
+    async def _get_idle_seconds(self) -> float:
+        """Calculate seconds since last user activity."""
+        last_activity = await self.redis.get(f"last_activity:{self.user_name}")
+        if not last_activity:
+            return 0.0
+        last_ts = datetime.fromisoformat(last_activity.decode())
+        return (datetime.now(timezone.utc) - last_ts).total_seconds()
+    
+    async def _run_pending_checks(self):
+        """Check for work pending from previous session."""
+        ctx = await self._build_context()
+        
+        for job_name, job in self._jobs.items():
+            pending_key = f"pending:{self.user_name}:{job_name}"
+            if await self.redis.get(pending_key):
+                logger.info(f"Found pending work for job: {job_name}")
+                await self.redis.delete(pending_key)
+                await self._execute_job(job, ctx)
+    
+    async def _monitor_loop(self):
+        """Main loop - check jobs periodically."""
+        while self._is_running:
+            await asyncio.sleep(self.CHECK_INTERVAL)
+            
+            ctx = await self._build_context()
+            
+            for job_name, job in self._jobs.items():
+                ctx.last_run = self._last_runs.get(job_name)
+                
+                try:
+                    if await job.should_run(ctx):
+                        await self._execute_job(job, ctx)
+                except Exception as e:
+                    logger.error(f"Job {job_name} check failed: {e}")
+    
+    async def _execute_job(self, job: BaseJob, ctx: JobContext):
+        """Execute a single job with error handling."""
+        logger.info(f"Executing job: {job.name}")
+        
+        try:
+            result = await job.execute(ctx)
+            self._last_runs[job.name] = datetime.now(timezone.utc)
+            
+            if result.summary:
+                logger.info(f"Job {job.name}: {result.summary}")
+            
+            if result.reschedule_seconds:
+                asyncio.create_task(self._delayed_run(job, result.reschedule_seconds))
+                
+        except Exception as e:
+            logger.error(f"Job {job.name} execution failed: {e}")
+    
+    async def _delayed_run(self, job: BaseJob, delay: float):
+        """Run a job after a delay."""
+        await asyncio.sleep(delay)
+        if self._is_running:
+            ctx = await self._build_context()
+            await self._execute_job(job, ctx)

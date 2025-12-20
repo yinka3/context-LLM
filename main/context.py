@@ -7,12 +7,11 @@ import redis.asyncio as redis
 from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 import json
-import instructor
-from pydantic import BaseModel
-from openai import AsyncOpenAI
+from main.processor import BatchProcessor
+from main.service import LLMService
 from redis import exceptions
 from redisclient import AsyncRedisClient
-from typing import Dict, List, Set, Tuple, TypeVar, Type
+from typing import List, Set, Tuple
 from functools import partial
 from schema.dtypes import *
 from schema.common_pb2 import Entity, Relationship, BatchMessage, MessageType
@@ -20,23 +19,13 @@ from main.nlp_pipe import NLPPipeline
 from main.entity_resolve import EntityResolver
 from graph.memgraph import MemGraphStore
 from main.prompts import *
-from rapidfuzz import process as fuzzy_process, fuzz
 from main.llm_trace import get_trace_logger
+from schedule.scheduler import Scheduler
+from schedule.merger import MergeDetectionJob
 load_dotenv()
 
-T = TypeVar('T', bound=BaseModel)
 STREAM_KEY_AI_RESPONSE = "stream:ai_response"
 
-LLM_CLIENT_INSTRUCT = lambda: instructor.from_openai(
-    AsyncOpenAI(base_url="https://openrouter.ai/api/v1",
-                api_key=os.getenv("OPENROUTER_API_KEY")),
-                mode=instructor.Mode.JSON
-)
-
-LLM_CLIENT = lambda: AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY")
-)
 BATCH_SIZE = 5
 PROFILE_INTERVAL = 15
 
@@ -46,15 +35,14 @@ BATCH_TIMEOUT_SECONDS = 180.0
 
 class Context:
 
-    def __init__(self, user_name: str, topics: List[str], redis_client, llm_client_instruct, llm_client):
+    def __init__(self, user_name: str, topics: List[str], redis_client):
         self.user_name: str = user_name
         self.active_topics: List[str] = topics
         self.session_emotions: List[str] = []
         self._session_entity_ids: Set[int] = set()
-        
-        self.redis_client: redis.Redis = redis_client 
-        self.llm_instruct: AsyncOpenAI = llm_client_instruct
-        self.llm_client: AsyncOpenAI = llm_client
+        self.scheduler: Scheduler = None
+        self.redis_client: redis.Redis = redis_client
+        self.llm: LLMService = None
         
         self.store: 'MemGraphStore' = None 
         self.cpu_executor: ThreadPoolExecutor = None
@@ -65,16 +53,16 @@ class Context:
         self._batch_timer_task: asyncio.Task = None
         self._batch_processing_lock = asyncio.Lock()
         self._batch_queue_task: asyncio.Task = None
+        self.batch_processor: BatchProcessor = None
 
         self.trace_logger = get_trace_logger()
 
     @classmethod
     async def create(cls, user_name: str, topics: List[str] = ["General"]) -> "Context":
         redis_conn = AsyncRedisClient().get_client()
-        llm = LLM_CLIENT()
-        llm_instruct = LLM_CLIENT_INSTRUCT()
         
-        instance = cls(user_name, topics, redis_conn, llm_instruct, llm)
+        instance = cls(user_name, topics, redis_conn)
+        instance.llm = LLMService(trace_logger=get_trace_logger())
         
         instance.store = MemGraphStore()
         instance.cpu_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ctx_worker")
@@ -82,7 +70,8 @@ class Context:
         loop = asyncio.get_running_loop()
         
         instance.nlp_pipe = await loop.run_in_executor(
-            instance.cpu_executor, NLPPipeline, llm_instruct
+            instance.cpu_executor, 
+            partial(NLPPipeline, llm=instance.llm)
         )
         
         instance.ent_resolver = await loop.run_in_executor(
@@ -90,6 +79,23 @@ class Context:
         )
 
         await instance._get_or_create_user_entity(user_name)
+
+        instance.batch_processor = BatchProcessor(
+            redis_client=redis_conn,
+            llm=instance.llm,
+            ent_resolver=instance.ent_resolver,
+            nlp_pipe=instance.nlp_pipe,
+            cpu_executor=instance.cpu_executor,
+            user_name=user_name,
+            active_topics=topics,
+            get_next_ent_id=instance.get_next_ent_id,
+        )
+
+        instance.scheduler = Scheduler(user_name)
+        instance.scheduler.register(
+            MergeDetectionJob(instance.ent_resolver, instance.store)
+        )
+        await instance.scheduler.start()
         
         return instance
 
@@ -255,6 +261,7 @@ class Context:
         }))
 
         buffer_len = await self.redis_client.llen(buffer_key)
+        await self.scheduler.record_activity()
         
         if buffer_len >= BATCH_SIZE:
             if self._batch_timer_task:
@@ -309,98 +316,6 @@ class Context:
         await pipe.execute()
 
     
-    async def _call_slm(self, 
-                        prompt: Tuple[str, str], 
-                        response_model: Type[T]) -> T | None:
-        
-        system, user = prompt
-
-        self.trace_logger.debug(
-            f"MODEL: meta-llama/llama-3.3-70b-instruct\n"
-            f"SYSTEM PROMPT:\n{system}\n\n"
-        )
-        
-        try:
-            response = await self.llm_instruct.chat.completions.create(
-                model="meta-llama/llama-3.3-70b-instruct",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user}
-                ],
-                response_model=response_model,
-                max_retries=2,
-                temperature=0,
-                extra_body={
-                    "provider": {
-                        "allow_fallbacks": True 
-                    }
-                }
-            )
-        
-            self.trace_logger.debug(f"RESPONSE:\n{response.model_dump_json(indent=2)}")
-
-            return response
-        except Exception as e:
-            self.trace_logger.error(f"GENERATION FAILED: {e}")
-            logger.error(f"LLM Generation Failed: {e}")
-            return None
-    
-    async def _call_reasoning(self, system: str, user: str) -> str | None:
-
-        self.trace_logger.debug(
-            f"MODEL: anthropic/claude-sonnet-4.5\n"
-            f"SYSTEM PROMPT:\n{system}\n\n"
-        )
-
-        try:
-            response = await self.llm_client.chat.completions.create(
-            model="anthropic/claude-sonnet-4",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user}
-            ],
-            temperature=1,
-            extra_body={
-                    "provider": {"allow_fallbacks": True}
-                }
-            )
-
-            content = response.choices[0].message.content
-            self.trace_logger.debug(f"RESPONSE:\n{content}")
-
-            return content
-        except Exception as e:
-            self.trace_logger.error(f"GENERATION FAILED: {e}")
-            logger.error(f"LLM Generation Failed: {e}")
-            return None
-    
-    async def _call_formatter(self, reasoning_output: str, response_model: Type[T]) -> T | None:
-
-        system = get_connection_formatter_prompt()
-
-        try:
-            response = await self.llm_instruct.chat.completions.create(
-                model="meta-llama/llama-3.3-70b-instruct",
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": reasoning_output}
-                ],
-                response_model=response_model,
-                max_retries=2,
-                temperature=0,
-                extra_body={
-                    "provider": {
-                        "allow_fallbacks": True 
-                    }
-                }
-            )
-
-            return response
-        except Exception as e:
-            logger.error(f"Formatter failed: {e}")
-            return None
-
-    
     async def _send_batch_to_stream(self, entities: List[Entity], 
                                         relations: List[Relationship], type: MessageType, 
                                         stream_key: str = STREAM_KEY_STRUCTURE):
@@ -423,205 +338,11 @@ class Context:
                     'timestamp': str(time.time())
                 }
                 
-                await self.redis_client.xadd(STREAM_KEY_STRUCTURE, stream_payload)
+                await self.redis_client.xadd(stream_key, stream_payload)
                 logger.info(f"Published batch {batch_id} to stream (Snapshot secured)")
 
             except exceptions.RedisError as e:
                 logger.critical(f"Redis WRITE failure in _publish_batch. Data potentially lost: {e}")
-    
-    async def _build_known_entities(self, mentions: List[Tuple[str, str, str]]) -> List[Dict]:
-        """
-        Tiered lookup: exact then fuzzy against _name_to_id.
-        Returns known entities for VEGAPUNK-02 context.
-        """
-        matched_ids = set()
-        
-        for mention_name, _, _ in mentions:
-            entity_id = self.ent_resolver._name_to_id.get(mention_name)
-            if entity_id:
-                matched_ids.add(entity_id)
-                continue
-
-            if self.ent_resolver._name_to_id:
-                result = fuzzy_process.extractOne(
-                    query=mention_name,
-                    choices=self.ent_resolver._name_to_id.keys(),
-                    scorer=fuzz.WRatio,
-                    score_cutoff=85
-                )
-                if result:
-                    matched_name, score, _ = result
-                    logger.debug(f"Fuzzy matched '{mention_name}' -> '{matched_name}' (score={score})")
-                    matched_ids.add(self.ent_resolver._name_to_id[matched_name])
-        
-        known_entities = []
-        for ent_id in matched_ids:
-            profile = self.ent_resolver.entity_profiles.get(ent_id)
-            if profile:
-                known_entities.append({
-                    "canonical_name": profile.get("canonical_name"),
-                    "type": profile.get("type"),
-                    "aliases": self.ent_resolver.get_mentions_for_id(ent_id)
-                })
-        
-        return known_entities
-    
-    async def _disambiguate_reasoning(
-        self,
-        mentions: List[Tuple[str, str, str]],
-        messages: List[Dict],
-        known_entities: List[Dict]
-    ) -> DisambiguationResult:
-        """
-        Two-phase disambiguation: VEGAPUNK-02 (reasoning) → VEGAPUNK-03 (structuring).
-        """
-
-        messages_text = "\n".join([f"{m['id']}: \"{m['message']}\"" for m in messages])
-        mentions_formatted = [{"name": m[0], "type": m[1], "topic": m[2]} for m in mentions]
-        
-        system_prompt_02 = get_disambiguation_reasoning_prompt(self.user_name, messages_text)
-        user_content_02 = json.dumps({
-            "mentions": mentions_formatted,
-            "known_entities": known_entities
-        }, indent=2)
-        
-        reasoning_output = await self._call_reasoning(system_prompt_02, user_content_02)
-        
-        if not reasoning_output:
-            logger.error("VEGAPUNK-02 failed, returning empty result")
-            return DisambiguationResult(entries=[])
-        
-        if "<resolution>" not in reasoning_output:
-            logger.warning("No <resolution> block found in VEGAPUNK-02 output")
-        
-        system_prompt_03 = get_disambiguation_formatter_prompt()
-        user_content_03 = json.dumps({
-            "mentions": mentions_formatted,
-            "reasoning_output": reasoning_output
-        }, indent=2)
-        
-        result = await self._call_slm(
-            prompt=(system_prompt_03, user_content_03),
-            response_model=DisambiguationResult
-        )
-        
-        if not result:
-            logger.error("VEGAPUNK-03 failed, returning empty result")
-            return DisambiguationResult(entries=[])
-        
-        return result
-    
-    async def _resolve(self, disambiguation_result: DisambiguationResult) -> Tuple[List[int], Set[int], Set[int]]:
-        """
-        Validate disambiguation results, update ER.
-        Returns list of entity IDs touched.
-        """
-        entity_ids = []
-        new_entity_ids = set()
-        alias_updated_ids = set()
-        loop = asyncio.get_running_loop()
-        
-        for entry in disambiguation_result.entries:
-            if entry.verdict == "EXISTING":
-                entity_id, aliases_added = self.ent_resolver.validate_existing(entry.canonical_name, entry.mentions)
-                if entity_id is None:
-                    logger.warning(f"EXISTING '{entry.canonical_name}' not found, demoting")
-                    canonical = entry.mentions[0]
-                    entity_id = await self.get_next_ent_id()
-                    await loop.run_in_executor(
-                        self.cpu_executor,
-                        partial(self.ent_resolver.register_entity, entity_id, canonical, entry.mentions, entry.entity_type, "General")
-                    )
-                    new_entity_ids.add(entity_id)
-                elif aliases_added:
-                    alias_updated_ids.add(entity_id)
-            else:
-                canonical = max(entry.mentions, key=lambda m: (len(m), m)) if entry.verdict == "NEW_GROUP" else entry.mentions[0]
-                entity_id = await self.get_next_ent_id()
-                await loop.run_in_executor(
-                    self.cpu_executor,
-                    partial(self.ent_resolver.register_entity, entity_id, canonical, entry.mentions, entry.entity_type, "General")
-                )
-                new_entity_ids.add(entity_id)
-            
-            entity_ids.append(entity_id)
-        
-        return entity_ids, new_entity_ids, alias_updated_ids
-
-    async def _extract_connections(
-        self,
-        entity_ids: List[int],
-        messages: List[Dict]
-    ) -> ConnectionExtractionResponse | None:
-        """
-        Extract meaningful connections between entities in messages.
-        """
-    
-        candidate_entities = []
-        for ent_id in entity_ids:
-            profile = self.ent_resolver.entity_profiles.get(ent_id)
-            if profile:
-                mentions = self.ent_resolver.get_mentions_for_id(ent_id)
-                candidate_entities.append({
-                    "name": profile["canonical_name"],
-                    "type": profile["type"],
-                    "mentions": mentions
-                })
-        messages_text = "\n".join([f"{m['id']}: \"{m['message']}\"" for m in messages])
-        reasoning_prompt = get_connection_reasoning_prompt(self.user_name, messages_text)
-        user_content = json.dumps({"candidate_entities": candidate_entities, "messages": messages})
-
-        reasoning_output = await self._call_reasoning(reasoning_prompt, user_content)
-        if not reasoning_output:
-            return None
-        
-        result = await self._call_formatter(reasoning_output, ConnectionExtractionResponse)
-        return result
-    
-
-    async def _get_buffered_messages(self) -> List[Dict]:
-        buffer_key = f"buffer:{self.user_name}"
-        raw_messages = await self.redis_client.lrange(buffer_key, 0, BATCH_SIZE - 1)
-        return [json.loads(m) for m in raw_messages] if raw_messages else []
-
-
-    async def _extract_mentions_batch(self, messages: List[Dict]) -> Dict[str, str]:
-        """Phase 1: Parallel NLP extraction across all messages."""
-        loop = asyncio.get_running_loop()
-        
-        mention_tasks = [
-            self.nlp_pipe.extract_mentions(
-                self.user_name, 
-                self.active_topics, 
-                m["message"]
-            )
-            for m in messages
-        ]
-
-        emotion_tasks = [
-            loop.run_in_executor(self.cpu_executor, self.nlp_pipe.analyze_emotion, m["message"])
-            for m in messages
-        ]
-
-        all_mentions_results = await asyncio.gather(*mention_tasks)
-        all_emotions = await asyncio.gather(*emotion_tasks)
-
-        all_unique_mentions: Dict[str, Dict] = {}
-        for mentions in all_mentions_results:
-            for mention_text, mention_type, mention_topic in mentions:
-                if mention_text not in all_unique_mentions:
-                    all_unique_mentions[mention_text] = {
-                        "type": mention_type,
-                        "topic": mention_topic
-                    }
-
-        for emotions in all_emotions:
-            if emotions:
-                dominant = max(emotions, key=lambda x: x["score"])
-                self.session_emotions.append(dominant["label"])
-
-        return all_unique_mentions
-
 
 
     async def _run_session_profile_updates(self):
@@ -672,7 +393,7 @@ class Context:
                     "known_aliases": mentions
                 }, indent=2)
                 
-                new_summary = await self._call_reasoning(system_prompt, user_content)
+                new_summary = await self.llm.call_reasoning(system_prompt, user_content)
                 
                 if not new_summary or new_summary == existing_summary:
                     return None
@@ -707,68 +428,36 @@ class Context:
             )
             logger.info(f"Sent {len(updates_for_graph)} profile updates to stream")
 
-    async def _move_to_dead_letter(self, messages: List[Dict], error_reason: str):
-        dlq_key = f"dlq:{self.user_name}"
-        failure_entry = {
-            "timestamp": time.time(),
-            "error": error_reason,
-            "batch_size": len(messages),
-            "messages": messages
-        }
-        
-        try:
-            await self.redis_client.rpush(dlq_key, json.dumps(failure_entry))
-            logger.warning(f"Failed batch stored in DLQ: {dlq_key}: {failure_entry['messages']} ")
-        except Exception as redis_err:
-            logger.critical(f"DLQ STORAGE FAILED: {redis_err}. Raw data: {messages}")
 
     async def process_batch(self):
         async with self._batch_processing_lock:
             logger.info("Starting batch processing...")
-
-            messages = await self._get_buffered_messages()
+            
+            buffer_key = f"buffer:{self.user_name}"
+            messages = await self.batch_processor.get_buffered_messages(buffer_key, BATCH_SIZE)
+            
             if not messages:
                 return
-
-            logger.debug(f"Processing batch of {len(messages)} messages: {[m['id'] for m in messages]}")
-            try:
-                mentions_dict = await self._extract_mentions_batch(messages)
-                if not mentions_dict:
-                    logger.info("No mentions found in batch, skipping LLM calls")
-                    
-                
-                mentions = [(name, data["type"], data["topic"]) for name, data in mentions_dict.items()]
-                known_entities = await self._build_known_entities(mentions)
             
-                disambiguation_result = await self._disambiguate_reasoning(mentions, messages, known_entities)
-                if not disambiguation_result.entries:
-                    logger.info("No disambiguation results, skipping")
-                    
-                
-                entity_ids, new_entity_ids, alias_updated_ids = await self._resolve(disambiguation_result)
-
-                user_id = self.ent_resolver._name_to_id.get(self.user_name)
-                if user_id and user_id not in entity_ids:
-                    entity_ids.append(user_id)
-
-
-                self._session_entity_ids.update(entity_ids)
+            result = await self.batch_processor.run(messages)
             
-                connection_result = await self._extract_connections(entity_ids, messages)
+            if not result.success:
+                await self.batch_processor.move_to_dead_letter(messages, result.error)
+            else:
+                self._session_entity_ids.update(result.entity_ids)
+                self.session_emotions.extend(result.emotions)
+                
+                if result.extraction_result:
+                    await self._publish_batch(
+                        result.entity_ids,
+                        result.new_entity_ids,
+                        result.alias_updated_ids,
+                        result.extraction_result
+                    )
+            
+            await self.redis_client.ltrim(buffer_key, len(messages), -1)
+            logger.debug(f"Trimmed {len(messages)} from {buffer_key}")
 
-                if not connection_result:
-                    logger.error("Connection extraction failed")
-                    
-                await self._publish_batch(entity_ids, new_entity_ids, alias_updated_ids, connection_result)
-            except Exception as e:
-                logger.error(f"batch processing field: {e}")
-                await self._move_to_dead_letter(messages, str(e))
-            finally:
-                buffer_key = f"buffer:{self.user_name}"
-                await self.redis_client.ltrim(buffer_key, len(messages), -1)
-                logger.debug(f"Trimmed {len(messages)} from {buffer_key}")
-
-        
     
     async def _publish_batch(
         self,
@@ -866,14 +555,7 @@ class Context:
         logger.info("Waiting for graph consumer to sync...")
         await asyncio.sleep(20)
         
-        loop = asyncio.get_running_loop()
-        candidates = await loop.run_in_executor(
-            self.cpu_executor,
-            self.ent_resolver.detect_merge_candidates
-        )
-
-        if candidates:
-            logger.info(f"Detected {len(candidates)} merge candidates at shutdown")
+        await self.scheduler.stop()
         
         mentions = self.ent_resolver.get_mentions()
         if mentions:
