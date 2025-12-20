@@ -15,6 +15,7 @@ dependencies = [
     "protobuf>=6.33.2",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.1",
+    "python-statemachine>=2.5.0",
     "rapidfuzz>=3.14.3",
     "redis>=7.1.0",
     "redis-tools>=0.0.2",
