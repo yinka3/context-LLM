@@ -1,0 +1,24 @@
+[project]
+name = "vestige"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "faiss-cpu>=1.13.1",
+    "gliner<0.2.13",
+    "instructor>=1.13.0",
+    "loguru>=0.7.3",
+    "neo4j>=6.0.3",
+    "numpy>=2.3.5",
+    "openai>=2.13.0",
+    "protobuf>=6.33.2",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.1",
+    "rapidfuzz>=3.14.3",
+    "redis>=7.1.0",
+    "redis-tools>=0.0.2",
+    "sentence-transformers>=5.2.0",
+    "torch>=2.9.1",
+    "transformers==4.41.2",
+]

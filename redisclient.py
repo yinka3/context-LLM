@@ -1,46 +1,40 @@
-import json
-import os
-import numpy as np
-import redis
-import logging
-from dotenv import load_dotenv
+import redis.asyncio as async_redis
+import redis as sync_redis
 
-load_dotenv()
-
-logger = logging.getLogger(__name__)
 REDIS_HOST = 'localhost'
 REDIS_PORT = 6379
-REDIS_DB = 0
 
-class RedisClient:
+class AsyncRedisClient:
+    _instance = None
 
-    def __init__(self, host=REDIS_HOST, port=REDIS_PORT, db_num=REDIS_DB):
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            pool = async_redis.ConnectionPool.from_url(
+                url=f"redis://{REDIS_HOST}:{REDIS_PORT}",
+                decode_responses=False,
+                max_connections=10
+            )
+            cls._instance.client = async_redis.Redis(connection_pool=pool)
+        return cls._instance
 
-        try:
-            self.client = redis.Redis(host=host, port=port, db=db_num, decode_responses=True, password=os.getenv('REDIS_PASSWORD'))
-            self.client.ping()
-            logger.info(f"Redis connected at {host}:{port}")
-        except redis.exceptions.ConnectionError:
-            logger.error(f"Redis not connected at {host}:{port}")
-            self.client = None
-    
-    def store_entity_embedding(self, entity_id: int, embedding: np.ndarray, metadata: dict):
-        """Store entity embedding for RAG retrieval"""
-        self.client.hset(
-            "entity_embeddings",
-            f"ent_{entity_id}",
-            embedding.tobytes()
-        )
-        self.client.hset(
-            "entity_metadata", 
-            f"ent_{entity_id}",
-            json.dumps(metadata)
-        )
+    def get_client(self) -> async_redis.Redis:
+        return self.client
 
-    def get_all_embeddings(self):
-        """Retrieve all embeddings for similarity search"""
-        embeddings = self.client.hgetall("entity_embeddings")
-        return {
-            ent_id: np.frombuffer(emb_bytes, dtype=np.float32) 
-            for ent_id, emb_bytes in embeddings.items()
-        }
+
+class SyncRedisClient:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            pool = sync_redis.ConnectionPool.from_url(
+                url=f"redis://{REDIS_HOST}:{REDIS_PORT}",
+                decode_responses=False,
+                max_connections=10
+            )
+            cls._instance.client = sync_redis.Redis(connection_pool=pool)
+        return cls._instance
+
+    def get_client(self) -> sync_redis.Redis:
+        return self.client

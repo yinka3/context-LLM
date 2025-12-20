@@ -1,94 +1,315 @@
 import asyncio
-from datetime import datetime, timedelta
-import logging
-import logging_setup
-import json
+import time
+from dotenv import load_dotenv
 import os
-from main.entity_resolve import EntityResolver
-from redisclient import RedisClient
+import re
+import redis.asyncio as redis
+from concurrent.futures import ThreadPoolExecutor
+from loguru import logger
+import json
+from main.processor import BatchProcessor
+from main.service import LLMService
 from redis import exceptions
-from typing import Any, Dict, List, Tuple
-from main.nlp_pipe import NLP_PIPE
-from shared.dtypes import EntityData, MessageData
-from models.factory import get_llm_client
-from schema.common_pb2 import Entity, Relationship, BatchMessage, Message
+from redisclient import AsyncRedisClient
+from typing import List, Set, Tuple
+from functools import partial
+from schema.dtypes import *
+from schema.common_pb2 import Entity, Relationship, BatchMessage, MessageType
+from main.nlp_pipe import NLPPipeline
+from main.entity_resolve import EntityResolver
+from graph.memgraph import MemGraphStore
+from main.prompts import *
+from main.llm_trace import get_trace_logger
+from schedule.scheduler import Scheduler
+from schedule.merger import MergeDetectionJob
+load_dotenv()
 
-logging_setup.setup_logging()
-
-logger = logging.getLogger(__name__)
 STREAM_KEY_AI_RESPONSE = "stream:ai_response"
+
+BATCH_SIZE = 5
+PROFILE_INTERVAL = 15
+
+STREAM_KEY_STRUCTURE = "stream:structure"
+STREAM_KEY_PROFILE = "stream:profile"
+BATCH_TIMEOUT_SECONDS = 180.0
+
 class Context:
 
-    def __init__(self, user_name: str = "Yinka"):
-        self.ents_id = 0
-        self.msg_id = 1
-        self.user_message_cnt: int = 0
-        self.user_name = user_name
-        self.entities: Dict[int, EntityData] = {}
-        self.nlp_pipe: NLP_PIPE = NLP_PIPE()
-        self.ent_resolver: EntityResolver = EntityResolver()
-        self.redis_client = RedisClient()
-        self.llm_client = get_llm_client()
+    def __init__(self, user_name: str, topics: List[str], redis_client):
+        self.user_name: str = user_name
+        self.active_topics: List[str] = topics
+        self.session_emotions: List[str] = []
+        self._session_entity_ids: Set[int] = set()
+        self.scheduler: Scheduler = None
+        self.redis_client: redis.Redis = redis_client
+        self.llm: LLMService = None
         
+        self.store: 'MemGraphStore' = None 
+        self.cpu_executor: ThreadPoolExecutor = None
+        self.nlp_pipe: 'NLPPipeline' = None
+        self.ent_resolver: 'EntityResolver' = None
 
-        self.user_entity = self._create_user_entity(user_name)
-    
-    def get_next_msg_id(self) -> str:
-        self.msg_id += 1
-        return f"msg_{self.msg_id}"
+        self._background_tasks: Set[asyncio.Task] = set()
+        self._batch_timer_task: asyncio.Task = None
+        self._batch_processing_lock = asyncio.Lock()
+        self._batch_queue_task: asyncio.Task = None
+        self.batch_processor: BatchProcessor = None
 
-    def get_next_ent_id(self) -> str:
-        self.ents_id += 1
-        return f"ent_{self.ents_id}"
+        self.trace_logger = get_trace_logger()
 
-
-    def _create_user_entity(self):
-        logger.info("Adding USER information to graph")
-        user_entity = Entity(
-            id=self.get_next_ent_id(),
-            text="USER",
-            type="PERSON",
-            confidence=1.0,
-            aliases=[],
-            mentioned_in=[]
+    @classmethod
+    async def create(cls, user_name: str, topics: List[str] = ["General"]) -> "Context":
+        redis_conn = AsyncRedisClient().get_client()
+        
+        instance = cls(user_name, topics, redis_conn)
+        instance.llm = LLMService(trace_logger=get_trace_logger())
+        
+        instance.store = MemGraphStore()
+        instance.cpu_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ctx_worker")
+        
+        loop = asyncio.get_running_loop()
+        
+        instance.nlp_pipe = await loop.run_in_executor(
+            instance.cpu_executor, 
+            partial(NLPPipeline, llm=instance.llm)
+        )
+        
+        instance.ent_resolver = await loop.run_in_executor(
+            instance.cpu_executor, EntityResolver
         )
 
-        seriliazed_message = user_entity.SerializeToString()
+        await instance._get_or_create_user_entity(user_name)
+
+        instance.batch_processor = BatchProcessor(
+            redis_client=redis_conn,
+            llm=instance.llm,
+            ent_resolver=instance.ent_resolver,
+            nlp_pipe=instance.nlp_pipe,
+            cpu_executor=instance.cpu_executor,
+            user_name=user_name,
+            active_topics=topics,
+            get_next_ent_id=instance.get_next_ent_id,
+        )
+
+        instance.scheduler = Scheduler(user_name)
+        instance.scheduler.register(
+            MergeDetectionJob(instance.ent_resolver, instance.store)
+        )
+        await instance.scheduler.start()
         
-        self.redis_client.client.xadd("stream-direct:add_user", {'data': seriliazed_message})
-        self.redis_client.client.xack()
-        self.entities[user_entity.id] = user_entity
-        return user_entity
-        
+        return instance
+
+    @staticmethod
+    def _log_task_exception(task):
+        if task.cancelled():
+            return
+        if exc := task.exception():
+            logger.error(f"Background task failed: {exc}")
     
-    def add(self, item: Message):
-        if item.role == "user":
-            self.user_message_cnt += 1
-        self.process_live_messages(item)
+    def _fire_and_forget(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._log_task_exception)
+
+
+    async def get_next_msg_id(self) -> int:
+        return await self.redis_client.incr("global:next_msg_id")
+
+    async def get_next_ent_id(self) -> int:
+        return await self.redis_client.incr("global:next_ent_id")
+    
+    def _format_relative_time(self, now: datetime, ts: datetime) -> str:
+        delta = now - ts
+        seconds = delta.total_seconds()
+        
+        if seconds < 3600:
+            mins = int(seconds // 60)
+            return f"{mins}m ago" if mins > 1 else "just now"
+        elif seconds < 86400:
+            hours = int(seconds // 3600)
+            return f"{hours}h ago"
+        elif seconds < 604800:
+            days = int(seconds // 86400)
+            return f"{days}d ago"
+        else:
+            weeks = int(seconds // 604800)
+            return f"{weeks}w ago"
+
+
+    async def _get_or_create_user_entity(self, user_name: str):
+        loop = asyncio.get_running_loop()
+
+        entity_id = await loop.run_in_executor(
+                    self.cpu_executor,
+                    self.ent_resolver.get_id,
+                    user_name
+                )
+
+        if entity_id:
+            logger.info(f"User {user_name} recognized.")
+            return entity_id
+        
+        logger.info(f"Creating new USER entity for {user_name}")
+        new_id = await self.get_next_ent_id()
+        
+        profile = {
+            "canonical_name": user_name,
+            "summary": f"The primary user named {user_name}",
+            "type": "person",
+            "topic": "Personal"
+        }
+
+        embedding = await loop.run_in_executor(
+            self.cpu_executor,
+            partial(self.ent_resolver.register_entity, new_id, user_name, [user_name], "person", "Personal")
+        )
+        
+        self.ent_resolver.entity_profiles[new_id]["summary"] = profile["summary"]
+        self._session_entity_ids.add(new_id)
+        user_entity = Entity(
+            id=new_id,
+            canonical_name=user_name,
+            type="person",
+            confidence=1.0,
+            summary=profile["summary"],
+            topic="Personal",
+            embedding=embedding,
+            aliases=[user_name]
+        )
+
+        batch = BatchMessage(type=MessageType.SYSTEM_ENTITY)
+        batch.list_ents.append(user_entity)
+
+        try:
+            await self.redis_client.xadd(STREAM_KEY_STRUCTURE, {'data': batch.SerializeToString()})
+        except Exception as e:
+            logger.error(f"Failed to push User Entity to stream: {e}")
+        
+        return new_id
+        
+    async def _flush_batch_timeout(self):
+        try:
+            await asyncio.sleep(BATCH_TIMEOUT_SECONDS)
+            buffer_len = await self.redis_client.llen(f"buffer:{self.user_name}")
+            if buffer_len > 0:
+                logger.info(f"Batch timeout reached")
+                await self._trigger_batch_process()
+        except asyncio.CancelledError:
+            pass
+    
+    async def _flush_batch_shutdown(self):
+
+        logger.info("Initiating graceful shutdown of batch processor...")
+        if self._batch_timer_task:
+            self._batch_timer_task.cancel()
+            self._batch_timer_task = None
+        
+        buffer_key = f"buffer:{self.user_name}"
+        wait_count = 0
+        while await self.redis_client.llen(buffer_key) > 0:
+            if wait_count % 20 == 0:
+                logger.info(f"Shutdown: Waiting for buffer to drain... ({wait_count}s)")
+            wait_count += 1
+            await asyncio.sleep(1)
+            await self._trigger_batch_process() 
+
+        async with self._batch_processing_lock:
+            logger.info("Batch processing lock acquired - buffer is empty and active batches done.")
+
+        if self._batch_queue_task and not self._batch_queue_task.done():
+            logger.info("Stopping batch queue listener...")
+            self._batch_queue_task.cancel()
+            try:
+                await self._batch_queue_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._background_tasks:
+            logger.info(f"Waiting for {len(self._background_tasks)} background tasks...")
+            await asyncio.wait(self._background_tasks, timeout=90)
+        
+        logger.info("All batches and background tasks completed")
+    
+    async def _trigger_batch_process(self):
+
+        if self._batch_queue_task is None or self._batch_queue_task.done():
+            self._batch_queue_task = asyncio.create_task(self._batch_a_queue())
+    
+    async def _batch_a_queue(self):
+
+        while True:
+            buffer_len = await self.redis_client.llen(f"buffer:{self.user_name}")
+            
+            if buffer_len >= BATCH_SIZE:
+                await self.process_batch()
+                if self._background_tasks:
+                    await asyncio.wait(self._background_tasks, timeout=180)
+            else:
+                await asyncio.sleep(0.5)
+
+    async def add(self, msg: MessageData):
+        """Buffer message and trigger batch processing when ready."""
+        msg.id = await self.get_next_msg_id()
+        await self.add_to_redis(msg)
+
+        buffer_key = f"buffer:{self.user_name}"
+        await self.redis_client.rpush(buffer_key, json.dumps({
+            "id": msg.id,
+            "message": msg.message.strip(),
+            "timestamp": msg.timestamp.isoformat()
+        }))
+
+        buffer_len = await self.redis_client.llen(buffer_key)
+        await self.scheduler.record_activity()
+        
+        if buffer_len >= BATCH_SIZE:
+            if self._batch_timer_task:
+                self._batch_timer_task.cancel()
+                self._batch_timer_task = None
+            
+            await self._trigger_batch_process()
+        elif buffer_len == 1:
+            self._batch_timer_task = asyncio.create_task(self._flush_batch_timeout())
 
     
-    def get_recent_context(self, num_messages: int = 10) -> Tuple[str, List[str]]:
-        # Get from Redis cache
+    async def get_recent_context(self, num_messages: int = 10) -> List[Tuple[str, str]]:
+        """Returns list of (formatted_message, raw_message) tuples."""
         sorted_set_key = f"recent_messages:{self.user_name}"
-        recent_msg_ids = self.redis_client.client.zrevrange(sorted_set_key, 0, num_messages-1)
+        recent_msg_ids = await self.redis_client.zrevrange(sorted_set_key, 0, num_messages-1)
         
-        context_text = []
-        for msg_id in recent_msg_ids:
-            msg_data = self.redis_client.client.hget(f"message_content:{self.user_name}", msg_id)
+        if not recent_msg_ids:
+            return []
+        
+        recent_msg_ids.reverse()
+        
+        msg_data_list = await self.redis_client.hmget(
+            f"message_content:{self.user_name}", 
+            *recent_msg_ids
+        )
+        
+        results = []
+        now = datetime.now()
+        
+        for msg_data in msg_data_list:
             if msg_data:
-                context_text.append(json.loads(msg_data)['message'])
+                parsed = json.loads(msg_data)
+                raw = parsed['message']
+                ts = datetime.fromisoformat(parsed['timestamp'])
+                relative = self._format_relative_time(now, ts)
+                results.append((f"({relative}) {raw}", raw))
+
+        return results
+
+
+    async def add_to_redis(self, msg: MessageData):
+        msg_key = f"msg_{msg.id}"
         
-        return " ".join(context_text), context_text
+        pipe = self.redis_client.pipeline()
 
-
-    def add_to_redis(self, msg: MessageData):
-        sorted_set_key = f"recent_messages:{self.user_name}" 
-        hash_key = f"message_content:{self.user_name}"
-
-        self.redis_client.client.hset(hash_key, f"msg_{msg.id}", json.dumps({
-            'message': msg.message,
-            'timestamp': msg.timestamp.isoformat(),
-            'role': msg.role
+        pipe.hset(f"message_content:{self.user_name}", msg_key, json.dumps({
+            'message': msg.message.strip(),
+            'timestamp': msg.timestamp.isoformat()
         }))
 
         self.redis_client.client.zadd(sorted_set_key, {f"msg_{msg.id}": msg.timestamp.timestamp()})
@@ -238,7 +459,7 @@ class Context:
     
     def publish_message(self, llm_response, msg=Message):
         
-        batched_msg = BatchMessage(message_id=msg.id)
+        batched_msg = BatchMessge(message_id=msg.id)
         for ent in llm_response["resolved_entities"]:
             entity_id = ent.get("id") or self.get_next_ent_id()
             new_ent = Entity(id=entity_id,

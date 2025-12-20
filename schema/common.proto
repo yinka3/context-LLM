@@ -1,43 +1,37 @@
 syntax = "proto3";
 
-message Message {
-    int32 id = 1;
-    string role = 2;
-    string user_message = 3;
-    string sentiment = 4;
-    int64 timestamp = 5;
-}
-
-
 message Entity {
     int32 id = 1;
-    string text = 2;
+    string canonical_name = 2;
     string type = 3;
     float confidence = 4;
-    repeated string aliases = 5;
-    repeated string mentioned_in = 6;
+    string summary = 5; 
+    string topic = 6;
+    repeated float embedding = 7;
+    int32 last_profiled_msg_id = 8;
+    repeated string aliases = 9;
 }
 
 
 message Relationship {
-    string source_text = 1;
-    string target_text = 2;
-    string relation = 3;
+    int32 message_id = 1;
+    string entity_a = 2;
+    string entity_b = 3;
     float confidence = 4;
 }
 
+enum MessageType {
+    USER_MESSAGE = 0;
+    PROFILE_UPDATE = 1;
+    SYSTEM_ENTITY = 2;
+}
+
 message BatchMessage {
-    string message_id = 1;
+    MessageType type = 1;
     repeated Entity list_ents = 2;
     repeated Relationship list_relations = 3;
 }
 
-message GraphResponse {
-    bool success = 1;
-    string error_message = 2;
-    int32 retry_count = 3;
-    int32 processed_count = 4;
-}
 
 
 
