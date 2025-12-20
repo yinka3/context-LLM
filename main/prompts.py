@@ -91,8 +91,32 @@ CRITICAL: Check the aliases array, not just canonical_name.
 - Correct: EXISTING | Destiny
 - Wrong: NEW_SINGLE | Des
 
-The aliases list is exhaustive. If a mention matches ANY string in ANY aliases array, it's EXISTING.
+The aliases list is your first check, not your only check.
+- If a mention matches ANY string in ANY aliases array → EXISTING
+- If explicit textual evidence in THIS batch proves a mention refers to a known entity → EXISTING
+  - Example: "Kevin is actually Kev" → both route to EXISTING | Kevin
+  - Example: "Prof Ramirez assigned..." when "Professor Ramirez" exists → EXISTING | Professor Ramirez
+- When using contextual evidence, include ALL related mentions in the same EXISTING entry so they get registered as aliases.
 </alias_matching>
+
+<partial_match_detection>
+If no exact alias match, actively scan known_entities for potential matches:
+
+**Name patterns to check:**
+- Title variations: "Dr. X" ↔ "Professor X" ↔ "Prof X" (same last name + academic context)
+- Partial names: "Marcus" could match "Marcus Thompson" (first name subset)
+- Honorific removal: "Ramirez" could match "Professor Ramirez" (last name only)
+- Abbreviations: "BU" could match "Boston University", "MIT" could match "Massachusetts Institute of Technology"
+
+**Confirmation required:**
+- Partial match alone is not enough
+- Context must confirm: same role, same relationships, or logical continuity
+- Example: "Marcus" in "Mock interview with Marcus" matches "Marcus Thompson" who offered a mock interview → EXISTING | Marcus Thompson
+
+**When uncertain:**
+- Lean toward EXISTING if context strongly supports it
+- Merge detection exists downstream, but fragmentation is harder to fix than a false merge
+</partial_match_detection>
 
 <principles>
 Trust but verify:
@@ -118,8 +142,7 @@ When uncertain:
 </messages>
 
 <output_format>
-
-Think it through, then deliver your verdict. Keep reasoning under 800 tokens—be thorough, not exhaustive.
+Think it through, then deliver your verdict. Keep reasoning under 1000 tokens—be thorough, not exhaustive.
 <reasoning>
 Your analysis...
 </reasoning>

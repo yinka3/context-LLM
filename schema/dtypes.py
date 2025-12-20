@@ -29,10 +29,36 @@ class ProfileUpdate(BaseModel):
     topic: str = Field(..., description="Broad thematic category.")
 
 class ResolutionEntry(BaseModel):
-    verdict: Literal["EXISTING", "NEW_GROUP", "NEW_SINGLE"]
-    mentions: List[str]
-    entity_type: str
-    canonical_name: Optional[str] = None
+    verdict: Literal["EXISTING", "NEW_GROUP", "NEW_SINGLE"] = Field(
+        ..., 
+        description="EXISTING: mention(s) map to an entity already in known_entities. "
+                    "NEW_GROUP: multiple mentions in this batch refer to the same NEW entity. "
+                    "NEW_SINGLE: a single mention representing a new entity."
+    )
+    mentions: List[str] = Field(
+        ..., 
+        description="All text spans from the input that refer to this entity. "
+                    "For EXISTING, includes the mention(s) that matched. "
+                    "For NEW_GROUP, all grouped mentions. "
+                    "For NEW_SINGLE, the single mention."
+    )
+    entity_type: str = Field(
+        ..., 
+        description="Semantic type of the entity (e.g., person, professor, organization, place, gym). "
+                    "Use the type from the original mention. If grouped mentions have mixed types, "
+                    "use the type of the mention selected as canonical_name."
+    )
+    canonical_name: Optional[str] = Field(
+        default=None, 
+        description="For EXISTING: the exact canonical_name from known_entities. "
+                    "For NEW_GROUP: the longest or most complete mention. "
+                    "For NEW_SINGLE: the mention text verbatim."
+    )
+
 
 class DisambiguationResult(BaseModel):
-    entries: List[ResolutionEntry]
+    entries: List[ResolutionEntry] = Field(
+        ..., 
+        description="One entry per distinct entity. Every input mention must appear "
+                    "in exactly one entry. No mention left behind, no mention duplicated."
+    )

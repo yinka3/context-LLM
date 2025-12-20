@@ -120,10 +120,13 @@ These are your rules, follow them with the appropriate degree.
 
 
 2. **DO NOT'S**
-- any unnamed reference/generic nouns or unspecific place with no connection to named references in this text, examples: "that burger joint", "the concert", "the book"
+- any unnamed reference/generic nouns or unspecific place with no connection to named references in this text.
+  - examples: "that burger joint", "the big concert", "the red book"
 - more examples: "my homework", "that girl", or any general unnamed task or place/thing.
 - pronouns with no connection to a named reference ("he", "she", "they", "it", "that", "this")
 - Temporal expressions ("today", "yesterday", "next week", "last month")
+- Generic nouns without distinguishing names: if the mention could apply to thousands of instances without additional context, it's not specific enough.
+  - examples: "the meeting", "my doctor", "the restaurant", "the app", "the conference", "the park", "Central Park"
 
 </finding_entities>
 

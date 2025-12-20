@@ -511,18 +511,19 @@ class Context:
         
         return result
     
-    async def _resolve(self, disambiguation_result: DisambiguationResult) -> Tuple[List[int], Set[int]]:
+    async def _resolve(self, disambiguation_result: DisambiguationResult) -> Tuple[List[int], Set[int], Set[int]]:
         """
         Validate disambiguation results, update ER.
         Returns list of entity IDs touched.
         """
         entity_ids = []
         new_entity_ids = set()
+        alias_updated_ids = set()
         loop = asyncio.get_running_loop()
         
         for entry in disambiguation_result.entries:
             if entry.verdict == "EXISTING":
-                entity_id = self.ent_resolver.validate_existing(entry.canonical_name, entry.mentions)
+                entity_id, aliases_added = self.ent_resolver.validate_existing(entry.canonical_name, entry.mentions)
                 if entity_id is None:
                     logger.warning(f"EXISTING '{entry.canonical_name}' not found, demoting")
                     canonical = entry.mentions[0]
@@ -532,6 +533,8 @@ class Context:
                         partial(self.ent_resolver.register_entity, entity_id, canonical, entry.mentions, entry.entity_type, "General")
                     )
                     new_entity_ids.add(entity_id)
+                elif aliases_added:
+                    alias_updated_ids.add(entity_id)
             else:
                 canonical = max(entry.mentions, key=lambda m: (len(m), m)) if entry.verdict == "NEW_GROUP" else entry.mentions[0]
                 entity_id = await self.get_next_ent_id()
@@ -543,7 +546,7 @@ class Context:
             
             entity_ids.append(entity_id)
         
-        return entity_ids, new_entity_ids
+        return entity_ids, new_entity_ids, alias_updated_ids
 
     async def _extract_connections(
         self,
@@ -630,64 +633,67 @@ class Context:
         current_msg_id = await self.redis_client.get("global:next_msg_id")
         current_msg_id = int(current_msg_id) if current_msg_id else 0
         
+        semaphore = asyncio.Semaphore(5)
+
         async def update_single(ent_id: int) -> Optional[Entity]:
-            profile = self.ent_resolver.entity_profiles.get(ent_id)
-            if not profile:
-                return None
-            
-            canonical_name = profile.get("canonical_name", "Unknown")
-            entity_type = profile.get("type", "unknown")
-            existing_summary = profile.get("summary", "")
+            async with semaphore:
+                profile = self.ent_resolver.entity_profiles.get(ent_id)
+                if not profile:
+                    return None
+                
+                canonical_name = profile.get("canonical_name", "Unknown")
+                entity_type = profile.get("type", "unknown")
+                existing_summary = profile.get("summary", "")
 
 
-            mentions = self.ent_resolver.get_mentions_for_id(ent_id)
-            if not mentions:
-                logger.debug(f"No mentions for {canonical_name}, skipping profile")
-                return None
+                mentions = self.ent_resolver.get_mentions_for_id(ent_id)
+                if not mentions:
+                    logger.debug(f"No mentions for {canonical_name}, skipping profile")
+                    return None
 
-            pattern = re.compile(
-                r'\b(' + '|'.join(re.escape(m) for m in mentions) + r')\b', 
-                re.IGNORECASE
-            )
-            
-            observations = [formatted for formatted, raw in recent_context if pattern.search(raw)]
+                pattern = re.compile(
+                    r'\b(' + '|'.join(re.escape(m) for m in mentions) + r')\b', 
+                    re.IGNORECASE
+                )
+                
+                observations = [formatted for formatted, raw in recent_context if pattern.search(raw)]
 
-            if not observations:
-                logger.debug(f"No observations for {canonical_name}, skipping profile")
-                return None
-            
-            context_text = "\n".join(observations)
-            system_prompt = get_profile_update_prompt(self.user_name)
-            user_content = json.dumps({
-                "entity_name": canonical_name,
-                "entity_type": entity_type,
-                "existing_summary": existing_summary,
-                "new_observations": context_text,
-                "known_aliases": mentions
-            }, indent=2)
-            
-            new_summary = await self._call_reasoning(system_prompt, user_content)
-            
-            if not new_summary or new_summary == existing_summary:
-                return None
-            
-            loop = asyncio.get_running_loop()
-            embedding = await loop.run_in_executor(
-                self.cpu_executor,
-                partial(self.ent_resolver.update_profile_summary, ent_id, new_summary)
-            )
-            
-            logger.info(f"Profiled entity {ent_id}: {canonical_name}")
-            
-            return Entity(
-                id=ent_id,
-                canonical_name=canonical_name,
-                type=entity_type,
-                summary=new_summary,
-                topic=profile.get("topic", "General"),
-                embedding=embedding,
-                last_profiled_msg_id=current_msg_id
-            )
+                if not observations:
+                    logger.debug(f"No observations for {canonical_name}, skipping profile")
+                    return None
+                
+                context_text = "\n".join(observations)
+                system_prompt = get_profile_update_prompt(self.user_name)
+                user_content = json.dumps({
+                    "entity_name": canonical_name,
+                    "entity_type": entity_type,
+                    "existing_summary": existing_summary,
+                    "new_observations": context_text,
+                    "known_aliases": mentions
+                }, indent=2)
+                
+                new_summary = await self._call_reasoning(system_prompt, user_content)
+                
+                if not new_summary or new_summary == existing_summary:
+                    return None
+                
+                loop = asyncio.get_running_loop()
+                embedding = await loop.run_in_executor(
+                    self.cpu_executor,
+                    partial(self.ent_resolver.update_profile_summary, ent_id, new_summary)
+                )
+                
+                logger.info(f"Profiled entity {ent_id}: {canonical_name}")
+                
+                return Entity(
+                    id=ent_id,
+                    canonical_name=canonical_name,
+                    type=entity_type,
+                    summary=new_summary,
+                    topic=profile.get("topic", "General"),
+                    embedding=embedding,
+                    last_profiled_msg_id=current_msg_id
+                )
         
         results = await asyncio.gather(*[update_single(ent_id) for ent_id in self._session_entity_ids])
         updates_for_graph = [r for r in results if r is not None]
@@ -739,7 +745,7 @@ class Context:
                     logger.info("No disambiguation results, skipping")
                     
                 
-                entity_ids, new_entity_ids = await self._resolve(disambiguation_result)
+                entity_ids, new_entity_ids, alias_updated_ids = await self._resolve(disambiguation_result)
 
                 user_id = self.ent_resolver._name_to_id.get(self.user_name)
                 if user_id and user_id not in entity_ids:
@@ -753,7 +759,7 @@ class Context:
                 if not connection_result:
                     logger.error("Connection extraction failed")
                     
-                await self._publish_batch(entity_ids, new_entity_ids, connection_result)
+                await self._publish_batch(entity_ids, new_entity_ids, alias_updated_ids, connection_result)
             except Exception as e:
                 logger.error(f"batch processing field: {e}")
                 await self._move_to_dead_letter(messages, str(e))
@@ -768,6 +774,7 @@ class Context:
         self,
         entity_ids: List[int],
         new_entity_ids: Set[int],
+        alias_updated_ids: Set[int],
         extraction_result: ConnectionExtractionResponse
         ):
         """
@@ -805,6 +812,20 @@ class Context:
                     embedding=embedding,
                     aliases=aliases
                 ))
+        
+        if alias_updated_ids:
+            for ent_id in alias_updated_ids:
+                if ent_id in new_entity_ids:
+                    continue
+                profile = self.ent_resolver.entity_profiles.get(ent_id)
+                if profile:
+                    aliases = self.ent_resolver.get_mentions_for_id(ent_id)
+                    proto_ents.append(Entity(
+                        id=ent_id,
+                        canonical_name=profile["canonical_name"],
+                        confidence=1.0,
+                        aliases=aliases
+                    ))
 
         proto_rels = []
         for msg_result in extraction_result.message_results:
