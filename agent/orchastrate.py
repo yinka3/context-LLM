@@ -8,12 +8,11 @@ class ContextState:
     call_count: int = 0
     max_calls: int = 5
     user_query: str = ""
-    target_entity: str = ""
+    current_state: str = "start"
     inspected_entity_ids: Set[int] = field(default_factory=set)
     hot_topics: List[str] = field(default_factory=list)
     active_topics: List[str] = field(default_factory=list)
     hot_topic_context: Dict[str, List[Dict]] = field(default_factory=dict)
-    evidence: List[Dict] = field(default_factory=list)
     retrieved_messages: List[Dict] = field(default_factory=list)
     entity_profiles: List[Dict] = field(default_factory=list)
     graph_results: List[Dict] = field(default_factory=list)
