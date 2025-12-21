@@ -1,6 +1,7 @@
+from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional, TypedDict, Union
 
 
 class MessageData(BaseModel):
@@ -62,3 +63,41 @@ class DisambiguationResult(BaseModel):
         description="One entry per distinct entity. Every input mention must appear "
                     "in exactly one entry. No mention left behind, no mention duplicated."
     )
+
+class BaseResult(TypedDict):
+    status: str
+    state: str
+    tools_used: List[str]
+
+
+class CompleteResult(BaseResult):
+    response: str
+    messages: List[Dict]
+    profiles: List[Dict]
+    graph: List[Dict]
+    web: List[Dict]
+
+
+class ClarificationResult(BaseResult):
+    question: str
+
+
+RunResult = Union[CompleteResult, ClarificationResult]
+
+@dataclass
+class ToolCall:
+    name: str
+    args: Dict = field(default_factory=dict)
+
+
+@dataclass 
+class FinalResponse:
+    content: str
+
+
+@dataclass
+class ClarificationRequest:
+    question: str
+
+
+StellaResponse = Union[ToolCall, FinalResponse, ClarificationRequest]

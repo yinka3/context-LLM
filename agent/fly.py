@@ -1,68 +1,89 @@
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
-from agent.orchastrate import ContextState, StateOrchestrator
+from datetime import datetime, timezone
+import json
+from typing import Dict, List, Optional
+
+from agent.orchestrate import ContextState, StateOrchestrator
 from agent.tools import Tools
+from main.service import LLMService
+from main.system_prompt import get_stella_prompt
+from schema.dtypes import (
+    ClarificationRequest, 
+    ClarificationResult, 
+    CompleteResult, 
+    FinalResponse, 
+    RunResult, 
+    StellaResponse, 
+    ToolCall
+)
+from schema.tool_schema import TOOL_SCHEMAS
 
-
-
-class BaseResult(TypedDict):
-    status: str
-    state: str
-    tools_used: List[str]
-
-
-class CompleteResult(BaseResult):
-    response: str
-    messages: List[Dict]
-    profiles: List[Dict]
-    graph: List[Dict]
-    web: List[Dict]
-
-
-class ClarificationResult(BaseResult):
-    question: str
-
-
-RunResult = Union[CompleteResult, ClarificationResult]
-
-@dataclass
-class ToolCall:
-    name: str
-    args: Dict = field(default_factory=dict)
-
-
-@dataclass 
-class FinalResponse:
-    content: str
-
-
-@dataclass
-class ClarificationRequest:
-    question: str
-
-
-StellaResponse = Union[ToolCall, FinalResponse, ClarificationRequest]
-
-def build_context_for_stella(ctx: ContextState) -> Dict:
-    return {
-        "query": ctx.user_query,
-        "hot_topic_context": ctx.hot_topic_context,
-        "messages": ctx.retrieved_messages,
-        "profiles": ctx.entity_profiles,
-        "graph": ctx.graph_results,
-        "web": ctx.web_results,
-        "calls_remaining": ctx.max_calls - ctx.call_count,
-        "current_state": ctx.current_state
-    }
+def build_user_message(
+    ctx: ContextState,
+    last_result: Optional[Dict] = None,
+    error: Optional[str] = None
+) -> str:
+    msg = f"**Query:** {ctx.user_query}\n"
+    msg += f"**State:** {ctx.current_state}\n"
+    msg += f"**Calls remaining:** {ctx.max_calls - ctx.call_count}\n"
+    
+    if error:
+        msg += f"\n**Error from last action:** {error}\n"
+    
+    if last_result:
+        msg += f"\n**Last tool result:**\n```json\n{json.dumps(last_result, indent=2, default=str)[:2000]}\n```\n"
+    
+    if ctx.hot_topic_context:
+        msg += f"\n**Hot topic context (pre-fetched):**\n```json\n{json.dumps(ctx.hot_topic_context, indent=2, default=str)[:1500]}\n```\n"
+    
+    if ctx.entity_profiles:
+        msg += f"\n**Accumulated profiles ({len(ctx.entity_profiles)}):**\n```json\n{json.dumps(ctx.entity_profiles, indent=2, default=str)[:2000]}\n```\n"
+    
+    if ctx.graph_results:
+        msg += f"\n**Accumulated graph results ({len(ctx.graph_results)}):**\n```json\n{json.dumps(ctx.graph_results, indent=2, default=str)[:1500]}\n```\n"
+    
+    if ctx.retrieved_messages:
+        msg += f"\n**Accumulated messages ({len(ctx.retrieved_messages)}):**\n```json\n{json.dumps(ctx.retrieved_messages, indent=2, default=str)[:1500]}\n```\n"
+    
+    if ctx.web_results:
+        msg += f"\n**Web results ({len(ctx.web_results)}):**\n```json\n{json.dumps(ctx.web_results, indent=2, default=str)[:1500]}\n```\n"
+    
+    return msg
 
 
 def call_the_doctor(
-    ctx: ContextState, 
-    last_result: Optional[Dict] = None, 
-    error: Optional[str] = None
+    llm: LLMService,
+    ctx: ContextState,
+    user_name: str,
+    last_result: Optional[Dict] = None,
+    error: Optional[str] = None,
+    persona: str = ""
 ) -> StellaResponse:
-    # TODO: Build prompt, call LLM with tools, parse response
-    return FinalResponse(content="")
+    
+    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    system_prompt = get_stella_prompt(user_name, current_time, persona)
+    user_message = build_user_message(ctx, last_result, error)
+    
+    response = llm.call_with_tools_sync(
+        system=system_prompt,
+        user=user_message,
+        tools=TOOL_SCHEMAS
+    )
+    
+    if not response or not response.get("tool_calls"):
+        return FinalResponse(content="I couldn't determine how to help.")
+    
+    tool_call = response["tool_calls"][0]
+    name = tool_call["name"]
+    args = json.loads(tool_call["arguments"])
+    
+    if name == "finish":
+        return FinalResponse(content=args.get("response", ""))
+    
+    if name == "request_clarification":
+        return ClarificationRequest(question=args.get("question", ""))
+    
+    return ToolCall(name=name, args=args)   
+    
 
 
 def execute_tool(tools: Tools, name: str, args: Dict) -> Optional[Dict]:
@@ -102,7 +123,14 @@ def update_accumulators(ctx: ContextState, tool_name: str, result):
     elif tool_name == "web_search":
         ctx.web_results.extend(result if isinstance(result, list) else [])
 
-def run(user_query: str, hot_topics: List[str], active_topics: List[str]) -> RunResult:
+def run(user_query: str,
+        user_name: str,
+        hot_topics: List[str], 
+        active_topics: List[str],
+        llm: Optional[LLMService] = None) -> RunResult:
+    
+    if llm is None:
+        llm = LLMService()
     
     context = ContextState(
         user_query=user_query,
@@ -121,7 +149,7 @@ def run(user_query: str, hot_topics: List[str], active_topics: List[str]) -> Run
     while machine.current_state not in terminal_states:
         
         context.current_state = machine.current_state.id
-        response = call_the_doctor(context, last_result, error)
+        response = call_the_doctor(llm, context, user_name, last_result, error)
         
         if isinstance(response, ClarificationRequest):
             valid, reason = machine.validate("request_clarification", {})

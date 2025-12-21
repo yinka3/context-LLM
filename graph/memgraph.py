@@ -185,7 +185,6 @@ class MemGraphStore:
     def get_all_embeddings(self) -> Dict[int, List[float]]:
         """
         Fetch all entity embeddings to hydrate FAISS at startup.
-        Returns: {entity_id: [float, float, ...]}
         """
         query = "MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN e.id as id, e.embedding as vec"
         with self.driver.session() as session:
@@ -220,7 +219,6 @@ class MemGraphStore:
     def get_hot_topic_context(self, hot_topic_names: List[str]):
         """
         Retrieves the top 3 most recently active entities for each Hot Topic.
-        Used ONLY for the Chat LLM context window.
         """
         query = """
         MATCH (t:Topic) WHERE t.name IN $hot_topics
@@ -250,8 +248,6 @@ class MemGraphStore:
     def search_entity(self, query: str, limit: int = 5):
         """
         Search for entities by name or alias.
-        Use this when the user mentions a person, place, or thing and you need to verify it exists or find the correct spelling.
-        Returns: matching entities with their ID, name, summary, and type.
         """
         query_cypher = """
         MATCH (e:Entity)
@@ -268,8 +264,6 @@ class MemGraphStore:
     def get_entity_profile(self, entity_name: str):
         """
         Get the full profile for a specific entity.
-        Use this when the user asks "what do you know about X" or "tell me about X" for a single person, place, or thing.
-        Returns: the entity's summary, type, aliases, topic, and when it was last mentioned.
         """
 
         query = """
@@ -320,9 +314,6 @@ class MemGraphStore:
     def get_recent_activity(self, entity_name: str, hours: int = 24):
         """
         Get recent interactions involving an entity within a time window.
-        Use this when the user asks "what happened with X recently" or "any updates on X" or wants time-filtered information.
-        Adjust hours parameter based on user's timeframe (24 for "today", 168 for "this week", etc).
-        Returns: recent interactions with timestamps and evidence.
         """
         cutoff_ms = int((time.time() - (hours * 3600)) * 1000)
         query = """
@@ -339,8 +330,6 @@ class MemGraphStore:
     def find_connection(self, start_name: str, end_name: str):
         """
         Find the shortest path connecting two entities.
-        Use this when the user asks "how is X connected to Y" or "what's the relationship between X and Y".
-        Returns: step-by-step path showing each entity in the chain, with message references as evidence.
         """
         query = """
         MATCH (start:Entity {canonical_name: $start_name}), (end:Entity {canonical_name: $end_name})
