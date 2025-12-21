@@ -88,47 +88,80 @@ class StateOrchestrator(StateMachine):
         self.ctx_state.call_count += 1
         self.ctx_state.tools_used.append(event)
 
-    async def on_enter_search_messages(self):
-        results = await self.tools.search_messages(self.ctx_state.user_query)
+    def on_enter_search_messages(self):
+        results = self.tools.search_messages(self.ctx_state.user_query)
         self.ctx_state.retrieved_messages.extend(results)
-    
-    async def on_enter_inspect_profile(self):
+
+    def on_enter_inspect_profile(self):
         op = self.ctx_state.operation
-        
         if op == "search":
-            results = await self.tools.search_entities(self.ctx_state.user_query)
+            results = self.tools.search_entities(self.ctx_state.user_query)
             self.ctx_state.entity_profiles.extend(results)
-        else:  # "get" is default
-            result = await self.tools.get_profile(self.ctx_state.target_entity)
+        else:
+            result = self.tools.get_profile(self.ctx_state.target_entity)
             if result:
                 self.ctx_state.entity_profiles.append(result)
                 self.ctx_state.inspected_entity_ids.add(result.get("id"))
 
-    async def on_enter_query_graph(self):
+    def on_enter_query_graph(self):
         op = self.ctx_state.operation
         target = self.ctx_state.target_entity
         
         if op == "path":
-            results = await self.tools.find_path(target, self.ctx_state.second_entity)
+            results = self.tools.find_path(target, self.ctx_state.second_entity)
         elif op == "activity":
-            results = await self.tools.get_recent_activity(target, self.ctx_state.time_window_hours)
-        else:  # "connections" is default
-            results = await self.tools.get_connections(target)
+            results = self.tools.get_recent_activity(target, self.ctx_state.time_window_hours)
+        else:
+            results = self.tools.get_connections(target)
         
         if results:
             self.ctx_state.graph_results.extend(results)
         else:
             self.ctx_state.graph_returned_empty = True
-    
-    async def on_enter_summarize(self):
-        # LLM synthesis happens here — stub for now
+
+    def on_enter_summarize(self):
         pass
 
-    async def on_enter_failed(self):
+    def on_enter_clarify(self):
+        self.ctx_state.call_count = 0
+
+    def on_enter_failed(self):
         self.ctx_state.evidence.append({
             "type": "system",
             "message": "I couldn't find information to answer that."
         })
-
-    async def on_enter_clarify(self):
-        self.ctx_state.call_count = 0 
+        
+    def get_available_transitions(self) -> List[Dict]:
+        """Returns valid transitions from current state with descriptions."""
+        
+        current = self.current_state.id
+        
+        transition_map = {
+            "ready": [
+                {"name": "start_message_search", "description": "Search recent messages for relevant context"},
+                {"name": "start_profile_inspect", "description": "Look up entity profile or search for entities"},
+                {"name": "start_graph_query", "description": "Query relationships, paths, or recent activity"},
+            ],
+            "search_messages": [
+                {"name": "search_to_profile", "description": "Look up an entity found in messages"},
+                {"name": "search_to_clarify", "description": "Ask user for clarification"},
+                {"name": "complete", "description": "Finish and synthesize response"},
+            ],
+            "inspect_profile": [
+                {"name": "inspect_another", "description": "Look up another entity profile"},
+                {"name": "profile_to_graph", "description": "Query relationships for this entity"},
+                {"name": "profile_to_clarify", "description": "Ask user for clarification"},
+                {"name": "complete", "description": "Finish and synthesize response"},
+            ],
+            "query_graph": [
+                {"name": "query_another", "description": "Run another graph query"},
+                {"name": "graph_to_profile", "description": "Look up profile for entity found in graph"},
+                {"name": "graph_to_clarify", "description": "Ask user for clarification"},
+                {"name": "complete", "description": "Finish and synthesize response"},
+            ],
+            "clarify": [
+                {"name": "clarify_restart", "description": "Resume after user clarification"},
+            ],
+        }
+        
+        return transition_map.get(current, [])
