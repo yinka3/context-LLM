@@ -1,8 +1,5 @@
 import asyncio
-import time
 from dotenv import load_dotenv
-import os
-import re
 import redis.asyncio as redis
 from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
@@ -44,8 +41,7 @@ class Context:
         self.redis_client: redis.Redis = redis_client
         self.llm: LLMService = None
         
-        self.store: 'MemGraphStore' = None 
-        self.cpu_executor: ThreadPoolExecutor = None
+        self.store: 'MemGraphStore' = None
         self.nlp_pipe: 'NLPPipeline' = None
         self.ent_resolver: 'EntityResolver' = None
 
@@ -58,14 +54,21 @@ class Context:
         self.trace_logger = get_trace_logger()
 
     @classmethod
-    async def create(cls, user_name: str, topics: List[str] = ["General"]) -> "Context":
+    async def create(
+        cls,
+        user_name: str,
+        ent_resolver: EntityResolver,
+        store: MemGraphStore,
+        cpu_executor: ThreadPoolExecutor,
+        topics: List[str] = ["General"]
+    ) -> "Context":
         redis_conn = AsyncRedisClient().get_client()
         
         instance = cls(user_name, topics, redis_conn)
         instance.llm = LLMService(trace_logger=get_trace_logger())
         
-        instance.store = MemGraphStore()
-        instance.cpu_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ctx_worker")
+        instance.store = store
+        instance.cpu_executor = cpu_executor
         
         loop = asyncio.get_running_loop()
         
@@ -74,9 +77,7 @@ class Context:
             partial(NLPPipeline, llm=instance.llm)
         )
         
-        instance.ent_resolver = await loop.run_in_executor(
-            instance.cpu_executor, EntityResolver
-        )
+        instance.ent_resolver = ent_resolver
 
         await instance._get_or_create_user_entity(user_name)
 
