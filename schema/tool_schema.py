@@ -7,9 +7,10 @@ TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Keywords or phrase to search for"}
+                    "query": {"type": "string", "description": "Keywords or phrase to search for"},
+                    "limit": {"type": "integer", "description": "Max results (default 5)"}
                 },
-                "required": ["query"]
+                "required": ["query", "limit"]
             }
         }
     },
