@@ -6,6 +6,9 @@ import redis.asyncio as redis
 from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 import json
+from jobs.dlq import DLQReplayJob
+from jobs.scheduler import Scheduler
+from jobs.merger import MergeDetectionJob
 from main.processor import BatchProcessor
 from main.service import LLMService
 from redis import exceptions
@@ -19,11 +22,9 @@ from main.entity_resolve import EntityResolver
 from graph.memgraph import MemGraphStore
 from main.prompts import *
 from main.llm_trace import get_trace_logger
-from schedule.scheduler import Scheduler
-from schedule.merger import MergeDetectionJob
-load_dotenv()
 
-STREAM_KEY_AI_RESPONSE = "stream:ai_response"
+
+load_dotenv()
 
 BATCH_SIZE = 5
 PROFILE_INTERVAL = 15
@@ -74,7 +75,14 @@ class Context:
         instance.executor = cpu_executor
         
         loop = asyncio.get_running_loop()
-        
+
+        max_id = await loop.run_in_executor(None, instance.store.get_max_entity_id)
+    
+        current_redis = await redis_conn.get("global:next_ent_id")
+        if not current_redis or int(current_redis) < max_id:
+            await redis_conn.set("global:next_ent_id", max_id)
+            logger.info(f"Startup Sync: Reset global:next_ent_id to {max_id} from Memgraph")
+            
         instance.nlp_pipe = await loop.run_in_executor(
             instance.executor, 
             partial(NLPPipeline, llm=instance.llm)
@@ -99,6 +107,7 @@ class Context:
         instance.scheduler.register(
             MergeDetectionJob(instance.ent_resolver, instance.store)
         )
+        instance.scheduler.register(DLQReplayJob())
         await instance.scheduler.start()
         
         return instance

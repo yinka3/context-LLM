@@ -1,0 +1,80 @@
+import json
+import time
+from loguru import logger
+from schedule.base import BaseJob, JobContext, JobResult
+
+class DLQReplayJob(BaseJob):
+    """
+    Periodically checks the Dead Letter Queue.
+    - Retries 'transient' errors (network blips).
+    - Parks 'fatal' errors (code bugs) so they don't loop forever.
+    """
+    
+    INTERVAL = 300
+    BATCH_SIZE = 50
+    
+
+    TRANSIENT_ERRORS = [
+        "ConnectionError",
+        "TimeoutError",
+        "BusyLoadingError",
+        "Service Unavailable",
+        "Connection refused",
+        "socket.timeout"
+    ]
+
+    @property
+    def name(self) -> str:
+        return "dlq_auto_replay"
+
+    async def should_run(self, ctx: JobContext) -> bool:
+        if not ctx.last_run:
+            return True
+            
+        elapsed = time.time() - ctx.last_run.timestamp()
+        return elapsed >= self.INTERVAL
+
+    async def execute(self, ctx: JobContext) -> JobResult:
+        dlq_key = f"dlq:{ctx.user_name}"
+        park_key = f"dlq:parked:{ctx.user_name}"
+        buffer_key = f"buffer:{ctx.user_name}"
+        
+        queue_len = await ctx.redis.llen(dlq_key)
+        if queue_len == 0:
+            return JobResult(success=True, summary="DLQ empty")
+
+        processed = 0
+        retried = 0
+        parked = 0
+        
+        for _ in range(min(queue_len, self.BATCH_SIZE)):
+            raw_item = await ctx.redis.lpop(dlq_key)
+            if not raw_item:
+                break
+                
+            processed += 1
+            try:
+                entry = json.loads(raw_item)
+                error_msg = str(entry.get("error", ""))
+                messages = entry.get("messages", [])
+                
+                is_transient = any(t in error_msg for t in self.TRANSIENT_ERRORS)
+                
+                if is_transient:
+                    for msg in messages:
+                        await ctx.redis.rpush(buffer_key, json.dumps(msg))
+                    retried += 1
+                    logger.info(f"Auto-healing DLQ item: {error_msg} -> Requeued")
+                else:
+                    entry["parked_at"] = time.time()
+                    await ctx.redis.rpush(park_key, json.dumps(entry))
+                    parked += 1
+                    logger.warning(f"Parking fatal DLQ item: {error_msg}")
+
+            except Exception as e:
+                logger.error(f"Failed to process DLQ item: {e}")
+                await ctx.redis.rpush(park_key, raw_item)
+                parked += 1
+
+        summary = f"Processed {processed}: {retried} retried, {parked} parked"
+        return JobResult(success=True, summary=summary)

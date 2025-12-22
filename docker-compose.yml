@@ -8,6 +8,9 @@ services:
     ports:
       - "6379:6379"
     
+    volumes:
+      - ./redis_data:/data
+    
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -26,6 +29,10 @@ services:
       - "7687:7687"
       - "7474:7474"
       - "3000:3000"
+    
+    volumes:
+      - ./memgraph_data:/var/lib/memgraph
+      - ./memgraph_log:/var/log/memgraph
     
     environment:
       - MEMGRAPH_USER=

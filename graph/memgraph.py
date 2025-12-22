@@ -19,6 +19,16 @@ class MemGraphStore:
     def verify_conn(self):
         self.driver.verify_connectivity()
     
+    def get_max_entity_id(self) -> int:
+        """
+        Returns the highest entity ID currently in the graph.
+        Used on startup to sync Redis counters.
+        """
+        query = "MATCH (e:Entity) RETURN max(e.id) as max_id"
+        with self.driver.session() as session:
+            result = session.run(query).single()
+            return result["max_id"] if result and result["max_id"] is not None else 0
+    
     def _setup_schema(self):
         """
         Create indices and constraints to ensure performance and data integrity.
