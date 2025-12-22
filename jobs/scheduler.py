@@ -4,7 +4,7 @@ from typing import Dict, Optional
 
 from loguru import logger
 from redisclient import AsyncRedisClient
-from schedule.base import BaseJob, JobContext
+from jobs.base import BaseJob, JobContext
 
 
 class Scheduler:

@@ -6,7 +6,7 @@ import signal
 import traceback
 from loguru import logger
 from redis import exceptions
-from logging_setup import setup_logging
+from log.logging_setup import setup_logging
 from redisclient import SyncRedisClient
 from schema.common_pb2 import BatchMessage, MessageType
 from graph.memgraph import MemGraphStore

@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import time
 from dotenv import load_dotenv
@@ -7,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 import json
 from jobs.dlq import DLQReplayJob
+from jobs.profile import ProfileRefinementJob
 from jobs.scheduler import Scheduler
 from jobs.merger import MergeDetectionJob
 from main.processor import BatchProcessor
@@ -21,7 +23,7 @@ from main.nlp_pipe import NLPPipeline
 from main.entity_resolve import EntityResolver
 from graph.memgraph import MemGraphStore
 from main.prompts import *
-from main.llm_trace import get_trace_logger
+from log.llm_trace import get_trace_logger
 
 
 load_dotenv()
@@ -30,7 +32,6 @@ BATCH_SIZE = 5
 PROFILE_INTERVAL = 15
 
 STREAM_KEY_STRUCTURE = "stream:structure"
-STREAM_KEY_PROFILE = "stream:profile"
 BATCH_TIMEOUT_SECONDS = 180.0
 
 class Context:
@@ -39,7 +40,6 @@ class Context:
         self.user_name: str = user_name
         self.active_topics: List[str] = topics
         self.session_emotions: List[str] = []
-        self._session_entity_ids: Set[int] = set()
         self.scheduler: Scheduler = None
         self.redis_client: redis.Redis = redis_client
         self.llm: LLMService = None
@@ -108,6 +108,9 @@ class Context:
             MergeDetectionJob(instance.ent_resolver, instance.store)
         )
         instance.scheduler.register(DLQReplayJob())
+        instance.scheduler.register(
+            ProfileRefinementJob(llm=instance.llm, resolver=instance.ent_resolver, executor=instance.executor)
+        )
         await instance.scheduler.start()
         
         return instance
@@ -358,90 +361,6 @@ class Context:
             logger.critical(f"Redis WRITE failure in _publish_batch. Data potentially lost: {e}")
 
 
-    async def _run_session_profile_updates(self):
-
-        logger.info(f"Profiling {len(self._session_entity_ids)} session entities...")
-        
-        recent_context = await self.get_recent_context(num_messages=75)
-        
-        current_msg_id = await self.redis_client.get("global:next_msg_id")
-        current_msg_id = int(current_msg_id) if current_msg_id else 0
-        
-        semaphore = asyncio.Semaphore(5)
-
-        async def update_single(ent_id: int) -> Optional[Entity]:
-            async with semaphore:
-                profile = self.ent_resolver.entity_profiles.get(ent_id)
-                if not profile:
-                    return None
-                
-                canonical_name = profile.get("canonical_name", "Unknown")
-                entity_type = profile.get("type", "unknown")
-                existing_summary = profile.get("summary", "")
-
-
-                mentions = self.ent_resolver.get_mentions_for_id(ent_id)
-                if not mentions:
-                    logger.debug(f"No mentions for {canonical_name}, skipping profile")
-                    return None
-
-                pattern = re.compile(
-                    r'\b(' + '|'.join(re.escape(m) for m in mentions) + r')\b', 
-                    re.IGNORECASE
-                )
-                
-                observations = [formatted for formatted, raw in recent_context if pattern.search(raw)]
-
-                if not observations:
-                    logger.debug(f"No observations for {canonical_name}, skipping profile")
-                    return None
-                
-                context_text = "\n".join(observations)
-                system_prompt = get_profile_update_prompt(self.user_name)
-                user_content = json.dumps({
-                    "entity_name": canonical_name,
-                    "entity_type": entity_type,
-                    "existing_summary": existing_summary,
-                    "new_observations": context_text,
-                    "known_aliases": mentions
-                }, indent=2)
-                
-                new_summary = await self.llm.call_reasoning(system_prompt, user_content)
-                
-                if not new_summary or new_summary == existing_summary:
-                    return None
-                
-                loop = asyncio.get_running_loop()
-                embedding = await loop.run_in_executor(
-                    self.cpu_executor,
-                    partial(self.ent_resolver.update_profile_summary, ent_id, new_summary)
-                )
-                
-                logger.info(f"Profiled entity {ent_id}: {canonical_name}")
-                
-                return Entity(
-                    id=ent_id,
-                    canonical_name=canonical_name,
-                    type=entity_type,
-                    summary=new_summary,
-                    topic=profile.get("topic", "General"),
-                    embedding=embedding,
-                    last_profiled_msg_id=current_msg_id
-                )
-        
-        results = await asyncio.gather(*[update_single(ent_id) for ent_id in self._session_entity_ids])
-        updates_for_graph = [r for r in results if r is not None]
-        
-        if updates_for_graph:
-            await self._send_batch_to_stream(
-                entities=updates_for_graph,
-                relations=[],
-                type=MessageType.PROFILE_UPDATE,
-                stream_key=STREAM_KEY_PROFILE
-            )
-            logger.info(f"Sent {len(updates_for_graph)} profile updates to stream")
-
-
     async def process_batch(self):
         async with self._batch_processing_lock:
             logger.info("Starting batch processing...")
@@ -562,18 +481,10 @@ class Context:
             logger.info(f"Waiting for {len(self._background_tasks)} background tasks...")
             await asyncio.wait(self._background_tasks, timeout=60)
         
-        if self._session_entity_ids:
-            await self._run_session_profile_updates()
-        
         logger.info("Waiting for graph consumer to sync...")
         await asyncio.sleep(20)
         
         await self.scheduler.stop()
-        
-        mentions = self.ent_resolver.get_mentions()
-        if mentions:
-            await self.redis_client.hset("entity_mentions", mapping=mentions)
-            logger.info(f"Persisted {len(mentions)} mention mappings to Redis")
 
         if self.session_emotions:
             from collections import Counter

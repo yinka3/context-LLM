@@ -1,7 +1,7 @@
 import json
 import time
 from loguru import logger
-from schedule.base import BaseJob, JobContext, JobResult
+from jobs.base import BaseJob, JobContext, JobResult
 
 class DLQReplayJob(BaseJob):
     """

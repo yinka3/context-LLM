@@ -6,7 +6,7 @@ services:
     container_name: vestige-redis
 
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     
     volumes:
       - ./redis_data:/data
@@ -26,17 +26,13 @@ services:
     container_name: vestige-memgraph
 
     ports:
-      - "7687:7687"
-      - "7474:7474"
-      - "3000:3000"
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:3000:3000"
     
     volumes:
       - ./memgraph_data:/var/lib/memgraph
       - ./memgraph_log:/var/log/memgraph
-    
-    environment:
-      - MEMGRAPH_USER=
-      - MEMGRAPH_PWD=
 
     healthcheck:
       test: ["CMD", "mgconsole", "--host", "localhost", "--port", "7687", "-c", "RETURN 1;"]

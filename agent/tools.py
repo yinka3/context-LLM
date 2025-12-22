@@ -17,20 +17,20 @@ class Tools:
         self.resolver = ent_resolver
         self.user_name = user_name
     
-    def _resolve_entity_name(self, query: str) -> Optional[str]:
+    def _resolve_entity_name(self, entity: str) -> Optional[str]:
         """Resolve user input to canonical entity name via exact or fuzzy match."""
         
         
-        entity_id = self.resolver._name_to_id.get(query)
+        entity_id = self.resolver._name_to_id.get(entity)
         if entity_id:
             profile = self.resolver.entity_profiles.get(entity_id)
-            return profile["canonical_name"] if profile else query
+            return profile["canonical_name"] if profile else entity
         
         if not self.resolver._name_to_id:
             return None
         
         result = fuzzy_process.extractOne(
-            query=query,
+            query=entity,
             choices=self.resolver._name_to_id.keys(),
             scorer=fuzz.WRatio,
             score_cutoff=85
@@ -126,6 +126,13 @@ class Tools:
         canonical = self._resolve_entity_name(entity_name)
         if not canonical:
             return None
+        
+        entity_id = self.resolver.get_id(canonical)
+        if entity_id:
+            profile = self.resolver.entity_profiles.get(entity_id)
+            if profile:
+                return profile
+            
         return self.store.get_entity_profile(canonical)
 
     def get_connections(self, entity_name: str, active_only: bool = True) -> List[Dict]:

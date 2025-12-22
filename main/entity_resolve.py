@@ -196,6 +196,12 @@ class EntityResolver:
 
 
         with self._lock:
+
+            #TODO: eventually need to make a better LRU system
+            if len(self.entity_profiles) >= 10000:
+                oldest_id = next(iter(self.entity_profiles))
+                del self.entity_profiles[oldest_id]
+                
             logger.info(f"Adding entity {entity_id}-{profile["canonical_name"]} to resolver indexes.")
 
             profile.setdefault("topic", "General")

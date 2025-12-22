@@ -9,7 +9,7 @@ if not os.getenv("OPENROUTER_API_KEY"):
     sys.exit(1)
 
 from loguru import logger
-from logging_setup import setup_logging
+from log.logging_setup import setup_logging
 from neo4j import GraphDatabase
 from main.context import Context
 from schema.dtypes import MessageData
