@@ -1,11 +1,12 @@
 import asyncio
+from datetime import datetime
 from functools import partial
 import json
 import re
 import time
 from typing import List, Optional, Set
 from loguru import logger
-from jobs.base import BaseJob, JobContext, JobResult
+from jobs.base import BaseJob, JobContext, JobNotifier, JobResult
 from schema.common_pb2 import BatchMessage, Entity, MessageType
 from redis import exceptions
 from main.service import LLMService
@@ -50,38 +51,59 @@ class ProfileRefinementJob(BaseJob):
         return False
 
     async def execute(self, ctx: JobContext) -> JobResult:
-        dirty_key = f"dirty_entities:{ctx.user_name}"
-        
-        raw_ids = await ctx.redis.spop(dirty_key, 50)
-        if not raw_ids:
-            return JobResult(success=True, summary="No entities to update")
-        
-        entity_ids = [int(id_str) for id_str in raw_ids]
-        
+        warning = "⚠️ **Deepening Profiles.** I am reading through recent conversations to update entity details. Please wait a moment for the best results."
 
-        sorted_set_key = f"recent_messages:{ctx.user_name}"
-        recent_msg_ids = await ctx.redis.zrevrange(sorted_set_key, 0, self.MSG_WINDOW - 1)
-        
-        if not recent_msg_ids:
-            await ctx.redis.sadd(dirty_key, *entity_ids)
-            return JobResult(success=False, summary="No context messages found")
+        async with JobNotifier(ctx.redis, warning):
+            dirty_key = f"dirty_entities:{ctx.user_name}"
+            
+            raw_ids = await ctx.redis.spop(dirty_key, 50)
+            if not raw_ids:
+                return JobResult(success=True, summary="No entities to update")
+            
+            entity_ids = [int(id_str) for id_str in raw_ids]
+            
 
-        msg_data_list = await ctx.redis.hmget(f"message_content:{ctx.user_name}", *recent_msg_ids)
+            sorted_set_key = f"recent_messages:{ctx.user_name}"
+            recent_msg_ids = await ctx.redis.zrevrange(sorted_set_key, 0, self.MSG_WINDOW - 1)
+            
+            if not recent_msg_ids:
+                await ctx.redis.sadd(dirty_key, *entity_ids)
+                return JobResult(success=False, summary="No context messages found")
 
-        recent_context = []
-        for msg in msg_data_list:
-             if msg:
-                 recent_context.append(json.loads(msg)['message'])
-        
-        updates = await self._run_updates(ctx.user_name, entity_ids, recent_context)
-        
-        if updates:
-            await self._publish_updates(ctx, updates)
+            msg_data_list = await ctx.redis.hmget(f"message_content:{ctx.user_name}", *recent_msg_ids)
 
-        return JobResult(
-            success=True, 
-            summary=f"Refined {len(updates)} profiles from {len(entity_ids)} candidates"
-        )
+            recent_context = []
+            now = datetime.now()
+            
+            for msg_data in msg_data_list:
+                if msg_data:
+                    parsed = json.loads(msg_data)
+                    raw = parsed['message']
+                    ts = datetime.fromisoformat(parsed['timestamp'])
+                    
+                    delta = (now - ts).total_seconds()
+                    if delta < 3600:
+                        mins = int(delta // 60)
+                        relative = f"{mins}m ago" if mins > 1 else "just now"
+                    elif delta < 86400:
+                        hours = int(delta // 3600)
+                        relative = f"{hours}h ago"
+                    else:
+                        days = int(delta // 86400)
+                        relative = f"{days}d ago"
+                        
+                    formatted = f"({relative}) {raw}"
+                    recent_context.append((formatted, raw))
+            
+            updates = await self._run_updates(ctx, entity_ids, recent_context)
+            
+            if updates:
+                await self._publish_updates(ctx, updates)
+
+            return JobResult(
+                success=True, 
+                summary=f"Refined {len(updates)} profiles from {len(entity_ids)} candidates"
+            )
 
     async def _run_updates(self, ctx: JobContext, entity_ids: List[int], recent_context: List[tuple]):
         current_msg_id = await ctx.redis.get("global:next_msg_id")

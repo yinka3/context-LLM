@@ -182,7 +182,6 @@ class Context:
         )
         
         self.ent_resolver.entity_profiles[new_id]["summary"] = profile["summary"]
-        self._session_entity_ids.add(new_id)
         user_entity = Entity(
             id=new_id,
             canonical_name=user_name,
@@ -362,6 +361,10 @@ class Context:
 
 
     async def process_batch(self):
+        while await self.redis_client.exists("system:maintenance_lock"):
+            logger.warning("Maintenance Lock Active: Pausing Batch Processing...")
+            await asyncio.sleep(2)
+            
         async with self._batch_processing_lock:
             logger.info("Starting batch processing...")
             
@@ -376,7 +379,6 @@ class Context:
             if not result.success:
                 await self.batch_processor.move_to_dead_letter(messages, result.error)
             else:
-                self._session_entity_ids.update(result.entity_ids)
                 self.session_emotions.extend(result.emotions)
                 
                 if result.extraction_result:

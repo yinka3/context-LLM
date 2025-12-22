@@ -1,11 +1,11 @@
 import asyncio
 import json
 from datetime import datetime, timezone
+import time
 from typing import TYPE_CHECKING
 import numpy as np
 from loguru import logger
-
-from schedule.base import BaseJob, JobContext, JobResult
+from jobs.base import BaseJob, JobContext, JobResult, JobNotifier
 
 if TYPE_CHECKING:
     from main.entity_resolve import EntityResolver
@@ -41,52 +41,84 @@ class MergeDetectionJob(BaseJob):
         return not already_ran
     
     async def execute(self, ctx: JobContext) -> JobResult:
-        await ctx.redis.set(f"merge_ran:{ctx.user_name}", "true")
-        
-        loop = asyncio.get_running_loop()
-        
-        candidates = await loop.run_in_executor(
-            None, self.ent_resolver.detect_merge_candidates
-        )
-        
-        if not candidates:
-            return JobResult(success=True, summary="No merge candidates found")
-        
-        auto_merge = [c for c in candidates if c["cross_score"] >= self.AUTO_MERGE_THRESHOLD]
-        hitl = [c for c in candidates if self.HITL_THRESHOLD <= c["cross_score"] < self.AUTO_MERGE_THRESHOLD]
-        
-        logger.info(f"Merge split: {len(auto_merge)} auto, {len(hitl)} HITL")
-        
-        merged_ids = set()
-        successful = 0
-        failed = 0
-        
-        for candidate in auto_merge:
-            primary_id = candidate["primary_id"]
-            secondary_id = candidate["secondary_id"]
-            
-            if primary_id in merged_ids or secondary_id in merged_ids:
-                continue
-            
-            success = await self._execute_merge(primary_id, secondary_id)
-            
-            if success:
-                merged_ids.add(secondary_id)
-                successful += 1
-                self._sync_resolver(primary_id, secondary_id)
-            else:
-                failed += 1
-        
-        proposals_stored = await self._store_hitl_proposals(ctx, hitl, merged_ids)
-        
-        if successful > 0:
-            mentions = self.ent_resolver.get_mentions()
-            await ctx.redis.hset("entity_mentions", mapping=mentions)
-        
-        return JobResult(
-            success=True,
-            summary=f"{successful} merged, {failed} failed, {proposals_stored} HITL proposals"
-        )
+        warning = "⚠️ **Memory Consolidation in Progress.** I am currently merging duplicate entities. Answers regarding these people might be temporarily inconsistent."
+
+        async with JobNotifier(ctx.redis, warning):
+            lock_key = "system:maintenance_lock"
+            await ctx.redis.set(lock_key, "true", ex=600)
+
+            try:
+                stream_key = "stream:structure"
+                group_name = "group:graph_builders"
+                
+                logger.info("Waiting for stream to drain...")
+                start_wait = time.time()
+                
+                while True:
+                    if time.time() - start_wait > 60:
+                        logger.error("Timeout waiting for stream to drain. Aborting Merge.")
+                        return JobResult(success=False, summary="Stream drain timeout")
+
+                    try:
+                        groups = await ctx.redis.xinfo_groups(stream_key)
+                        target_group = next((g for g in groups if g["name"] == group_name), None)
+                        
+                        if target_group and (target_group["lag"] > 0 or target_group["pending"] > 0):
+                            await asyncio.sleep(1)
+                            continue
+                        break 
+                    except Exception:
+                        break
+
+                await ctx.redis.set(f"merge_ran:{ctx.user_name}", "true")
+                
+                loop = asyncio.get_running_loop()
+                
+                candidates = await loop.run_in_executor(
+                    None, self.ent_resolver.detect_merge_candidates
+                )
+                
+                if not candidates:
+                    return JobResult(success=True, summary="No merge candidates found")
+                
+                auto_merge = [c for c in candidates if c["cross_score"] >= self.AUTO_MERGE_THRESHOLD]
+                hitl = [c for c in candidates if self.HITL_THRESHOLD <= c["cross_score"] < self.AUTO_MERGE_THRESHOLD]
+                
+                logger.info(f"Merge split: {len(auto_merge)} auto, {len(hitl)} HITL")
+                
+                merged_ids = set()
+                successful = 0
+                failed = 0
+                
+                for candidate in auto_merge:
+                    primary_id = candidate["primary_id"]
+                    secondary_id = candidate["secondary_id"]
+                    
+                    if primary_id in merged_ids or secondary_id in merged_ids:
+                        continue
+                    
+                    success = await self._execute_merge(primary_id, secondary_id)
+                    
+                    if success:
+                        merged_ids.add(secondary_id)
+                        successful += 1
+                        self._sync_resolver(primary_id, secondary_id)
+                    else:
+                        failed += 1
+                
+                proposals_stored = await self._store_hitl_proposals(ctx, hitl, merged_ids)
+                
+                if successful > 0:
+                    mentions = self.ent_resolver.get_mentions()
+                    await ctx.redis.hset("entity_mentions", mapping=mentions)
+            finally:
+                await ctx.redis.delete(lock_key)
+                logger.info("Maintenance Complete. Resuming Write Path.")
+
+            return JobResult(
+                success=True,
+                summary=f"{successful} merged, {failed} failed, {proposals_stored} HITL proposals"
+            )
     
     async def on_shutdown(self, ctx: JobContext) -> None:
         """Set pending flag so next session picks up merge work."""

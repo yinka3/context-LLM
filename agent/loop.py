@@ -176,7 +176,7 @@ def summarize_result(tool_name: str, result: Dict) -> Tuple[str, int]:
 
 
 
-def run(user_query: str,
+async def run(user_query: str,
         user_name: str,
         conversation_history: List[Dict],
         hot_topics: List[str], 
@@ -185,6 +185,14 @@ def run(user_query: str,
         store: MemGraphStore,
         ent_resolver: EntityResolver
         ) -> RunResult:
+    
+    system_warning = ""
+    try:
+        raw_warning = await ent_resolver.redis_client.get("system:active_job_warning")
+        if raw_warning:
+            system_warning = f"{raw_warning.decode()}\n\n---\n\n"
+    except Exception as e:
+        logger.error(f"Failed to check system warning: {e}")
     
     trace = QueryTrace(
         trace_id=str(uuid.uuid4()),
@@ -196,7 +204,8 @@ def run(user_query: str,
         user_query=user_query,
         hot_topics=hot_topics,
         active_topics=active_topics,
-        trace_id=trace.trace_id
+        trace_id=trace.trace_id,
+        history=conversation_history
     )
     machine = StateOrchestrator(context)
     tools = Tools(user_name, store, ent_resolver)
@@ -218,9 +227,13 @@ def run(user_query: str,
             valid, reason = machine.validate("request_clarification", {})
             if valid:
                 machine.request_clarification()
+                final_q = response.question
+                if system_warning:
+                    final_q = system_warning + final_q
+
                 return ClarificationResult(
                     status="clarification_needed",
-                    question=response.question,
+                    question=final_q,
                     tools_used=context.tools_used,
                     state=machine.current_state.id
                 )
@@ -234,9 +247,13 @@ def run(user_query: str,
             if valid:
                 machine.record_call("finish", {})
                 machine.finish()
+                final_response_text = response.content
+                if system_warning:
+                    final_response_text = system_warning + final_response_text
+
                 return CompleteResult(
                     status="complete",
-                    response=response.content,
+                    response=final_response_text,
                     tools_used=context.tools_used,
                     state=machine.current_state.id,
                     messages=context.retrieved_messages,
@@ -283,7 +300,7 @@ def run(user_query: str,
             result_summary=result_summary,
             result_count=result_count,
             duration_ms=(time.perf_counter() - step_start) * 1000,
-            error=last_result.get("error")
+            error=last_result.get("error") if isinstance(last_result, dict) else None
         ))
 
 
@@ -300,7 +317,7 @@ def run(user_query: str,
 
     return CompleteResult(
         status="complete",
-        response="",
+        response=system_warning + "I encountered a state error and could not finish.",
         tools_used=context.tools_used,
         state=machine.current_state.id,
         messages=context.retrieved_messages,

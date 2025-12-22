@@ -11,6 +11,7 @@ class ContextState:
     current_state: str = "start"
     trace_id: str = ""
     current_step: int = 0
+    history: List[Dict] = field(default_factory=list)
     inspected_entity_ids: Set[int] = field(default_factory=set)
     hot_topics: List[str] = field(default_factory=list)
     active_topics: List[str] = field(default_factory=list)
