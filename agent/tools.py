@@ -1,14 +1,51 @@
-from typing import List, Dict, Optional
+import json
+from typing import List, Dict, Optional, TYPE_CHECKING
 
-from graph.memgraph import MemGraphStore
+import faiss
+import numpy as np
+from rapidfuzz import process as fuzzy_process, fuzz
+if TYPE_CHECKING:
+    from main.entity_resolve import EntityResolver
+    from graph.memgraph import MemGraphStore
+
 
 
 class Tools:
     
-    def __init__(self, store: Optional[MemGraphStore] = None):
-        self.store = store or MemGraphStore()
+    def __init__(self, user_name: str, store: 'MemGraphStore', ent_resolver: 'EntityResolver'):
+        self.store = store
+        self.resolver = ent_resolver
+        self.user_name = user_name
+    
+    def _resolve_entity_name(self, query: str) -> Optional[str]:
+        """Resolve user input to canonical entity name via exact or fuzzy match."""
+        
+        
+        entity_id = self.resolver._name_to_id.get(query)
+        if entity_id:
+            profile = self.resolver.entity_profiles.get(entity_id)
+            return profile["canonical_name"] if profile else query
+        
+        if not self.resolver._name_to_id:
+            return None
+        
+        result = fuzzy_process.extractOne(
+            query=query,
+            choices=self.resolver._name_to_id.keys(),
+            scorer=fuzz.WRatio,
+            score_cutoff=85
+        )
+        
+        if result:
+            matched_name, score, _ = result
+            entity_id = self.resolver._name_to_id[matched_name]
+            profile = self.resolver.entity_profiles.get(entity_id)
+            return profile["canonical_name"] if profile else matched_name
+        
+        return None
 
-    def search_messages(self, query: str) -> List[Dict]:
+    
+    def search_messages(self, query: str, limit: int = 5) -> List[Dict]:
         """
         Search past user messages by semantic similarity.
         Use when looking for what the user said about a topic, event, or person.
@@ -16,10 +53,50 @@ class Tools:
         
         Args:
             query: Keywords or phrase to search for
+            limit: Max results (default 5)
         
         Returns: List of messages with content, timestamp, and relevance score.
         """
-        return []
+        redis = self.resolver.redis_client
+        content_key = f"message_content:{self.user_name}"
+        
+        all_messages = redis.hgetall(content_key)
+        if not all_messages:
+            return []
+        
+        msg_ids = []
+        texts = []
+        parsed_data = {}
+        
+        for msg_id, msg_data in all_messages.items():
+            msg_id = msg_id.decode() if isinstance(msg_id, bytes) else msg_id
+            parsed = json.loads(msg_data)
+            msg_ids.append(msg_id)
+            texts.append(parsed["message"])
+            parsed_data[msg_id] = parsed
+        
+        all_texts = [query] + texts
+        embeddings = self.resolver.embedding_model.encode(all_texts)
+        faiss.normalize_L2(embeddings)
+        
+        query_vec = embeddings[0]
+        msg_vecs = embeddings[1:]
+        
+        scores = np.dot(msg_vecs, query_vec)
+        top_indices = np.argsort(scores)[::-1][:limit]
+        
+        results = []
+        for idx in top_indices:
+            msg_id = msg_ids[idx]
+            results.append({
+                "id": msg_id,
+                "message": parsed_data[msg_id]["message"],
+                "timestamp": parsed_data[msg_id]["timestamp"],
+                "score": float(scores[idx])
+            })
+        
+        return results
+
 
     def search_entities(self, query: str, limit: int = 5) -> List[Dict]:
         """
@@ -46,7 +123,10 @@ class Tools:
         Returns: Full profile with summary, type, aliases, topic, last_mentioned.
         Returns None if entity not found.
         """
-        return self.store.get_entity_profile(entity_name)
+        canonical = self._resolve_entity_name(entity_name)
+        if not canonical:
+            return None
+        return self.store.get_entity_profile(canonical)
 
     def get_connections(self, entity_name: str, active_only: bool = True) -> List[Dict]:
         """
@@ -59,7 +139,10 @@ class Tools:
         
         Returns: List of connections with target entity, connection strength, evidence message IDs.
         """
-        return self.store.get_related_entities([entity_name], active_only) or []
+        canonical = self._resolve_entity_name(entity_name)
+        if not canonical:
+            return []
+        return self.store.get_related_entities([canonical], active_only) or []
 
     def get_recent_activity(self, entity_name: str, hours: int = 24) -> List[Dict]:
         """
@@ -72,7 +155,10 @@ class Tools:
         
         Returns: Recent interactions with timestamps and evidence message IDs.
         """
-        return self.store.get_recent_activity(entity_name, hours) or []
+        canonical = self._resolve_entity_name(entity_name)
+        if not canonical:
+            return []
+        return self.store.get_recent_activity(canonical, hours) or []
 
     def find_path(self, entity_a: str, entity_b: str) -> List[Dict]:
         """
@@ -87,7 +173,11 @@ class Tools:
         Returns: Step-by-step path showing each entity in the chain with evidence.
         Returns empty list if no connection found.
         """
-        return self.store.find_connection(entity_a, entity_b) or []
+        canonical_a = self._resolve_entity_name(entity_a)
+        canonical_b = self._resolve_entity_name(entity_b)
+        if not canonical_a or not canonical_b:
+            return []
+        return self.store.find_connection(canonical_a, canonical_b) or []
 
     def get_hot_topic_context(self, hot_topics: List[str]) -> Dict[str, List[Dict]]:
         """

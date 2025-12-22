@@ -9,6 +9,8 @@ class ContextState:
     max_calls: int = 5
     user_query: str = ""
     current_state: str = "start"
+    trace_id: str = ""
+    current_step: int = 0
     inspected_entity_ids: Set[int] = field(default_factory=set)
     hot_topics: List[str] = field(default_factory=list)
     active_topics: List[str] = field(default_factory=list)
