@@ -4,18 +4,19 @@ from typing import List, Dict, Optional, TYPE_CHECKING
 import faiss
 import numpy as np
 from rapidfuzz import process as fuzzy_process, fuzz
-if TYPE_CHECKING:
-    from main.entity_resolve import EntityResolver
-    from graph.memgraph import MemGraphStore
+import redis
+from main.entity_resolve import EntityResolver
+from db.memgraph import MemGraphStore
 
 
 
 class Tools:
     
-    def __init__(self, user_name: str, store: 'MemGraphStore', ent_resolver: 'EntityResolver'):
+    def __init__(self, user_name: str, store: MemGraphStore, ent_resolver: EntityResolver, redis_client: redis.Redis):
         self.store = store
         self.resolver = ent_resolver
         self.user_name = user_name
+        self.redis = redis_client
     
     def _resolve_entity_name(self, entity: str) -> Optional[str]:
         """Resolve user input to canonical entity name via exact or fuzzy match."""
@@ -37,7 +38,7 @@ class Tools:
         )
         
         if result:
-            matched_name, score, _ = result
+            matched_name, _, _ = result
             entity_id = self.resolver._name_to_id[matched_name]
             profile = self.resolver.entity_profiles.get(entity_id)
             return profile["canonical_name"] if profile else matched_name
@@ -57,10 +58,8 @@ class Tools:
         
         Returns: List of messages with content, timestamp, and relevance score.
         """
-        redis = self.resolver.redis_client
         content_key = f"message_content:{self.user_name}"
-        
-        all_messages = redis.hgetall(content_key)
+        all_messages = self.redis.hgetall(content_key)
         if not all_messages:
             return []
         

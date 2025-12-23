@@ -1,15 +1,13 @@
 from datetime import datetime, timezone
 import json
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import uuid
 
 from loguru import logger
-
 from agent.orchestrate import ContextState, StateOrchestrator
 from agent.tools import Tools
-from graph.memgraph import MemGraphStore
-from main.entity_resolve import EntityResolver
+from redisclient import AsyncRedisClient, SyncRedisClient
 from main.service import LLMService
 from main.system_prompt import get_stella_prompt
 from schema.dtypes import (
@@ -24,6 +22,10 @@ from schema.dtypes import (
     TraceEntry
 )
 from schema.tool_schema import TOOL_SCHEMAS
+
+if TYPE_CHECKING:
+    from db.memgraph import MemGraphStore
+    from main.entity_resolve import EntityResolver
 
 def build_user_message(
     ctx: ContextState,
@@ -80,7 +82,7 @@ def call_the_doctor(
     
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     system_prompt = get_stella_prompt(user_name, current_time, persona)
-    user_message = build_user_message(ctx, last_result, error)
+    user_message = build_user_message(ctx, ctx.history, last_result, error)
     
     response = llm.call_with_tools_sync(
         system=system_prompt,
@@ -103,7 +105,6 @@ def call_the_doctor(
     
     return ToolCall(name=name, args=args)   
     
-
 
 def execute_tool(tools: Tools, name: str, args: Dict) -> Optional[Dict]:
     dispatch = {
@@ -182,13 +183,14 @@ async def run(user_query: str,
         hot_topics: List[str], 
         active_topics: List[str],
         llm: LLMService,
-        store: MemGraphStore,
-        ent_resolver: EntityResolver
+        store: 'MemGraphStore',
+        ent_resolver: 'EntityResolver',
+        redis_client: AsyncRedisClient
         ) -> RunResult:
     
     system_warning = ""
     try:
-        raw_warning = await ent_resolver.redis_client.get("system:active_job_warning")
+        raw_warning = await redis_client.get_client().get("system:active_job_warning")
         if raw_warning:
             system_warning = f"{raw_warning.decode()}\n\n---\n\n"
     except Exception as e:
@@ -208,7 +210,8 @@ async def run(user_query: str,
         history=conversation_history
     )
     machine = StateOrchestrator(context)
-    tools = Tools(user_name, store, ent_resolver)
+    sync_redis = SyncRedisClient().get_client()
+    tools = Tools(user_name, store, ent_resolver, sync_redis)
 
     if hot_topics:
         context.hot_topic_context = tools.get_hot_topic_context(hot_topics)
@@ -220,6 +223,14 @@ async def run(user_query: str,
         
         context.current_state = machine.current_state.id
         context.current_step += 1
+        if context.call_count >= context.max_calls:
+            if machine.current_state not in terminal_states:
+                return ClarificationResult(
+                    status="clarification_needed",
+                    question="I wasn't able to find enough information to answer that. Could you be more specific or rephrase?",
+                    tools_used=context.tools_used,
+                    state=machine.current_state.id
+                )
         step_start = time.perf_counter()
         response = call_the_doctor(llm, context, user_name, last_result, error)
         

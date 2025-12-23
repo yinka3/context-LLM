@@ -3,17 +3,14 @@ from datetime import datetime
 from functools import partial
 import json
 import re
-import time
-from typing import List, Optional, Set
+from typing import List, Optional
 from loguru import logger
+from db.memgraph import MemGraphStore
 from jobs.base import BaseJob, JobContext, JobNotifier, JobResult
-from schema.common_pb2 import BatchMessage, Entity, MessageType
-from redis import exceptions
 from main.service import LLMService
 from main.entity_resolve import EntityResolver
 from main.prompts import get_profile_update_prompt
 
-STREAM_KEY_PROFILE = "stream:profile" 
 
 class ProfileRefinementJob(BaseJob):
     """
@@ -29,9 +26,10 @@ class ProfileRefinementJob(BaseJob):
     VOLUME_THRESHOLD = 30
     IDLE_THRESHOLD = 300
     
-    def __init__(self, llm: LLMService, resolver: EntityResolver, executor):
+    def __init__(self, llm: LLMService, resolver: EntityResolver, store: MemGraphStore, executor):
         self.llm = llm
         self.resolver = resolver
+        self.store = store
         self.executor = executor
 
     @property
@@ -98,7 +96,7 @@ class ProfileRefinementJob(BaseJob):
             updates = await self._run_updates(ctx, entity_ids, recent_context)
             
             if updates:
-                await self._publish_updates(ctx, updates)
+                await self._write_updates(updates)
 
             return JobResult(
                 success=True, 
@@ -111,7 +109,7 @@ class ProfileRefinementJob(BaseJob):
         
         semaphore = asyncio.Semaphore(5)
 
-        async def update_single(ent_id: int) -> Optional[Entity]:
+        async def update_single(ent_id: int) -> Optional[dict]:
             async with semaphore:
                 profile = self.resolver.entity_profiles.get(ent_id)
                 if not profile:
@@ -158,43 +156,34 @@ class ProfileRefinementJob(BaseJob):
                 
                 logger.info(f"Refined profile for {canonical_name} (ID: {ent_id})")
                 
-                return Entity(
-                    id=ent_id,
-                    canonical_name=canonical_name,
-                    type=entity_type,
-                    summary=new_summary,
-                    topic=profile.get("topic", "General"),
-                    embedding=embedding,
-                    last_profiled_msg_id=current_msg_id
-                )
+                return {
+                    "id": ent_id,
+                    "canonical_name": canonical_name,
+                    "summary": new_summary,
+                    "topic": profile.get("topic", "General"),
+                    "embedding": embedding,
+                    "last_msg_id": current_msg_id
+                }
         
         results = await asyncio.gather(*[update_single(eid) for eid in entity_ids])
         return [r for r in results if r is not None]
 
-    async def _publish_updates(self, ctx: JobContext, updates: List[Entity]):
-        """
-        Migrated from Context._send_batch_to_stream.
-        Publishes the PROFILE_UPDATE batch to Redis Stream.
-        """
-        batch = BatchMessage(
-            type=MessageType.PROFILE_UPDATE,
-            list_ents=updates,
-            list_relations=[]
-        )
+    async def _write_updates(self, updates: List[dict]):
+        """Write profile updates directly to Memgraph."""
+        loop = asyncio.get_running_loop()
         
-        serialized_data = batch.SerializeToString()
+        for update in updates:
+            await loop.run_in_executor(
+                self.executor,
+                partial(
+                    self.store.update_entity_profile,
+                    entity_id=update["id"],
+                    canonical_name=update["canonical_name"],
+                    summary=update["summary"],
+                    embedding=update["embedding"],
+                    last_msg_id=update["last_msg_id"],
+                    topic=update["topic"]
+                )
+            )
         
-        try:
-            batch_id = f"profile_job_{int(time.time())}"
-            
-            stream_payload = {
-                'data': serialized_data,
-                'batch_id': batch_id,
-                'timestamp': str(time.time())
-            }
-            
-            await ctx.redis.xadd(STREAM_KEY_PROFILE, stream_payload)
-            logger.info(f"Published {len(updates)} profile updates to {STREAM_KEY_PROFILE}")
-
-        except exceptions.RedisError as e:
-            logger.error(f"Failed to publish profile updates: {e}")
+        logger.info(f"Wrote {len(updates)} profile updates to graph")

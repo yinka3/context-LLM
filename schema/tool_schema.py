@@ -94,7 +94,8 @@ TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query"}
+                    "query": {"type": "string",
+                              "description": "Search query"}
                 },
                 "required": ["query"]
             }

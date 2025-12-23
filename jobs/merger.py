@@ -9,7 +9,7 @@ from jobs.base import BaseJob, JobContext, JobResult, JobNotifier
 
 if TYPE_CHECKING:
     from main.entity_resolve import EntityResolver
-    from graph.memgraph import MemGraphStore
+    from db.memgraph import MemGraphStore
 
 
 class MergeDetectionJob(BaseJob):
@@ -46,30 +46,7 @@ class MergeDetectionJob(BaseJob):
         async with JobNotifier(ctx.redis, warning):
             lock_key = "system:maintenance_lock"
             await ctx.redis.set(lock_key, "true", ex=600)
-
             try:
-                stream_key = "stream:structure"
-                group_name = "group:graph_builders"
-                
-                logger.info("Waiting for stream to drain...")
-                start_wait = time.time()
-                
-                while True:
-                    if time.time() - start_wait > 60:
-                        logger.error("Timeout waiting for stream to drain. Aborting Merge.")
-                        return JobResult(success=False, summary="Stream drain timeout")
-
-                    try:
-                        groups = await ctx.redis.xinfo_groups(stream_key)
-                        target_group = next((g for g in groups if g["name"] == group_name), None)
-                        
-                        if target_group and (target_group["lag"] > 0 or target_group["pending"] > 0):
-                            await asyncio.sleep(1)
-                            continue
-                        break 
-                    except Exception:
-                        break
-
                 await ctx.redis.set(f"merge_ran:{ctx.user_name}", "true")
                 
                 loop = asyncio.get_running_loop()
@@ -107,10 +84,7 @@ class MergeDetectionJob(BaseJob):
                         failed += 1
                 
                 proposals_stored = await self._store_hitl_proposals(ctx, hitl, merged_ids)
-                
-                if successful > 0:
-                    mentions = self.ent_resolver.get_mentions()
-                    await ctx.redis.hset("entity_mentions", mapping=mentions)
+                                
             finally:
                 await ctx.redis.delete(lock_key)
                 logger.info("Maintenance Complete. Resuming Write Path.")

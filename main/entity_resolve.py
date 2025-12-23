@@ -6,16 +6,14 @@ import faiss
 import re
 import numpy as np
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from graph.memgraph import MemGraphStore
-from redisclient import SyncRedisClient
+from db.memgraph import MemGraphStore
+
 
 
 class EntityResolver:
 
-    def __init__(self, embedding_model='dunzhang/stella_en_1.5B_v5'):
-
- 
-        self.redis_client = SyncRedisClient().get_client()
+    def __init__(self, store: 'MemGraphStore', embedding_model='dunzhang/stella_en_1.5B_v5'):
+        self.store = store
         
         self.embedding_model = SentenceTransformer(embedding_model, trust_remote_code=True, device='cpu')
         self.cross_encoder = CrossEncoder('BAAI/bge-reranker-v2-m3', device='cpu')
@@ -27,88 +25,61 @@ class EntityResolver:
         self._name_to_id = {}
         self._lock = threading.RLock()
     
-        self._hydrate_aliases()
-        self.store = MemGraphStore()
-        self._hydrate_vectors()
+        self._hydrate_from_store()
 
-    def _hydrate_aliases(self):
+    def _hydrate_from_store(self):
+        """Populate all resolver structures from Memgraph."""
         try:
-            stored_mentions = self.redis_client.hgetall("entity_mentions")
-            with self._lock:
-                if stored_mentions:
-                    self._name_to_id = {k.decode(): int(v) for k, v in stored_mentions.items()}
-                    logger.info(f"Hydrated EntityResolver with {len(self._name_to_id)} aliases from Redis.")
-                else:
-                    logger.warning("Redis alias cache is empty. Attempting Cold Sync from Memgraph...")
-                    
-                    if not hasattr(self, 'store'):
-                        self.store = MemGraphStore()
-
-                    full_mapping = self.store.get_all_aliases_map()
-                    
-                    if full_mapping:
-                        self._name_to_id = full_mapping
-                        
-                        try:
-                            self.redis_client.hset("entity_mentions", mapping=full_mapping)
-                            logger.info(f"Cold Sync Successful: Restored {len(full_mapping)} aliases from Memgraph to Redis.")
-                        except Exception as e:
-                            logger.error(f"Failed to refill Redis after Cold Sync: {e}")
-                    else:
-                        logger.info("Memgraph is also empty. Starting with fresh Identity Map.")
-                          
-        except Exception as e:
-            logger.critical(f"Failed to hydrate from Redis: {e}")
-    
-    def _hydrate_vectors(self):
-        try:
-            logger.info("Hydrating FAISS vectors from Memgraph...")
-            embeddings_map = self.store.get_all_embeddings()
+            entities = self.store.get_all_entities_for_hydration()
             
-            if not embeddings_map:
-                logger.info("No vectors found in Memgraph.")
+            if not entities:
+                logger.info("No entities in Memgraph. Starting fresh.")
                 return
-
+            
             ids = []
             vectors = []
             
-            for eid, vec in embeddings_map.items():
-                if len(vec) == self.embedding_dim:
-                    ids.append(eid)
-                    vectors.append(vec)
+            with self._lock:
+                for ent in entities:
+                    ent_id = ent["id"]
+                    canonical = ent["canonical_name"]
+                    aliases = ent["aliases"] or []
+                    embedding = ent["embedding"]
+                    
+                    self._name_to_id[canonical] = ent_id
+                    for alias in aliases:
+                        self._name_to_id[alias] = ent_id
+                    
+                    self.entity_profiles[ent_id] = {
+                        "canonical_name": canonical,
+                        "type": ent["type"],
+                        "topic": ent["topic"] or "General",
+                        "summary": ent["summary"] or ""
+                    }
+                    
+                    if embedding and len(embedding) == self.embedding_dim:
+                        ids.append(ent_id)
+                        vectors.append(embedding)
+                
+                if ids:
+                    self.index_id_map.add_with_ids(
+                        np.array(vectors, dtype=np.float32),
+                        np.array(ids, dtype=np.int64)
+                    )
             
-            if ids:
-                self.index_id_map.add_with_ids(
-                    np.array(vectors, dtype=np.float32),
-                    np.array(ids, dtype=np.int64)
-                )
-            logger.info(f"Restored {len(ids)} vectors to FAISS.")
+            logger.info(f"Hydrated {len(self.entity_profiles)} entities, {len(ids)} vectors from Memgraph")
             
         except Exception as e:
-            logger.error(f"Failed to hydrate vectors: {e}")
+            logger.error(f"Hydration failed: {e}")
+            raise
 
-    def set_mentions(self, mentions: Dict[str, int]):
-        """Set _name_to_id from external source (Redis)."""
-        with self._lock:
-            self._name_to_id.update(mentions)
-    
     def get_mentions(self) -> Dict[str, int]:
         """Get copy of _name_to_id for persistence."""
         with self._lock:
             return self._name_to_id.copy()
     
     def get_id(self, name: str) -> Optional[int]:
-        if name in self._name_to_id:
-            return self._name_to_id[name]
-        
-        redis_id = self.redis_client.hget("entity_mentions", name)
-        if redis_id:
-            entity_id = int(redis_id)
-            with self._lock:
-                self._name_to_id[name] = entity_id
-            return entity_id
-            
-        return None
+        return self._name_to_id.get(name)
     
     def get_mentions_for_id(self, entity_id: int) -> List[str]:
         return [mention for mention, eid in self._name_to_id.items() if eid == entity_id]
@@ -139,13 +110,6 @@ class EntityResolver:
                 if mention not in self._name_to_id:
                     self._name_to_id[mention] = entity_id
                     new_aliases[mention] = entity_id
-            
-            if new_aliases:
-                try:
-                    self.redis_client.hset("entity_mentions", mapping=new_aliases)
-                    logger.debug(f"Sent {len(new_aliases)} to Redis store for entity {entity_id}")
-                except Exception as e:
-                    logger.error(f"Failed to persist new aliases: {e}")
 
             return entity_id, len(new_aliases) > 0
     
@@ -173,15 +137,6 @@ class EntityResolver:
             self._name_to_id[canonical_name] = entity_id
             for mention in mentions:
                 self._name_to_id[mention] = entity_id
-
-            mapping_update = {m: entity_id for m in mentions}
-            mapping_update[canonical_name] = entity_id
-
-            try:
-                self.redis_client.hset("entity_mentions", mapping=mapping_update)
-                logger.debug(f"Persisted {len(mapping_update)} aliases for {canonical_name} to Redis.")
-            except Exception as e:
-                logger.error(f"CRITICAL: Failed to persist entity mappings to Redis: {e}")
 
         return embedding
 

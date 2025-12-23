@@ -1,7 +1,4 @@
 import asyncio
-import os
-import re
-import time
 from dotenv import load_dotenv
 import redis.asyncio as redis
 from concurrent.futures import ThreadPoolExecutor
@@ -13,15 +10,13 @@ from jobs.scheduler import Scheduler
 from jobs.merger import MergeDetectionJob
 from main.processor import BatchProcessor
 from main.service import LLMService
-from redis import exceptions
 from redisclient import AsyncRedisClient
 from typing import List, Set, Tuple
 from functools import partial
 from schema.dtypes import *
-from schema.common_pb2 import Entity, Relationship, BatchMessage, MessageType
 from main.nlp_pipe import NLPPipeline
 from main.entity_resolve import EntityResolver
-from graph.memgraph import MemGraphStore
+from db.memgraph import MemGraphStore
 from main.prompts import *
 from log.llm_trace import get_trace_logger
 
@@ -31,7 +26,6 @@ load_dotenv()
 BATCH_SIZE = 5
 PROFILE_INTERVAL = 15
 
-STREAM_KEY_STRUCTURE = "stream:structure"
 BATCH_TIMEOUT_SECONDS = 180.0
 
 class Context:
@@ -61,7 +55,6 @@ class Context:
     async def create(
         cls,
         user_name: str,
-        ent_resolver: EntityResolver,
         store: MemGraphStore,
         cpu_executor: ThreadPoolExecutor,
         topics: List[str] = ["General"]
@@ -88,7 +81,7 @@ class Context:
             partial(NLPPipeline, llm=instance.llm)
         )
         
-        instance.ent_resolver = ent_resolver
+        instance.ent_resolver = EntityResolver(store=instance.store)
 
         await instance._get_or_create_user_entity(user_name)
 
@@ -109,7 +102,10 @@ class Context:
         )
         instance.scheduler.register(DLQReplayJob())
         instance.scheduler.register(
-            ProfileRefinementJob(llm=instance.llm, resolver=instance.ent_resolver, executor=instance.executor)
+            ProfileRefinementJob(llm=instance.llm, 
+                                 resolver=instance.ent_resolver,
+                                 store=instance.store,
+                                 executor=instance.executor)
         )
         await instance.scheduler.start()
         
@@ -157,10 +153,10 @@ class Context:
         loop = asyncio.get_running_loop()
 
         entity_id = await loop.run_in_executor(
-                    self.executor,
-                    self.ent_resolver.get_id,
-                    user_name
-                )
+            self.executor,
+            self.ent_resolver.get_id,
+            user_name
+        )
 
         if entity_id:
             logger.info(f"User {user_name} recognized.")
@@ -169,38 +165,32 @@ class Context:
         logger.info(f"Creating new USER entity for {user_name}")
         new_id = await self.get_next_ent_id()
         
-        profile = {
-            "canonical_name": user_name,
-            "summary": f"The primary user named {user_name}",
-            "type": "person",
-            "topic": "Personal"
-        }
+        summary = f"The primary user named {user_name}"
 
         embedding = await loop.run_in_executor(
             self.executor,
             partial(self.ent_resolver.register_entity, new_id, user_name, [user_name], "person", "Personal")
         )
         
-        self.ent_resolver.entity_profiles[new_id]["summary"] = profile["summary"]
-        user_entity = Entity(
-            id=new_id,
-            canonical_name=user_name,
-            type="person",
-            confidence=1.0,
-            summary=profile["summary"],
-            topic="Personal",
-            embedding=embedding,
-            aliases=[user_name]
+        self.ent_resolver.entity_profiles[new_id]["summary"] = summary
+
+        user_entity = {
+            "id": new_id,
+            "canonical_name": user_name,
+            "type": "person",
+            "confidence": 1.0,
+            "summary": summary,
+            "topic": "Personal",
+            "embedding": embedding,
+            "aliases": [user_name]
+        }
+
+        await loop.run_in_executor(
+            self.executor,
+            partial(self.store.write_batch, [user_entity], [], False)
         )
-
-        batch = BatchMessage(type=MessageType.SYSTEM_ENTITY)
-        batch.list_ents.append(user_entity)
-
-        try:
-            await self.redis_client.xadd(STREAM_KEY_STRUCTURE, {'data': batch.SerializeToString()})
-        except Exception as e:
-            logger.error(f"Failed to push User Entity to stream: {e}")
         
+        logger.info(f"User entity {user_name} (ID: {new_id}) written to graph")
         return new_id
         
     async def _flush_batch_timeout(self):
@@ -330,35 +320,6 @@ class Context:
         pipe.zremrangebyrank(f"recent_messages:{self.user_name}", 0, -76)
         await pipe.execute()
 
-    
-    async def _send_batch_to_stream(self, entities: List[Entity], 
-                                        relations: List[Relationship], type: MessageType, 
-                                        stream_key: str = STREAM_KEY_STRUCTURE):
-        batch = BatchMessage(
-            type=type,
-            list_ents=entities,
-            list_relations=relations
-        )
-        serialized_data = batch.SerializeToString()
-    
-        try:
-            batch_id = f"batch_{int(time.time())}_{os.urandom(4).hex()}"
-            snapshot_key = f"snapshot:{batch_id}"
-
-            await self.redis_client.setex(snapshot_key, 3600, serialized_data)
-
-            stream_payload = {
-                'data': serialized_data,
-                'batch_id': batch_id,
-                'timestamp': str(time.time())
-            }
-            
-            await self.redis_client.xadd(stream_key, stream_payload)
-            logger.info(f"Published batch {batch_id} to stream (Snapshot secured)")
-
-        except exceptions.RedisError as e:
-            logger.critical(f"Redis WRITE failure in _publish_batch. Data potentially lost: {e}")
-
 
     async def process_batch(self):
         while await self.redis_client.exists("system:maintenance_lock"):
@@ -382,7 +343,7 @@ class Context:
                 self.session_emotions.extend(result.emotions)
                 
                 if result.extraction_result:
-                    await self._publish_batch(
+                    await self._write_to_graph(
                         result.entity_ids,
                         result.new_entity_ids,
                         result.alias_updated_ids,
@@ -393,64 +354,62 @@ class Context:
             logger.debug(f"Trimmed {len(messages)} from {buffer_key}")
 
     
-    async def _publish_batch(
+    async def _write_to_graph(
         self,
-        entity_ids: List[int],
-        new_entity_ids: Set[int],
-        alias_updated_ids: Set[int],
+        entity_ids: list[int],
+        new_entity_ids: set[int],
+        alias_updated_ids: set[int],
         extraction_result: ConnectionExtractionResponse
-        ):
-        """
-        Publish entities and relationships to graph via Redis stream.
-        """
-    
+    ):
+
+   
         entity_lookup = {}
         for ent_id in entity_ids:
             profile = self.ent_resolver.entity_profiles.get(ent_id)
             if profile:
                 canonical = profile["canonical_name"]
-                entity_lookup[canonical.lower()] = {
+                entry = {
                     "id": ent_id,
                     "canonical_name": canonical,
                     "type": profile.get("type"),
                     "topic": profile.get("topic", "General")
                 }
+                entity_lookup[canonical.lower()] = entry
                 for mention in self.ent_resolver.get_mentions_for_id(ent_id):
-                    entity_lookup[mention.lower()] = entity_lookup[canonical.lower()]
-        
+                    entity_lookup[mention.lower()] = entry
 
-        proto_ents = []
+        entities = []
         for ent_id in new_entity_ids:
             profile = self.ent_resolver.entity_profiles.get(ent_id)
             if profile:
-                embedding = self.ent_resolver.get_embedding_for_id(ent_id)
-                aliases = self.ent_resolver.get_mentions_for_id(ent_id)
-                proto_ents.append(Entity(
-                    id=ent_id,
-                    canonical_name=profile["canonical_name"],
-                    type=profile.get("type", ""),
-                    confidence=1.0,
-                    summary="",
-                    topic=profile.get("topic", "General"),
-                    embedding=embedding,
-                    aliases=aliases
-                ))
+                entities.append({
+                    "id": ent_id,
+                    "canonical_name": profile["canonical_name"],
+                    "type": profile.get("type", ""),
+                    "confidence": 1.0,
+                    "summary": "",
+                    "topic": profile.get("topic", "General"),
+                    "embedding": self.ent_resolver.get_embedding_for_id(ent_id),
+                    "aliases": self.ent_resolver.get_mentions_for_id(ent_id)
+                })
         
-        if alias_updated_ids:
-            for ent_id in alias_updated_ids:
-                if ent_id in new_entity_ids:
-                    continue
-                profile = self.ent_resolver.entity_profiles.get(ent_id)
-                if profile:
-                    aliases = self.ent_resolver.get_mentions_for_id(ent_id)
-                    proto_ents.append(Entity(
-                        id=ent_id,
-                        canonical_name=profile["canonical_name"],
-                        confidence=1.0,
-                        aliases=aliases
-                    ))
+        for ent_id in alias_updated_ids:
+            if ent_id in new_entity_ids:
+                continue
+            profile = self.ent_resolver.entity_profiles.get(ent_id)
+            if profile:
+                entities.append({
+                    "id": ent_id,
+                    "canonical_name": profile["canonical_name"],
+                    "type": profile.get("type", ""),
+                    "confidence": 1.0,
+                    "summary": "",
+                    "topic": profile.get("topic", "General"),
+                    "embedding": [],
+                    "aliases": self.ent_resolver.get_mentions_for_id(ent_id)
+                })
 
-        proto_rels = []
+        relationships = []
         for msg_result in extraction_result.message_results:
             msg_id = msg_result.message_id
             
@@ -459,21 +418,27 @@ class Context:
                 ent_b = entity_lookup.get(pair.entity_b.lower())
                 
                 if ent_a and ent_b:
-                    proto_rels.append(Relationship(
-                        entity_a=ent_a["canonical_name"],
-                        entity_b=ent_b["canonical_name"],
-                        confidence=pair.confidence,
-                        message_id=msg_id
-                    ))
+                    relationships.append({
+                        "entity_a": ent_a["canonical_name"],
+                        "entity_b": ent_b["canonical_name"],
+                        "message_id": f"msg_{msg_id}",
+                        "confidence": pair.confidence
+                    })
                 else:
-                    logger.warning(f"Skipping pair: {pair.entity_a} - {pair.entity_b} (entity not found)")
+                    logger.warning(f"Skipping pair: {pair.entity_a} - {pair.entity_b}")
 
-        await self._send_batch_to_stream(
-            entities=proto_ents,
-            relations=proto_rels,
-            type=MessageType.USER_MESSAGE,
-            stream_key=STREAM_KEY_STRUCTURE
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self.executor,
+            partial(self.store.write_batch, entities, relationships, True)
         )
+        
+        if new_entity_ids:
+            dirty_key = f"dirty_entities:{self.user_name}"
+            await self.redis_client.sadd(dirty_key, *[str(eid) for eid in new_entity_ids])
+        
+        logger.info(f"Wrote {len(entities)} entities, {len(relationships)} relationships to graph")
+
         
     async def shutdown(self):
 
@@ -482,9 +447,6 @@ class Context:
         if self._background_tasks:
             logger.info(f"Waiting for {len(self._background_tasks)} background tasks...")
             await asyncio.wait(self._background_tasks, timeout=60)
-        
-        logger.info("Waiting for graph consumer to sync...")
-        await asyncio.sleep(20)
         
         await self.scheduler.stop()
 
