@@ -7,16 +7,13 @@ Inspired by [Zep’s temporal knowledge graph architecture](https://github.com/g
 ## Features
 
 **Entity Extraction & Disambiguation**  
-Identifies people, places, organizations, and concepts from conversational text. Handles the chaos of real messaging—typos, nicknames, inconsistent casing—and resolves them to canonical entities.
+Identifies people, places, organizations, and concepts from conversational text. Handles the chaos of real messaging: typos, nicknames, inconsistent casing, and resolves them to canonical entities.
 
 **Relationship Tracking**  
 Builds a graph of who knows who, what connects to what, with message-level evidence. Relationships have weights and timestamps, so you know what’s strong and what’s stale.
 
-**Mood & Emotion Tracking**  
-Captures emotional tone per message and logs daily mood summaries. Because sometimes the vibe matters.
-
 **Topic-Based Access Control**  
-Toggle topics active/inactive to control what context surfaces. Mark topics as “hot” for priority retrieval.
+Toggle topics active/inactive to restrict what the agent can see. Inactive topics are filtered out at the database level, not just hidden in the UI. Mark topics as “hot” for priority retrieval.
 
 ## SS Agents
 
@@ -28,7 +25,7 @@ Current SS agents:
 - **Merge Detection** — Catches duplicates that slip through initial disambiguation. Uses embedding similarity + cross-encoder verification to propose merges with confidence scores.
 - **DLQ Replay** — Retries failed batches when transient errors (network blips, timeouts) were the cause. Parks fatal errors for inspection instead of infinite loops.
 
-The scheduler is designed to be extensible—add your own SS agents for custom background tasks.
+The scheduler is designed to be extensible. Add your own SS agents for custom background tasks.
 
 ## Architecture
 
@@ -36,7 +33,7 @@ Vestige separates **write** (deterministic extraction) from **read** (agentic re
 
 ### Write Path
 
-In *One Piece*, Dr. Vegapunk is the world’s greatest scientist—so brilliant that his brain grew too large for his body. His solution? Split his consciousness into six satellites, each handling a specialized aspect of his genius: logic, evil, good, desire, violence, and wisdom.
+In *One Piece*, Dr. Vegapunk is the world’s greatest scientist, so brilliant that his brain grew too large for his body. His solution? Split his consciousness into six satellites, each handling a specialized aspect of his genius: logic, evil, good, desire, violence, and wisdom.
 
 Vestige borrows this idea. Rather than throwing one monolithic prompt at extraction and hoping for the best, the write path splits cognitive labor across specialized prompts:
 
@@ -50,7 +47,7 @@ Vestige borrows this idea. Rather than throwing one monolithic prompt at extract
 |VEGAPUNK-06|Profile refinement               |
 |VEGAPUNK-07|Summary merging                  |
 
-Each prompt does one thing well. Reasoning and formatting are deliberately separated—let the LLM think freely, then constrain the output. This keeps accuracy high and structured output reliable.
+Each prompt does one thing well. Reasoning and formatting are deliberately separated: let the LLM think freely, then constrain the output. This keeps accuracy high and structured output reliable.
 
 ### Read Path (In Progress)
 
