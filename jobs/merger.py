@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from loguru import logger
 from jobs.base import BaseJob, JobContext, JobResult, JobNotifier
+from main.prompts import get_summary_merge_prompt
+from main.service import LLMService
 
 if TYPE_CHECKING:
     from main.entity_resolve import EntityResolver
@@ -23,22 +25,39 @@ class MergeDetectionJob(BaseJob):
     IDLE_THRESHOLD = 15 * 60
     AUTO_MERGE_THRESHOLD = 0.9
     HITL_THRESHOLD = 0.65
-    
-    def __init__(self, ent_resolver: "EntityResolver", store: "MemGraphStore"):
+    MERGE_DELAY_SECONDS = 120
+
+    def __init__(self, ent_resolver: "EntityResolver", store: "MemGraphStore", llm_client: LLMService):
         self.ent_resolver = ent_resolver
         self.store = store
+        self.llm = llm_client
     
     @property
     def name(self) -> str:
         return "merge_detection"
     
     async def should_run(self, ctx: JobContext) -> bool:
+        ran_key = f"merge_ran:{ctx.user_name}"
+        if await ctx.redis.get(ran_key):
+            return False
+        
+
+        profile_complete_key = f"profile_complete:{ctx.user_name}"
+        profile_timestamp = await ctx.redis.get(profile_complete_key)
+        
+        if not profile_timestamp:
+            return False
+        
+        completed_at = float(profile_timestamp.decode())
+        elapsed = time.time() - completed_at
+        
+        if elapsed < self.MERGE_DELAY_SECONDS:
+            return False
+        
         if ctx.idle_seconds < self.IDLE_THRESHOLD:
             return False
         
-        ran_key = f"merge_ran:{ctx.user_name}"
-        already_ran = await ctx.redis.get(ran_key)
-        return not already_ran
+        return True
     
     async def execute(self, ctx: JobContext) -> JobResult:
         warning = "⚠️ **Memory Consolidation in Progress.** I am currently merging duplicate entities. Answers regarding these people might be temporarily inconsistent."
@@ -74,7 +93,7 @@ class MergeDetectionJob(BaseJob):
                     if primary_id in merged_ids or secondary_id in merged_ids:
                         continue
                     
-                    success = await self._execute_merge(primary_id, secondary_id)
+                    success = await self._execute_merge(ctx.user_name, primary_id, secondary_id)
                     
                     if success:
                         merged_ids.add(secondary_id)
@@ -99,15 +118,22 @@ class MergeDetectionJob(BaseJob):
         await ctx.redis.set(f"pending:{ctx.user_name}:{self.name}", "true")
         logger.debug("Merge detection pending flag set")
     
-    async def _execute_merge(self, primary_id: int, secondary_id: int, max_retries: int = 2) -> bool:
+    async def _execute_merge(self, user_name: str, primary_id: int, secondary_id: int, max_retries: int = 2) -> bool:
         """Execute merge with retry."""
         loop = asyncio.get_running_loop()
         
         primary_profile = self.ent_resolver.entity_profiles.get(primary_id, {})
         secondary_profile = self.ent_resolver.entity_profiles.get(secondary_id, {})
-        merged_summary = self._merge_summaries(
-            primary_profile.get("summary", ""),
-            secondary_profile.get("summary", "")
+        merged_summary = await self._merge_summaries_llm(
+            user_name,
+            primary_name=primary_profile.get("canonical_name", "Unknown"),
+            entity_type=primary_profile.get("type", "unknown"),
+            all_aliases=list(set(
+                self.ent_resolver.get_mentions_for_id(primary_id) +
+                self.ent_resolver.get_mentions_for_id(secondary_id)
+            )),
+            summary_a=primary_profile.get("summary", ""),
+            summary_b=secondary_profile.get("summary", "")
         )
         
         for attempt in range(1, max_retries + 1):
@@ -128,13 +154,40 @@ class MergeDetectionJob(BaseJob):
         
         return False
     
-    def _merge_summaries(self, primary: str, secondary: str) -> str:
-        """Combine two summaries. TODO: LLM-based merging."""
-        if not primary:
-            return secondary
-        if not secondary:
-            return primary
-        return f"{primary} {secondary}"
+    async def _merge_summaries_llm(
+        self,
+        user_name: str,
+        primary_name: str,
+        entity_type: str,
+        all_aliases: list[str],
+        summary_a: str, 
+        summary_b: str
+    ) -> str:
+        """Merge two summaries using VEGAPUNK-07."""
+        
+        if not summary_a and not summary_b:
+            return ""
+        if not summary_a:
+            return summary_b
+        if not summary_b:
+            return summary_a
+        
+        system_prompt = get_summary_merge_prompt(user_name)
+        user_content = json.dumps({
+            "entity_name": primary_name,
+            "entity_type": entity_type,
+            "all_aliases": all_aliases,
+            "summary_a": summary_a,
+            "summary_b": summary_b
+        }, indent=2)
+        
+        result = await self.llm.call_reasoning(system_prompt, user_content, self.llm.DEFAULT_STRUCTURED_MODEL)
+        
+        if result and result.startswith("MERGE_CONFLICT"):
+            logger.warning(f"Merge conflict for {primary_name}: {result}")
+            return f"{summary_a} {summary_b}"
+        
+        return result or f"{summary_a} {summary_b}"
     
     def _sync_resolver(self, primary_id: int, secondary_id: int):
         """Update EntityResolver after merge."""

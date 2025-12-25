@@ -12,7 +12,7 @@ class AsyncRedisClient:
             cls._instance = super().__new__(cls)
             pool = async_redis.ConnectionPool.from_url(
                 url=f"redis://{REDIS_HOST}:{REDIS_PORT}",
-                decode_responses=False,
+                decode_responses=True,
                 max_connections=10
             )
             cls._instance.client = async_redis.Redis(connection_pool=pool)
@@ -29,7 +29,7 @@ class SyncRedisClient:
             cls._instance = super().__new__(cls)
             pool = redis.ConnectionPool.from_url(
                 url=f"redis://{REDIS_HOST}:{REDIS_PORT}",
-                decode_responses=False,
+                decode_responses=True,
                 max_connections=5
             )
             cls._instance.client = redis.Redis(connection_pool=pool)

@@ -75,7 +75,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "find_path",
-            "description": "Find shortest connection path between two entities. Use for 'how is X connected to Y'. Requires both entities known.",
+            "description": "Find shortest connection path between two entities. Use for 'how is X connected to Y' or 'what's the relationship between X and Y'. Requires both entities known — use get_profile first if unsure.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -86,21 +86,21 @@ TOOL_SCHEMAS = [
             }
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web for external information. ONLY for current events or info not in user's graph. Commits to web-only path.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string",
-                              "description": "Search query"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
+    # {
+    #     "type": "function",
+    #     "function": {
+    #         "name": "web_search",
+    #         "description": "Search the web for external information. ONLY for current events or info not in user's graph. Commits to web-only path.",
+    #         "parameters": {
+    #             "type": "object",
+    #             "properties": {
+    #                 "query": {"type": "string",
+    #                           "description": "Search query"}
+    #             },
+    #             "required": ["query"]
+    #         }
+    #     }
+    # },
     {
         "type": "function",
         "function": {

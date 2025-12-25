@@ -79,7 +79,7 @@ class Scheduler:
         last_activity = await self.redis.get(f"last_activity:{self.user_name}")
         if not last_activity:
             return 0.0
-        last_ts = datetime.fromisoformat(last_activity.decode())
+        last_ts = datetime.fromisoformat(last_activity)
         return (datetime.now(timezone.utc) - last_ts).total_seconds()
     
     async def _run_pending_checks(self):

@@ -12,11 +12,12 @@ from db.memgraph import MemGraphStore
 
 class Tools:
     
-    def __init__(self, user_name: str, store: MemGraphStore, ent_resolver: EntityResolver, redis_client: redis.Redis):
+    def __init__(self, user_name: str, store: MemGraphStore, ent_resolver: EntityResolver, redis_client: redis.Redis, active_topics: List[str] = None):
         self.store = store
         self.resolver = ent_resolver
         self.user_name = user_name
         self.redis = redis_client
+        self.active_topics = active_topics or []
     
     def _resolve_entity_name(self, entity: str) -> Optional[str]:
         """Resolve user input to canonical entity name via exact or fuzzy match."""
@@ -171,19 +172,30 @@ class Tools:
         Find the shortest connection path between two entities.
         Use when asked "how is X connected to Y" or "what's the relationship between X and Y".
         Requires both entities to be known — use get_profile first if unsure.
-        
+
         Args:
             entity_a: First entity name
             entity_b: Second entity name
-        
-        Returns: Step-by-step path showing each entity in the chain with evidence.
-        Returns empty list if no connection found.
+
+        Returns: 
+            Step-by-step path showing each entity in the chain with evidence.
+            If path exists only through inactive topics: [{"hidden": True, "message": "..."}]
+            Empty list if no connection found.
         """
         canonical_a = self._resolve_entity_name(entity_a)
         canonical_b = self._resolve_entity_name(entity_b)
         if not canonical_a or not canonical_b:
             return []
-        return self.store.find_connection(canonical_a, canonical_b) or []
+
+        path = self.store._find_path_filtered(canonical_a, canonical_b, active_only=True)
+        if path:
+            return path
+
+        full_path = self.store._find_path_filtered(canonical_a, canonical_b, active_only=False)
+        if full_path:
+            return [{"hidden": True, "message": "Connection exists through inactive topics"}]
+        
+        return []
 
     def get_hot_topic_context(self, hot_topics: List[str]) -> Dict[str, List[Dict]]:
         """
@@ -200,16 +212,16 @@ class Tools:
             return {}
         return self.store.get_hot_topic_context(hot_topics)
 
-    def web_search(self, query: str) -> List[Dict]:
-        """
-        Search the web for external information.
-        Use ONLY for current events, external facts, or information not in the user's graph.
-        This is a separate path — once you go web, you cannot use internal tools.
+    # def web_search(self, query: str) -> List[Dict]:
+    #     """
+    #     Search the web for external information.
+    #     Use ONLY for current events, external facts, or information not in the user's graph.
+    #     This is a separate path — once you go web, you cannot use internal tools.
         
-        Args:
-            query: Search query
+    #     Args:
+    #         query: Search query
         
-        Returns: List of web results with title, snippet, url.
-        """
-        # TODO: Implement web search
-        return []
+    #     Returns: List of web results with title, snippet, url.
+    #     """
+    #     # TODO: Implement web search
+    #     return []

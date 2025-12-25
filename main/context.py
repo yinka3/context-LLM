@@ -46,7 +46,6 @@ class Context:
         self._background_tasks: Set[asyncio.Task] = set()
         self._batch_timer_task: asyncio.Task = None
         self._batch_processing_lock = asyncio.Lock()
-        self._batch_queue_task: asyncio.Task = None
         self.batch_processor: BatchProcessor = None
 
         self.trace_logger = get_trace_logger()
@@ -98,7 +97,7 @@ class Context:
 
         instance.scheduler = Scheduler(user_name)
         instance.scheduler.register(
-            MergeDetectionJob(instance.ent_resolver, instance.store)
+            MergeDetectionJob(instance.ent_resolver, instance.store, instance.llm)
         )
         instance.scheduler.register(DLQReplayJob())
         instance.scheduler.register(
@@ -198,63 +197,29 @@ class Context:
             await asyncio.sleep(BATCH_TIMEOUT_SECONDS)
             buffer_len = await self.redis_client.llen(f"buffer:{self.user_name}")
             if buffer_len > 0:
-                logger.info(f"Batch timeout reached")
-                await self._trigger_batch_process()
+                logger.info("Batch timeout reached")
+                self._fire_and_forget(self.process_batch())
         except asyncio.CancelledError:
             pass
     
     async def _flush_batch_shutdown(self):
-
-        logger.info("Initiating graceful shutdown of batch processor...")
+        logger.info("Initiating graceful shutdown...")
+        
         if self._batch_timer_task:
             self._batch_timer_task.cancel()
             self._batch_timer_task = None
         
         buffer_key = f"buffer:{self.user_name}"
-        wait_count = 0
         while await self.redis_client.llen(buffer_key) > 0:
-            if wait_count % 20 == 0:
-                logger.info(f"Shutdown: Waiting for buffer to drain... ({wait_count}s)")
-            wait_count += 1
-            await asyncio.sleep(1)
-            await self._trigger_batch_process() 
-
-        async with self._batch_processing_lock:
-            logger.info("Batch processing lock acquired - buffer is empty and active batches done.")
-
-        if self._batch_queue_task and not self._batch_queue_task.done():
-            logger.info("Stopping batch queue listener...")
-            self._batch_queue_task.cancel()
-            try:
-                await self._batch_queue_task
-            except asyncio.CancelledError:
-                pass
-
+            await self.process_batch()
+        
         if self._background_tasks:
             logger.info(f"Waiting for {len(self._background_tasks)} background tasks...")
             await asyncio.wait(self._background_tasks, timeout=90)
         
-        logger.info("All batches and background tasks completed")
-    
-    async def _trigger_batch_process(self):
-
-        if self._batch_queue_task is None or self._batch_queue_task.done():
-            self._batch_queue_task = asyncio.create_task(self._batch_a_queue())
-    
-    async def _batch_a_queue(self):
-
-        while True:
-            buffer_len = await self.redis_client.llen(f"buffer:{self.user_name}")
-            
-            if buffer_len >= BATCH_SIZE:
-                await self.process_batch()
-                if self._background_tasks:
-                    await asyncio.wait(self._background_tasks, timeout=180)
-            else:
-                await asyncio.sleep(0.5)
+        logger.info("Shutdown complete")
 
     async def add(self, msg: MessageData):
-        """Buffer message and trigger batch processing when ready."""
         msg.id = await self.get_next_msg_id()
         await self.add_to_redis(msg)
 
@@ -272,8 +237,7 @@ class Context:
             if self._batch_timer_task:
                 self._batch_timer_task.cancel()
                 self._batch_timer_task = None
-            
-            await self._trigger_batch_process()
+            self._fire_and_forget(self.process_batch())
         elif buffer_len == 1:
             self._batch_timer_task = asyncio.create_task(self._flush_batch_timeout())
 
@@ -459,6 +423,7 @@ class Context:
             secondary, secondary_count = top_two[1] if len(top_two) > 1 else ("neutral", 0)
             
             self.store.log_daily_mood(
+                user_name=self.user_name,
                 primary=primary,
                 primary_count=primary_count,
                 secondary=secondary,

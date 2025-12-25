@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from loguru import logger
 import threading
 from typing import Dict, List, Optional, Tuple
+from rapidfuzz import process as fuzz
 import faiss
 import re
 import numpy as np
@@ -201,20 +202,61 @@ class EntityResolver:
             return embedding_np.tolist()
 
     def detect_merge_candidates(self) -> list:
-        """Detect potential entity merges based on summary similarity."""
-
+        """Detect potential entity merges using name matching and summary similarity."""
+        
         logger.info(f"Merge detection started, {len(self.entity_profiles)} entities to scan")
         
         candidates = []
         seen_pairs = set()
         
+        # PASS 1: Name-based detection (case-insensitive exact matches)
+        name_to_ids: dict[str, list[int]] = {}
+        for ent_id, profile in self.entity_profiles.items():
+            canonical = profile.get("canonical_name", "")
+            if canonical:
+                key = canonical.lower().strip()
+                if key not in name_to_ids:
+                    name_to_ids[key] = []
+                name_to_ids[key].append(ent_id)
+        
+        for _, ids in name_to_ids.items():
+            if len(ids) < 2:
+                continue
+            
+            for i, id_a in enumerate(ids):
+                for id_b in ids[i + 1:]:
+                    pair = tuple(sorted([id_a, id_b]))
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    
+                    profile_a = self.entity_profiles.get(id_a, {})
+                    profile_b = self.entity_profiles.get(id_b, {})
+                    
+                    logger.info(
+                        f"Name match: ({id_a}, {id_b}) "
+                        f"{profile_a.get('canonical_name')} <-> {profile_b.get('canonical_name')} | "
+                        f"Decision=APPROVED"
+                    )
+                    
+                    primary_id, secondary_id = pair
+                    candidates.append({
+                        "primary_id": primary_id,
+                        "secondary_id": secondary_id,
+                        "primary_name": self.entity_profiles[primary_id].get("canonical_name", "Unknown"),
+                        "secondary_name": self.entity_profiles[secondary_id].get("canonical_name", "Unknown"),
+                        "faiss_score": 1.0,
+                        "cross_score": 1.0
+                    })
+        
+        # PASS 2: Summary-based detection (different names, same entity)
         for entity_id, profile in self.entity_profiles.items():
             summary = profile.get("summary", "")
             entity_type = profile.get("type")
             canonical_name = profile.get("canonical_name", "Unknown")
+            
             if not summary:
                 continue
-            
             
             match = re.match(r'^(.+?[.!?])(?:\s+[A-Z]|$)', summary)
             first_sentence = match.group(1).strip() if match else summary[:200].strip()
@@ -238,49 +280,38 @@ class EntityResolver:
                 match_profile = self.entity_profiles.get(match_id)
                 if not match_profile:
                     continue
-
-                match_type = match_profile.get("type")
-                match_name = match_profile.get("canonical_name", "Unknown")
-        
-                if entity_type != match_type:
-                    logger.debug(f"Type mismatch: {canonical_name} ({entity_type}) vs {match_name} ({match_type}), skipping")
-                    continue
-
-                if canonical_name == match_name:
-                    pair = tuple(sorted([entity_id, match_id]))
-                    if pair in seen_pairs:
-                        continue
-                    seen_pairs.add(pair)
-                    
-                    logger.info(f"Merge verification: ({entity_id}, {match_id}) {canonical_name} <- {match_name} | "
-                                f"Exact name match Decision=APPROVED")
-                    primary_id, secondary_id = pair
-                    candidates.append({
-                        "primary_id": primary_id,
-                        "secondary_id": secondary_id,
-                        "primary_name": canonical_name,
-                        "secondary_name": match_name,
-                        "faiss_score": float(faiss_score),
-                        "cross_score": 1.0 
-                    })
-                    continue
-
-                if faiss_score < 0.50:
-                    continue
-
-                primary_text = f"{canonical_name}. {profile.get('summary', '')[:150]}"
-                secondary_text = f"{match_name}. {match_profile.get('summary', '')[:150]}"
-                cross_score = float(self.cross_encoder.predict([[primary_text, secondary_text]])[0])
                 
                 pair = tuple(sorted([entity_id, match_id]))
                 if pair in seen_pairs:
                     continue
+                
+                match_type = match_profile.get("type")
+                match_name = match_profile.get("canonical_name", "Unknown")
+                
+                # Fuzzy name check to bypass type mismatch
+                name_score = fuzz.WRatio(canonical_name.lower(), match_name.lower())
+                names_similar = name_score >= 85
+                
+                if entity_type != match_type and not names_similar:
+                    logger.debug(
+                        f"Type mismatch: {canonical_name} ({entity_type}) vs "
+                        f"{match_name} ({match_type}), skipping"
+                    )
+                    continue
+                
+                if faiss_score < 0.50:
+                    continue
+                
+                primary_text = f"{canonical_name}. {profile.get('summary', '')[:150]}"
+                secondary_text = f"{match_name}. {match_profile.get('summary', '')[:150]}"
+                cross_score = float(self.cross_encoder.predict([[primary_text, secondary_text]])[0])
+                
                 seen_pairs.add(pair)
                 
                 decision = "APPROVED" if cross_score >= 0.65 else "REJECTED"
                 logger.info(
-                    f"Merge verification: ({entity_id}, {match_id}) {canonical_name} <- {match_name} | "
-                    f"FAISS={faiss_score:.3f} CrossEncoder={cross_score:.3f} Decision={decision}"
+                    f"Summary match: ({entity_id}, {match_id}) {canonical_name} <-> {match_name} | "
+                    f"FAISS={faiss_score:.3f} Cross={cross_score:.3f} Fuzzy={name_score} Decision={decision}"
                 )
                 
                 if cross_score >= 0.65:
@@ -295,5 +326,4 @@ class EntityResolver:
                     })
         
         logger.info(f"Merge detection complete: {len(candidates)} candidates found")
-        
         return candidates

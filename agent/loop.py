@@ -65,8 +65,8 @@ def build_user_message(
     if ctx.retrieved_messages:
         msg += f"\n**Accumulated messages ({len(ctx.retrieved_messages)}):**\n```json\n{json.dumps(ctx.retrieved_messages, indent=2, default=str)}\n```\n"
     
-    if ctx.web_results:
-        msg += f"\n**Web results ({len(ctx.web_results)}):**\n```json\n{json.dumps(ctx.web_results, indent=2, default=str)}\n```\n"
+    # if ctx.web_results:
+    #     msg += f"\n**Web results ({len(ctx.web_results)}):**\n```json\n{json.dumps(ctx.web_results, indent=2, default=str)}\n```\n"
     
     return msg
 
@@ -113,8 +113,8 @@ def execute_tool(tools: Tools, name: str, args: Dict) -> Optional[Dict]:
         "get_profile": lambda: tools.get_profile(args.get("entity_name", "")),
         "get_connections": lambda: tools.get_connections(args.get("entity_name", "")),
         "get_activity": lambda: tools.get_recent_activity(args.get("entity_name", ""), args.get("hours", 24)),
-        "find_path": lambda: tools.find_path(args.get("entity_a", ""), args.get("entity_b", "")),
-        "web_search": lambda: tools.web_search(args.get("query", ""))
+        "find_path": lambda: tools.find_path(args.get("entity_a", ""), args.get("entity_b", ""))
+        # "web_search": lambda: tools.web_search(args.get("query", ""))
     }
     
     if name not in dispatch:
@@ -140,14 +140,12 @@ def update_accumulators(ctx: ContextState, tool_name: str, result):
     
     elif tool_name == "get_profile":
         ctx.entity_profiles.append(result)
-        if result.get("id"):
-            ctx.inspected_entity_ids.add(result["id"])
     
     elif tool_name in ("get_connections", "get_activity", "find_path"):
         ctx.graph_results.extend(result if isinstance(result, list) else [])
     
-    elif tool_name == "web_search":
-        ctx.web_results.extend(result if isinstance(result, list) else [])
+    # elif tool_name == "web_search":
+    #     ctx.web_results.extend(result if isinstance(result, list) else [])
 
 
 def summarize_result(tool_name: str, result: Dict) -> Tuple[str, int]:
@@ -186,13 +184,13 @@ async def run(user_query: str,
         store: 'MemGraphStore',
         ent_resolver: 'EntityResolver',
         redis_client: AsyncRedisClient
-        ) -> RunResult:
+    ) -> RunResult:
     
     system_warning = ""
     try:
         raw_warning = await redis_client.get_client().get("system:active_job_warning")
         if raw_warning:
-            system_warning = f"{raw_warning.decode()}\n\n---\n\n"
+            system_warning = f"{raw_warning}\n\n---\n\n"
     except Exception as e:
         logger.error(f"Failed to check system warning: {e}")
     
@@ -211,7 +209,19 @@ async def run(user_query: str,
     )
     machine = StateOrchestrator(context)
     sync_redis = SyncRedisClient().get_client()
-    tools = Tools(user_name, store, ent_resolver, sync_redis)
+    tools = Tools(user_name, store, ent_resolver, sync_redis, active_topics)
+
+    if not ent_resolver.entity_profiles or len(ent_resolver.entity_profiles) <= 1:
+        return CompleteResult(
+            status="complete",
+            response="I don't know much about your world yet. Tell me about the people, places, and things in your life and I'll start remembering.",
+            tools_used=[],
+            state="start",
+            messages=[],
+            profiles=[],
+            graph=[],
+            web=[]
+        )
 
     if hot_topics:
         context.hot_topic_context = tools.get_hot_topic_context(hot_topics)
@@ -221,16 +231,38 @@ async def run(user_query: str,
     terminal_states = {machine.complete, machine.clarify}
     while machine.current_state not in terminal_states:
         
+        if context.call_count >= context.max_calls and machine.can_finish():
+            if context.entity_profiles or context.graph_results or context.retrieved_messages:
+                partial_response = "Here's what I found, though I couldn't fully answer your question:\n"
+                
+                if context.entity_profiles:
+                    names = [p.get("canonical_name", "unknown") for p in context.entity_profiles if isinstance(p, dict)]
+                    if names:
+                        partial_response += f"- Found profiles: {', '.join(names)}\n"
+                
+                if context.retrieved_messages:
+                    partial_response += f"- Found {len(context.retrieved_messages)} related messages\n"
+                
+                return CompleteResult(
+                    status="complete",
+                    response=partial_response,
+                    tools_used=context.tools_used,
+                    state=machine.current_state.id,
+                    messages=context.retrieved_messages,
+                    profiles=context.entity_profiles,
+                    graph=context.graph_results
+                )
+    
+            # No evidence at all
+            return ClarificationResult(
+                status="clarification_needed",
+                question="I wasn't able to find enough information to answer that. Could you rephrase or be more specific?",
+                tools_used=context.tools_used,
+                state=machine.current_state.id
+            )
+        
         context.current_state = machine.current_state.id
         context.current_step += 1
-        if context.call_count >= context.max_calls:
-            if machine.current_state not in terminal_states:
-                return ClarificationResult(
-                    status="clarification_needed",
-                    question="I wasn't able to find enough information to answer that. Could you be more specific or rephrase?",
-                    tools_used=context.tools_used,
-                    state=machine.current_state.id
-                )
         step_start = time.perf_counter()
         response = call_the_doctor(llm, context, user_name, last_result, error)
         
@@ -270,7 +302,6 @@ async def run(user_query: str,
                     messages=context.retrieved_messages,
                     profiles=context.entity_profiles,
                     graph=context.graph_results,
-                    web=context.web_results
                 )
             else:
                 error = reason
@@ -333,7 +364,6 @@ async def run(user_query: str,
         state=machine.current_state.id,
         messages=context.retrieved_messages,
         profiles=context.entity_profiles,
-        graph=context.graph_results,
-        web=context.web_results
+        graph=context.graph_results
     )
 
