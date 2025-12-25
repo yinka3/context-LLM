@@ -63,7 +63,7 @@ class ProfileRefinementJob(BaseJob):
         if dirty_count < self.USER_VOLUME_THRESHOLD and ctx.idle_seconds < self.USER_IDLE_THRESHOLD:
             return False
         
-        user_id = self.resolver._name_to_id.get(ctx.user_name)
+        user_id = self.resolver.get_id(ctx.user_name)
         if not user_id:
             logger.warning(f"User entity {ctx.user_name} not found in resolver")
             return False

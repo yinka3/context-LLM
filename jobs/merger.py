@@ -54,8 +54,8 @@ class MergeDetectionJob(BaseJob):
         if elapsed < self.MERGE_DELAY_SECONDS:
             return False
         
-        if ctx.idle_seconds < self.IDLE_THRESHOLD:
-            return False
+        # if ctx.idle_seconds < self.IDLE_THRESHOLD:
+        #     return False
         
         return True
     
