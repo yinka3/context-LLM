@@ -47,9 +47,9 @@ class EntityResolver:
                     aliases = ent["aliases"] or []
                     embedding = ent["embedding"]
                     
-                    self._name_to_id[canonical] = ent_id
+                    self._name_to_id[canonical.lower()] = ent_id
                     for alias in aliases:
-                        self._name_to_id[alias] = ent_id
+                        self._name_to_id[alias.lower()] = ent_id
                     
                     self.entity_profiles[ent_id] = {
                         "canonical_name": canonical,
@@ -80,7 +80,7 @@ class EntityResolver:
             return self._name_to_id.copy()
     
     def get_id(self, name: str) -> Optional[int]:
-        return self._name_to_id.get(name)
+        return self._name_to_id.get(name.lower())
     
     def get_mentions_for_id(self, entity_id: int) -> List[str]:
         return [mention for mention, eid in self._name_to_id.items() if eid == entity_id]
@@ -108,8 +108,8 @@ class EntityResolver:
             
             new_aliases = {}
             for mention in mentions:
-                if mention not in self._name_to_id:
-                    self._name_to_id[mention] = entity_id
+                if mention.lower() not in self._name_to_id:
+                    self._name_to_id[mention.lower()] = entity_id
                     new_aliases[mention] = entity_id
 
             return entity_id, len(new_aliases) > 0
@@ -135,9 +135,9 @@ class EntityResolver:
         embedding = self.add_entity(entity_id, profile)
         
         with self._lock:
-            self._name_to_id[canonical_name] = entity_id
+            self._name_to_id[canonical_name.lower()] = entity_id
             for mention in mentions:
-                self._name_to_id[mention] = entity_id
+                self._name_to_id[mention.lower()] = entity_id
 
         return embedding
 

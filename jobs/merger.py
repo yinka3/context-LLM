@@ -48,7 +48,7 @@ class MergeDetectionJob(BaseJob):
         if not profile_timestamp:
             return False
         
-        completed_at = float(profile_timestamp.decode())
+        completed_at = float(profile_timestamp)
         elapsed = time.time() - completed_at
         
         if elapsed < self.MERGE_DELAY_SECONDS:
@@ -195,7 +195,7 @@ class MergeDetectionJob(BaseJob):
         
         with self.ent_resolver._lock:
             for alias in secondary_aliases:
-                self.ent_resolver._name_to_id[alias] = primary_id
+                self.ent_resolver._name_to_id[alias.lower()] = primary_id
             
             if secondary_id in self.ent_resolver.entity_profiles:
                 del self.ent_resolver.entity_profiles[secondary_id]

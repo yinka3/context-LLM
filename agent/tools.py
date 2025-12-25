@@ -23,7 +23,7 @@ class Tools:
         """Resolve user input to canonical entity name via exact or fuzzy match."""
         
         
-        entity_id = self.resolver._name_to_id.get(entity)
+        entity_id = self.resolver.get_id(entity)
         if entity_id:
             profile = self.resolver.entity_profiles.get(entity_id)
             return profile["canonical_name"] if profile else entity

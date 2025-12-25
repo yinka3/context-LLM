@@ -23,7 +23,8 @@ class ProfileRefinementJob(BaseJob):
     """
     
     MSG_WINDOW = 75
-    VOLUME_THRESHOLD = 30
+    VOLUME_THRESHOLD = 20
+    USER_VOLUME_THRESHOLD = 10
     IDLE_THRESHOLD = 300
     USER_IDLE_THRESHOLD = 600
     USER_MSG_COUNT = 45
@@ -50,7 +51,7 @@ class ProfileRefinementJob(BaseJob):
             
         return False
     
-    async def _maybe_refine_user(self, ctx: JobContext) -> bool:
+    async def _maybe_refine_user(self, ctx: JobContext, dirty_count: int) -> bool:
         """
         Check conditions and trigger user profile refinement if needed.
         Returns True if refinement ran.
@@ -59,7 +60,7 @@ class ProfileRefinementJob(BaseJob):
         if await ctx.redis.get(ran_key):
             return False
         
-        if ctx.idle_seconds < self.USER_IDLE_THRESHOLD:
+        if dirty_count < self.USER_VOLUME_THRESHOLD and ctx.idle_seconds < self.USER_IDLE_THRESHOLD:
             return False
         
         user_id = self.resolver._name_to_id.get(ctx.user_name)
@@ -83,9 +84,11 @@ class ProfileRefinementJob(BaseJob):
 
         async with JobNotifier(ctx.redis, warning):
             dirty_key = f"dirty_entities:{ctx.user_name}"
-            raw_ids = await ctx.redis.spop(dirty_key, 50)
+            dirty_count = await ctx.redis.scard(dirty_key)
+            raw_ids = await ctx.redis.spop(dirty_key, dirty_count)
+            await ctx.redis.delete(dirty_key)
             
-            user_id = self.resolver._name_to_id.get(ctx.user_name)
+            user_id = self.resolver.get_id(ctx.user_name)
             entity_ids = [int(id_str) for id_str in raw_ids if int(id_str) != user_id] if raw_ids else []
             
             updates = []
@@ -125,7 +128,7 @@ class ProfileRefinementJob(BaseJob):
                 if updates:
                     await self._write_updates(updates)
             
-            user_refined = await self._maybe_refine_user(ctx)
+            user_refined = await self._maybe_refine_user(ctx, dirty_count)
             
             parts = []
             if updates:
@@ -137,7 +140,7 @@ class ProfileRefinementJob(BaseJob):
 
             await ctx.redis.setex(
                 f"profile_complete:{ctx.user_name}",
-                300,  # 5 min TTL
+                300,
                 str(datetime.now(timezone.utc).timestamp())
             )
             
