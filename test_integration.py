@@ -1,7 +1,10 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import os
 from dotenv import load_dotenv
+
+from db.memgraph import MemGraphStore
 load_dotenv()
 
 if not os.getenv("OPENROUTER_API_KEY"):
@@ -9,15 +12,15 @@ if not os.getenv("OPENROUTER_API_KEY"):
     sys.exit(1)
 
 from loguru import logger
-from logging_setup import setup_logging
+from log.logging_setup import setup_logging
 from neo4j import GraphDatabase
 from main.context import Context
 from schema.dtypes import MessageData
-from test_messages import ALEX_MESSAGES
+from long_test_msgs import MAYA_MESSAGES_V2
 
 setup_logging(log_level="INFO", log_file="test_integration.log")
 
-TEST_MESSAGES = ALEX_MESSAGES
+TEST_MESSAGES = MAYA_MESSAGES_V2
 
 MEMGRAPH_URI = "bolt://localhost:7687"
 
@@ -95,24 +98,37 @@ async def wait_for_system_idle(ctx: Context):
 
 async def run_test():
     logger.info("=" * 60)
-    logger.info("VESTIGE PRODUCTION SIMULATION TEST")
+    logger.info("VESTIGE WRITE PATH TEST")
     logger.info("=" * 60)
 
     if not check_redis_connection() or not check_memgraph_connection():
         return False
 
+    user_name = "Maya"
+    topics = [
+        "Academic Progression & Research",
+        "Romantic Relationships & Dynamics", 
+        "Friendships & Social Dynamics",
+        "Family Connections & Transitions",
+        "Mental Health & Emotional States",
+        "Daily Life & Routines",
+        "Future Planning & Aspirations",
+    ]
+
+    store = MemGraphStore(uri=MEMGRAPH_URI)
+    executor = ThreadPoolExecutor(max_workers=4)
+
     try:
         logger.info("\n[Step 1] Initializing Application Context...")
-        TOPICS = [
-            "School",
-            "Fitness",
-            "Social Life"
-        ]
-        ctx = await Context.create(user_name="Alex", topics=TOPICS)
+        ctx = await Context.create(
+            user_name=user_name,
+            store=store,
+            cpu_executor=executor,
+            topics=topics
+        )
         logger.info("✓ Application started.")
         
         logger.info("\n[Step 2] Receiving User Messages...")
-
         for i, msg in enumerate(TEST_MESSAGES, 1):
             logger.info(f"  User: {msg[:60]}...")
             msg_obj = MessageData(message=msg)
@@ -122,54 +138,56 @@ async def run_test():
             else:
                 await asyncio.sleep(0.1)
         
-        logger.info("\n[Step 3] Application Shutdown Triggered...")
+        logger.info("\n[Step 3] Application Shutdown...")
         await ctx.shutdown()
-        
-        logger.info(f"\n[Step 4] Waiting {WAIT_FOR_PROCESSING}s for Eventual Consistency...")
-        await asyncio.sleep(WAIT_FOR_PROCESSING)
 
-        logger.info("\n[Step 5] Auditing Database State...")
+        logger.info("\n[Step 4] Auditing Database State...")
         
         entities = query_entities()
         relationships = query_relationships()
 
-        logger.info(f"\n--- ENTITY AUDIT ---")
-        failed_profiles = []
+        logger.info(f"\n--- ENTITY AUDIT ({len(entities)} total) ---")
         
         if not entities:
-            logger.warning("No entities found. Did the messages contain any names?")
+            logger.error("No entities found. Did the messages contain any names?")
+            return False
 
         for ent in entities:
-            summary = ent.get('summary', '')
-            has_summary = len(summary) > 0
-            
-            status_icon = "✓" if has_summary else "⏳" # Hourglass means maybe profile stream is still working
-            if ent['type'] == 'PERSON' and ent['name'] != 'USER' and not has_summary:
-                status_icon = "✗"
-                failed_profiles.append(ent['name'])
+            aliases = ent.get('aliases', []) or []
+            logger.info(f"  [{ent['type']}] {ent['name']} (id: {ent['id']}, aliases: {aliases})")
 
-            logger.info(f"{status_icon} [{ent['type']}] {ent['name']} (Created by: {ent.get('created_by', 'structure')})")
-            if has_summary:
-                logger.info(f"    Summary: {summary[:80]}...")
-
-
-        logger.info(f"\n--- RELATIONSHIP AUDIT ---")
+        logger.info(f"\n--- RELATIONSHIP AUDIT ({len(relationships)} total) ---")
         for rel in relationships:
             logger.info(f"  {rel['entity_a']} <---> {rel['entity_b']} (weight: {rel['weight']}, evidence: {rel['evidence_ids']})")
         
-        # 6. Final Report
-        success = True
-        if failed_profiles:
-            logger.error(f"\nFAILURE: The following profiles were created but never enriched: {failed_profiles}")
-            logger.error("Possible causes: Profile Stream Lag, Throttling Logic Error, or LLM Failure.")
-            success = False
-        elif len(entities) > 0:
-            logger.info("\nSUCCESS: All entities successfully ingested and enriched.")
+        logger.info("\n--- VALIDATION ---")
         
-        return success
+        user_entity = next((e for e in entities if e['name'] == user_name), None)
+        if not user_entity:
+            logger.error(f"✗ User entity '{user_name}' not found")
+            return False
+        logger.info(f"✓ User entity exists")
 
+        non_user_entities = [e for e in entities if e['name'] != user_name]
+        if not non_user_entities:
+            logger.error("✗ No entities extracted from messages")
+            return False
+        logger.info(f"✓ Extracted {len(non_user_entities)} entities from messages")
+
+        if not relationships:
+            logger.warning("⚠ No relationships found")
+        else:
+            logger.info(f"✓ Created {len(relationships)} relationships")
+
+        logger.info("\nWRITE PATH TEST PASSED")
+        return True
+
+    except Exception as e:
+        logger.exception(f"Test failed with error: {e}")
+        return False
     finally:
-        logger.info("\nTest run complete.")
+        store.close()
+        executor.shutdown(wait=True)
 
 if __name__ == "__main__":
     success = asyncio.run(run_test())

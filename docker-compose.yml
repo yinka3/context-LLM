@@ -1,41 +1,48 @@
 services:
-
   redis:
     image: redis:7-alpine
-
     container_name: vestige-redis
-
     ports:
-      - "6379:6379"
-    
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - ./redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
-      timeout: 20s
+      timeout: 5s
       retries: 5
-      start_period: 15s
-    
     restart: unless-stopped
-  
+
   memgraph:
-    image: memgraph/memgraph-platform
-
+    image: memgraph/memgraph-mage:latest
     container_name: vestige-memgraph
-
     ports:
-      - "7687:7687"
-      - "7474:7474"
-      - "3000:3000"
-    
-    environment:
-      - MEMGRAPH_USER=
-      - MEMGRAPH_PWD=
-
+      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7444:7444"
+    volumes:
+      - mg_lib:/var/lib/memgraph
+      - mg_log:/var/log/memgraph
+    command: ["--log-level=WARNING"]
     healthcheck:
-      test: ["CMD", "mgconsole", "--host", "localhost", "--port", "7687", "-c", "RETURN 1;"]
-      interval: 20s
-      timeout: 15s
+      test: ["CMD", "mg_client", "--host", "localhost", "--port", "7687", "-e", "RETURN 1;"]
+      interval: 10s
+      timeout: 10s
       retries: 5
-      start_period: 30s
-
+      start_period: 10s
     restart: unless-stopped
+
+  memgraph-lab:
+    image: memgraph/lab:latest
+    container_name: vestige-memgraph-lab
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - memgraph
+    environment:
+      - QUICK_CONNECT_MG_HOST=memgraph
+      - QUICK_CONNECT_MG_PORT=7687
+    restart: unless-stopped
+
+volumes:
+  mg_lib:
+  mg_log:

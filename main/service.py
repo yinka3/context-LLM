@@ -1,6 +1,6 @@
 import os
-from typing import Optional, Type, TypeVar
-from openai import AsyncOpenAI
+from typing import Dict, List, Optional, Type, TypeVar
+from openai import AsyncOpenAI, OpenAI
 import instructor
 from loguru import logger
 from pydantic import BaseModel
@@ -26,6 +26,11 @@ class LLMService:
         self._trace = trace_logger
         self._structured_model = structured_model or self.DEFAULT_STRUCTURED_MODEL
         self._reasoning_model = reasoning_model or self.DEFAULT_REASONING_MODEL
+
+        self._client_sync = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=self._api_key
+        )
         
         self._client = AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
@@ -136,5 +141,55 @@ class LLMService:
             if self._trace:
                 self._trace.error(f"[REASONING] Failed: {e}")
             logger.error(f"Reasoning LLM call failed: {e}")
+            return None
+    
+    def call_with_tools_sync(
+        self,
+        system: str,
+        user: str,
+        tools: List[Dict],
+        model: Optional[str] = None,
+        temperature: float = 0.0,
+    ) -> Optional[Dict]:
+        """Sync call with function tools. Returns parsed tool call."""
+        model = model or self._reasoning_model
+        
+        if self._trace:
+            self._trace.debug(f"[TOOLS SYNC] Model: {model}\nTools: {[t['function']['name'] for t in tools]}")
+        
+        try:
+            response = self._client_sync.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user}
+                ],
+                tools=tools,
+                tool_choice="required",
+                temperature=temperature,
+                extra_body={"provider": {"allow_fallbacks": True}}
+            )
+            
+            message = response.choices[0].message
+            
+            tool_calls = []
+            if message.tool_calls:
+                tool_calls = [
+                    {"name": tc.function.name, "arguments": tc.function.arguments}
+                    for tc in message.tool_calls
+                ]
+            
+            if self._trace:
+                self._trace.debug(f"[TOOLS SYNC] Response: {tool_calls}")
+            
+            return {
+                "content": message.content,
+                "tool_calls": tool_calls
+            }
+            
+        except Exception as e:
+            if self._trace:
+                self._trace.error(f"[TOOLS SYNC] Failed: {e}")
+            logger.error(f"Tool call failed: {e}")
             return None
     

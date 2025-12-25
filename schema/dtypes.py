@@ -1,6 +1,7 @@
+from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional, TypedDict, Union
 
 
 class MessageData(BaseModel):
@@ -11,7 +12,6 @@ class MessageData(BaseModel):
 class EntityPair(BaseModel):
     entity_a: str = Field(..., description="First entity canonical_name (alphabetically first).")
     entity_b: str = Field(..., description="Second entity canonical_name (alphabetically second).")
-    entity_b: str = Field(..., description="The second entity")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score 0.0-1.0")
     reason: str = Field(..., description="Short explanation for the connection")
 
@@ -62,3 +62,60 @@ class DisambiguationResult(BaseModel):
         description="One entry per distinct entity. Every input mention must appear "
                     "in exactly one entry. No mention left behind, no mention duplicated."
     )
+
+class BaseResult(TypedDict):
+    status: str
+    state: str
+    tools_used: List[str]
+
+
+class CompleteResult(BaseResult):
+    response: str
+    messages: List[Dict]
+    profiles: List[Dict]
+    graph: List[Dict]
+    web: List[Dict]
+
+
+class ClarificationResult(BaseResult):
+    question: str
+
+
+RunResult = Union[CompleteResult, ClarificationResult]
+
+@dataclass
+class ToolCall:
+    name: str
+    args: Dict = field(default_factory=dict)
+
+
+@dataclass 
+class FinalResponse:
+    content: str
+
+
+@dataclass
+class ClarificationRequest:
+    question: str
+
+
+StellaResponse = Union[ToolCall, FinalResponse, ClarificationRequest]
+
+@dataclass
+class TraceEntry:
+    step: int
+    state: str
+    tool: str
+    args: Dict
+    resolved_args: Dict
+    result_summary: str
+    result_count: int
+    duration_ms: float
+    error: Optional[str] = None
+
+@dataclass
+class QueryTrace:
+    trace_id: str
+    user_query: str
+    started_at: datetime
+    entries: List[TraceEntry] = field(default_factory=list)

@@ -91,7 +91,7 @@ class BatchProcessor:
             result.new_entity_ids = new_ids
             result.alias_updated_ids = alias_ids
             
-            user_id = self.ent_resolver._name_to_id.get(self.user_name)
+            user_id = self.ent_resolver.get_id(self.user_name)
             if user_id and user_id not in entity_ids:
                 entity_ids.append(user_id)
             
@@ -143,7 +143,7 @@ class BatchProcessor:
         matched_ids = set()
         
         for mention_name, _, _ in mentions:
-            entity_id = self.ent_resolver._name_to_id.get(mention_name)
+            entity_id = self.ent_resolver.get_id(mention_name)
             if entity_id:
                 matched_ids.add(entity_id)
                 continue
