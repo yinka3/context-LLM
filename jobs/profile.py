@@ -74,7 +74,7 @@ class ProfileRefinementJob(BaseJob):
             return False
         
         success = await self._refine_user_profile(ctx, user_id, profile)
-        
+
         await ctx.redis.setex(ran_key, 3600, "true")
         
         return success

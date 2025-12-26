@@ -83,7 +83,9 @@ class BatchProcessor:
             
             disambiguation = await self._disambiguate(mentions, messages, known_entities)
             if not disambiguation.entries:
-                logger.info("No disambiguation results, skipping")
+                logger.error("Disambiguation failed - no results returned")
+                result.success = False
+                result.error = "VEGAPUNK-02 returned empty disambiguation"
                 return result
             
             entity_ids, new_ids, alias_ids = await self._resolve(disambiguation)

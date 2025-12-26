@@ -97,7 +97,7 @@ class Context:
 
         instance.scheduler = Scheduler(user_name)
         instance.scheduler.register(
-            MergeDetectionJob(instance.ent_resolver, instance.store, instance.llm)
+            MergeDetectionJob(instance.ent_resolver, instance.store, instance.llm, instance._batch_processing_lock)
         )
         instance.scheduler.register(DLQReplayJob())
         instance.scheduler.register(

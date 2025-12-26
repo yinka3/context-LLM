@@ -64,10 +64,14 @@ class MemGraphStore:
                         e.embedding = $embedding
                     ON MATCH SET 
                         e.canonical_name = $canonical_name,
-                        e.aliases = apoc.coll.toSet(coalesce(e.aliases, []) + $aliases),
                         e.confidence = $confidence,
                         e.last_updated = timestamp(),
                         e.last_mentioned = timestamp()
+
+                    WITH e
+                    UNWIND coalesce(e.aliases, []) + $aliases AS alias
+                    WITH e, collect(DISTINCT alias) AS unique_aliases
+                    SET e.aliases = unique_aliases
 
                     WITH e
                     FOREACH (_ IN CASE WHEN $topic IS NOT NULL AND $topic <> "" THEN [1] ELSE [] END |
@@ -91,8 +95,12 @@ class MemGraphStore:
                     ON MATCH SET 
                         r.weight = r.weight + 1,
                         r.confidence = CASE WHEN $confidence > r.confidence THEN $confidence ELSE r.confidence END,
-                        r.last_seen = timestamp(),
-                        r.message_ids = apoc.coll.toSet(r.message_ids + [$message_id])
+                        r.last_seen = timestamp()
+                       
+                    WITH r
+                    UNWIND coalesce(r.message_ids, []) + [$message_id] AS mid
+                    WITH r, collect(DISTINCT mid) AS unique_ids
+                    SET r.message_ids = unique_ids
                 """, **rel)
 
         with self.driver.session() as session:
@@ -405,7 +413,11 @@ class MemGraphStore:
         MATCH (p:Entity {id: $primary_id})
         MATCH (s:Entity {id: $secondary_id})
 
-        SET p.aliases = apoc.coll.toSet(coalesce(p.aliases, []) + coalesce(s.aliases, []) + [s.canonical_name]),
+        WITH p, s, coalesce(p.aliases, []) + coalesce(s.aliases, []) + [s.canonical_name] AS combined_aliases
+        UNWIND combined_aliases AS alias
+        WITH p, s, collect(DISTINCT alias) AS unique_aliases
+
+        SET p.aliases = unique_aliases,
             p.summary = $summary,
             p.confidence = CASE WHEN coalesce(s.confidence, 0) > coalesce(p.confidence, 0) THEN s.confidence ELSE p.confidence END,
             p.last_mentioned = CASE WHEN coalesce(s.last_mentioned, 0) > coalesce(p.last_mentioned, 0) THEN s.last_mentioned ELSE p.last_mentioned END,
@@ -416,19 +428,24 @@ class MemGraphStore:
         OPTIONAL MATCH (s)-[r_source:RELATED_TO]-(target:Entity)
         WHERE target.id <> p.id
 
-        FOREACH (_ IN CASE WHEN r_source IS NOT NULL THEN [1] ELSE [] END |
-            MERGE (p)-[r_target:RELATED_TO]-(target)
-            ON CREATE SET 
-                r_target.weight = r_source.weight,
-                r_target.confidence = r_source.confidence,
-                r_target.message_ids = r_source.message_ids,
-                r_target.last_seen = r_source.last_seen
-            ON MATCH SET
-                r_target.weight = r_target.weight + r_source.weight,
-                r_target.confidence = CASE WHEN r_source.confidence > r_target.confidence THEN r_source.confidence ELSE r_target.confidence END,
-                r_target.message_ids = apoc.coll.toSet(coalesce(r_target.message_ids, []) + coalesce(r_source.message_ids, [])),
-                r_target.last_seen = CASE WHEN r_source.last_seen > r_target.last_seen THEN r_source.last_seen ELSE r_target.last_seen END
-        )
+        WITH p, s, r_source, target
+        WHERE r_source IS NOT NULL
+
+        MERGE (p)-[r_target:RELATED_TO]-(target)
+        ON CREATE SET 
+            r_target.weight = r_source.weight,
+            r_target.confidence = r_source.confidence,
+            r_target.message_ids = r_source.message_ids,
+            r_target.last_seen = r_source.last_seen
+        ON MATCH SET
+            r_target.weight = r_target.weight + r_source.weight,
+            r_target.confidence = CASE WHEN r_source.confidence > r_target.confidence THEN r_source.confidence ELSE r_target.confidence END,
+            r_target.last_seen = CASE WHEN r_source.last_seen > r_target.last_seen THEN r_source.last_seen ELSE r_target.last_seen END
+
+        WITH p, s, r_target, r_source
+        UNWIND coalesce(r_target.message_ids, []) + coalesce(r_source.message_ids, []) AS mid
+        WITH p, s, r_target, collect(DISTINCT mid) AS unique_mids
+        SET r_target.message_ids = unique_mids
 
         WITH DISTINCT s
         DETACH DELETE s
