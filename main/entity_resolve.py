@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from loguru import logger
 import threading
 from typing import Dict, List, Optional, Tuple
-from rapidfuzz import process as fuzz
+from rapidfuzz import fuzz
 import faiss
 import re
 import numpy as np
@@ -209,55 +209,28 @@ class EntityResolver:
         candidates = []
         seen_pairs = set()
         
-        # PASS 1: Name-based detection (case-insensitive exact matches)
+        # phase 1 to gather candidate pairs
         name_to_ids: dict[str, list[int]] = {}
         for ent_id, profile in self.entity_profiles.items():
             canonical = profile.get("canonical_name", "")
             if canonical:
                 key = canonical.lower().strip()
-                if key not in name_to_ids:
-                    name_to_ids[key] = []
-                name_to_ids[key].append(ent_id)
+                name_to_ids.setdefault(key, []).append(ent_id)
         
-        for _, ids in name_to_ids.items():
+        for ids in name_to_ids.values():
             if len(ids) < 2:
                 continue
-            
             for i, id_a in enumerate(ids):
                 for id_b in ids[i + 1:]:
-                    pair = tuple(sorted([id_a, id_b]))
-                    if pair in seen_pairs:
-                        continue
-                    seen_pairs.add(pair)
-                    
-                    profile_a = self.entity_profiles.get(id_a, {})
-                    profile_b = self.entity_profiles.get(id_b, {})
-                    
-                    logger.info(
-                        f"Name match: ({id_a}, {id_b}) "
-                        f"{profile_a.get('canonical_name')} <-> {profile_b.get('canonical_name')} | "
-                        f"Decision=APPROVED"
-                    )
-                    
-                    primary_id, secondary_id = pair
-                    candidates.append({
-                        "primary_id": primary_id,
-                        "secondary_id": secondary_id,
-                        "primary_name": self.entity_profiles[primary_id].get("canonical_name", "Unknown"),
-                        "secondary_name": self.entity_profiles[secondary_id].get("canonical_name", "Unknown"),
-                        "faiss_score": 1.0,
-                        "cross_score": 1.0
-                    })
+                    seen_pairs.add(tuple(sorted([id_a, id_b])))
         
-        # PASS 2: Summary-based detection (different names, same entity)
+        # Summary-based detection
         for entity_id, profile in self.entity_profiles.items():
             summary = profile.get("summary", "")
-            entity_type = profile.get("type")
-            canonical_name = profile.get("canonical_name", "Unknown")
-            
             if not summary:
                 continue
             
+            canonical_name = profile.get("canonical_name", "Unknown")
             match = re.match(r'^(.+?[.!?])(?:\s+[A-Z]|$)', summary)
             first_sentence = match.group(1).strip() if match else summary[:200].strip()
             
@@ -268,62 +241,54 @@ class EntityResolver:
             with self._lock:
                 if self.index_id_map.ntotal == 0:
                     continue
-                
                 scores, indices = self.index_id_map.search(embedding, k=5)
             
-            for match_id, faiss_score in zip(indices[0], scores[0]):
+            for match_id, score in zip(indices[0], scores[0]):
                 match_id = int(match_id)
-                
                 if match_id == -1 or match_id == entity_id:
                     continue
-                
-                match_profile = self.entity_profiles.get(match_id)
-                if not match_profile:
-                    continue
-                
-                pair = tuple(sorted([entity_id, match_id]))
-                if pair in seen_pairs:
-                    continue
-                
-                match_type = match_profile.get("type")
-                match_name = match_profile.get("canonical_name", "Unknown")
-                
-                # Fuzzy name check to bypass type mismatch
-                name_score = fuzz.WRatio(canonical_name.lower(), match_name.lower())
-                names_similar = name_score >= 85
-                
-                if entity_type != match_type and not names_similar:
-                    logger.debug(
-                        f"Type mismatch: {canonical_name} ({entity_type}) vs "
-                        f"{match_name} ({match_type}), skipping"
-                    )
-                    continue
-                
-                if faiss_score < 0.50:
-                    continue
-                
-                primary_text = f"{canonical_name}. {profile.get('summary', '')[:150]}"
-                secondary_text = f"{match_name}. {match_profile.get('summary', '')[:150]}"
-                cross_score = float(self.cross_encoder.predict([[primary_text, secondary_text]])[0])
-                
-                seen_pairs.add(pair)
-                
-                decision = "APPROVED" if cross_score >= 0.65 else "REJECTED"
-                logger.info(
-                    f"Summary match: ({entity_id}, {match_id}) {canonical_name} <-> {match_name} | "
-                    f"FAISS={faiss_score:.3f} Cross={cross_score:.3f} Fuzzy={name_score} Decision={decision}"
-                )
-                
-                if cross_score >= 0.65:
-                    primary_id, secondary_id = pair
-                    candidates.append({
-                        "primary_id": primary_id,
-                        "secondary_id": secondary_id,
-                        "primary_name": self.entity_profiles[primary_id].get("canonical_name", "Unknown"),
-                        "secondary_name": self.entity_profiles[secondary_id].get("canonical_name", "Unknown"),
-                        "faiss_score": float(faiss_score),
-                        "cross_score": cross_score
-                    })
+                if score >= 0.50:
+                    seen_pairs.add(tuple(sorted([entity_id, match_id])))
+        
+        for id_a, id_b in seen_pairs:
+            profile_a = self.entity_profiles.get(id_a, {})
+            profile_b = self.entity_profiles.get(id_b, {})
+            
+            summary_a = profile_a.get("summary", "")
+            summary_b = profile_b.get("summary", "")
+            
+            if not summary_a or not summary_b:
+                logger.debug(f"Skipping ({id_a}, {id_b}): empty summary")
+                continue
+            
+            name_a = profile_a.get("canonical_name", "Unknown")
+            name_b = profile_b.get("canonical_name", "Unknown")
+            
+            text_a = f"{name_a}. {summary_a[:150]}"
+            text_b = f"{name_b}. {summary_b[:150]}"
+            cross_score = float(self.cross_encoder.predict([[text_a, text_b]])[0])
+            
+            if cross_score < 0.65:
+                logger.info(f"Rejected ({id_a}, {id_b}) {name_a} <-> {name_b} | Cross={cross_score:.3f}")
+                continue
+            
+            # Relationship check
+            if self.store.has_direct_edge(id_a, id_b):
+                logger.info(f"Blocked ({id_a}, {id_b}) {name_a} <-> {name_b} | Direct edge exists")
+                continue
+            
+            if cross_score >= 0.93:
+                logger.info(f"Candidate ({id_a}, {id_b}) {name_a} <-> {name_b} | Cross={cross_score:.3f} → AUTO")
+            else:
+                logger.info(f"Candidate ({id_a}, {id_b}) {name_a} <-> {name_b} | Cross={cross_score:.3f} → HITL")
+
+            candidates.append({
+                "primary_id": id_a,
+                "secondary_id": id_b,
+                "primary_name": name_a,
+                "secondary_name": name_b,
+                "cross_score": cross_score
+            })
         
         logger.info(f"Merge detection complete: {len(candidates)} candidates found")
         return candidates

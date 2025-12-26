@@ -188,6 +188,15 @@ class MemGraphStore:
             if deleted > 0:
                 logger.info(f"Cleaned up {deleted} null-type entities")
             return deleted
+    
+    def has_direct_edge(self, id_a: int, id_b: int) -> bool:
+        query = """
+        MATCH (a:Entity {id: $id_a})-[r:RELATED_TO]-(b:Entity {id: $id_b})
+        RETURN count(r) > 0 as connected
+        """
+        with self.driver.session() as session:
+            result = session.run(query, {"id_a": id_a, "id_b": id_b}).single()
+            return result["connected"] if result else False
 
     def set_topic_status(self, topic_name: str, status: str):
         """Handles Topic State (active/inactive/hot)"""

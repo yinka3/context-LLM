@@ -114,23 +114,19 @@ class BatchProcessor:
         """Run NER and emotion detection across all messages."""
         loop = asyncio.get_running_loop()
         
-        mention_tasks = [
-            self.nlp.extract_mentions(self.user_name, self.topics, m["message"])
-            for m in messages
-        ]
+        combined_text = "\n".join([f"[MSG {m['id']}]: {m['message']}" for m in messages])
+        mentions = await self.nlp.extract_mentions(self.user_name, self.topics, combined_text)
+        
+        unique_mentions: Dict[str, Dict] = {}
+        for text, typ, topic in mentions:
+            if text not in unique_mentions:
+                unique_mentions[text] = {"type": typ, "topic": topic}
+        
         emotion_tasks = [
             loop.run_in_executor(self.executor, self.nlp.analyze_emotion, m["message"])
             for m in messages
         ]
-        
-        all_mentions = await asyncio.gather(*mention_tasks)
         all_emotions = await asyncio.gather(*emotion_tasks)
-        
-        unique_mentions: Dict[str, Dict] = {}
-        for mentions in all_mentions:
-            for text, typ, topic in mentions:
-                if text not in unique_mentions:
-                    unique_mentions[text] = {"type": typ, "topic": topic}
         
         emotions = []
         for emotion_list in all_emotions:

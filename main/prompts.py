@@ -99,6 +99,36 @@ The aliases list is your first check, not your only check.
 - When using contextual evidence, include ALL related mentions in the same EXISTING entry so they get registered as aliases.
 </alias_matching>
 
+<explicit_disambiguation>
+CRITICAL: User-provided disambiguation signals OVERRIDE name matching.
+
+When {user_name} explicitly indicates a mention refers to a DIFFERENT entity than one in known_entities, trust them. They know their own life better than you do.
+
+**Disambiguation patterns that trigger NEW_SINGLE:**
+- Parenthetical qualifiers: "(different X)", "(not the same X)", "(another X)", "(the Y one)"
+  - "jaylen's friend elena (different elena)" → NEW_SINGLE | Elena
+  - "met a marcus (not my marcus)" → NEW_SINGLE | Marcus
+  
+- Possessive + new relationship: "[person]'s [relationship] [name]" where the relationship contradicts known_entities
+  - "jaylen's friend elena" when existing Elena has no connection to Jaylen → likely NEW_SINGLE
+  - "my coworker sarah" when existing Sarah is labeled as "neighbor" → likely NEW_SINGLE
+
+- Explicit differentiation statements:
+  - "another elena" / "a different mike" / "not that sarah"
+  - "there's this guy named X" (introducing someone new, even if X exists)
+
+**How to handle:**
+1. Detect the disambiguation signal
+2. Create NEW_SINGLE with the name as-is
+3. Downstream profile refinement and relationship extraction will capture the distinguishing context
+
+**Do NOT dismiss these signals as "relationship details":**
+- WRONG: "The mention is just 'Elena' and Elena exists, so EXISTING. The 'different' part is just context."
+- RIGHT: "User explicitly said 'different elena' — this is a distinct person → NEW_SINGLE | Elena"
+
+The user is giving you a gift: explicit disambiguation. Use it.
+</explicit_disambiguation>
+
 <partial_match_detection>
 If no exact alias match, actively scan known_entities for potential matches:
 
@@ -107,6 +137,8 @@ If no exact alias match, actively scan known_entities for potential matches:
 - Partial names: "Marcus" could match "Marcus Thompson" (first name subset)
 - Honorific removal: "Ramirez" could match "Professor Ramirez" (last name only)
 - Abbreviations: "BU" could match "Boston University", "MIT" could match "Massachusetts Institute of Technology"
+- Possessive forms: "Weis" could match "Wei", "Dannys" could match "Danny"
+(informal text often drops apostrophes in possessives)
 
 **Confirmation required:**
 - Partial match alone is not enough
@@ -202,7 +234,6 @@ Each resolution entry needs entity_type. Pull from the original mentions list:
 - canonical_name spelling must be exact—for EXISTING use VEGAPUNK-02's spelling, for NEW use the mention text verbatim
 </output_rules>
 """
-
 
 def get_connection_reasoning_prompt(user_name: str, messages_text: str) -> str:
   return f"""
@@ -351,7 +382,7 @@ def ner_prompt(user_name, topics_list):
   You are VEGAPUNK -01, you have the first main operation in this process and have an important job, you are a named entity recognition system for a personal knowledge graph.
 
 <your_purpose>
-You are to read the user,{user_name}'s messages, they are talking to you and they would like you to listen to them. <find_entities>Find important entities in terms of relevance to the text given. 
+You are to read the user, {user_name}'s messages, they are talking to you and they would like you to listen to them. You will receive multiple messages at once, each marked with [MSG id]. Extract entities from all of them together — if the same entity appears across messages, only extract it once. Using the information in <finding_entities> find important entities in terms of relevance to the text given.
 </your_purpose>
 
 <speaker_context>
