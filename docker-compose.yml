@@ -6,15 +6,17 @@ services:
       - "127.0.0.1:6379:6379"
     volumes:
       - ./redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 5s
     restart: unless-stopped
 
   memgraph:
-    image: memgraph/memgraph-mage:latest
+    image: memgraph/memgraph:latest
     container_name: vestige-memgraph
     ports:
       - "127.0.0.1:7687:7687"
@@ -24,10 +26,10 @@ services:
       - mg_log:/var/log/memgraph
     command: ["--log-level=WARNING"]
     healthcheck:
-      test: ["CMD", "mg_client", "--host", "localhost", "--port", "7687", "-e", "RETURN 1;"]
+      test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole --host localhost --port 7687"]
       interval: 10s
       timeout: 10s
-      retries: 5
+      retries: 3
       start_period: 10s
     restart: unless-stopped
 
@@ -37,7 +39,8 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:
-      - memgraph
+      memgraph:
+        condition: service_healthy
     environment:
       - QUICK_CONNECT_MG_HOST=memgraph
       - QUICK_CONNECT_MG_PORT=7687

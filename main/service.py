@@ -9,8 +9,8 @@ T = TypeVar('T', bound=BaseModel)
 
 class LLMService:
 
-    DEFAULT_STRUCTURED_MODEL = "meta-llama/llama-3.3-70b-instruct"
-    DEFAULT_REASONING_MODEL = "anthropic/claude-sonnet-4"
+    DEFAULT_STRUCTURED_MODEL = "google/gemini-2.5-flash"
+    DEFAULT_REASONING_MODEL = "google/gemini-2.5-flash"
     
     def __init__(
         self,
@@ -108,10 +108,11 @@ class LLMService:
         system: str,
         user: str,
         model: Optional[str] = None,
-        temperature: float = 1.0,
+        temperature: float = 0.6
     ) -> Optional[str]:
         """Free-form reasoning, returns raw text. Returns None on failure."""
         model = model or self._reasoning_model
+
         
         if self._trace:
             self._trace.debug(
@@ -127,7 +128,7 @@ class LLMService:
                     {"role": "user", "content": user}
                 ],
                 temperature=temperature,
-                extra_body={"provider": {"allow_fallbacks": True}}
+                extra_body={"provider": {"allow_fallbacks": True}, "thinkingBudget": 0}
             )
             
             content = response.choices[0].message.content

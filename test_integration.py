@@ -16,11 +16,11 @@ from log.logging_setup import setup_logging
 from neo4j import GraphDatabase
 from main.context import Context
 from schema.dtypes import MessageData
-from long_test_msgs import MAYA_MESSAGES_V2
-
+# from long_test_msgs import MAYA_MESSAGES_V2
+from test_messages import ALEX_MESSAGES
 setup_logging(log_level="INFO", log_file="test_integration.log")
 
-TEST_MESSAGES = MAYA_MESSAGES_V2
+TEST_MESSAGES = ALEX_MESSAGES
 
 MEMGRAPH_URI = "bolt://localhost:7687"
 
@@ -104,15 +104,15 @@ async def run_test():
     if not check_redis_connection() or not check_memgraph_connection():
         return False
 
-    user_name = "Maya"
+    user_name = "Alex"
     topics = [
-        "Academic Progression & Research",
-        "Romantic Relationships & Dynamics", 
-        "Friendships & Social Dynamics",
-        "Family Connections & Transitions",
-        "Mental Health & Emotional States",
+        "Career & Professional Growth",
+        "Post-Breakup & Dating Life",
+        "Friendships & Social Circles",
+        "Family Relationships",
+        "Health & Fitness",
         "Daily Life & Routines",
-        "Future Planning & Aspirations",
+        "Personal Growth & Self-Improvement",
     ]
 
     store = MemGraphStore(uri=MEMGRAPH_URI)
