@@ -206,6 +206,18 @@ class MemGraphStore:
         with self.driver.session() as session:
             result = session.run(query, {"entity_id": entity_id})
             return {record["neighbor_id"] for record in result}
+    
+    def get_entities_by_name(self, name: str) -> List[Dict]:
+        query = """
+        MATCH (e:Entity)
+        WHERE toLower(e.canonical_name) = toLower($name)
+        OR any(alias IN e.aliases WHERE toLower(alias) = toLower($name))
+        RETURN e.id as id, e.canonical_name as canonical_name, 
+            e.type as type, e.aliases as aliases, e.summary as summary
+        """
+        with self.driver.session() as session:
+            result = session.run(query, {"name": name})
+            return [dict(record) for record in result]
 
     def set_topic_status(self, topic_name: str, status: str):
         """Handles Topic State (active/inactive/hot)"""

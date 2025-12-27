@@ -1,7 +1,6 @@
 import asyncio
 import json
 from datetime import datetime, timezone
-import time
 from typing import TYPE_CHECKING, Optional
 import numpy as np
 from loguru import logger
@@ -26,30 +25,19 @@ class MergeDetectionJob(BaseJob):
     AUTO_MERGE_THRESHOLD = 0.93
     HITL_THRESHOLD = 0.65
 
-    def __init__(self, user_name: str, ent_resolver: "EntityResolver", store: "MemGraphStore", llm_client: LLMService, batch_lock: asyncio.Lock):
+    def __init__(self, user_name: str, ent_resolver: "EntityResolver", store: "MemGraphStore", llm_client: LLMService):
         self.user_name = user_name
         self.ent_resolver = ent_resolver
         self.store = store
         self.llm = llm_client
-        self.batch_lock = batch_lock
     
     @property
     def name(self) -> str:
         return "merge_detection"
     
     async def should_run(self, ctx: JobContext) -> bool:
-        ran_key = f"merge_ran:{ctx.user_name}"
-        if await ctx.redis.get(ran_key):
-            return False
-
-        profile_complete_key = f"profile_complete:{ctx.user_name}"
-        if not await ctx.redis.get(profile_complete_key):
-            return False
-        
-        # if ctx.idle_seconds < self.IDLE_THRESHOLD:
-        #     return False
-        
-        return True
+        profile_complete = await ctx.redis.get(f"profile_complete:{ctx.user_name}")
+        return profile_complete is not None
     
     async def execute(self, ctx: JobContext) -> JobResult:
         warning = "⚠️ **Memory Consolidation in Progress.** I am currently merging duplicate entities. Answers regarding these people might be temporarily inconsistent."
@@ -57,59 +45,58 @@ class MergeDetectionJob(BaseJob):
         async with JobNotifier(ctx.redis, warning):
             lock_key = "system:maintenance_lock"
             await ctx.redis.set(lock_key, "true", ex=600)
-            async with self.batch_lock:
-                try:
-                    logger.info("Batch Lock passed to Merge Job")
-                    await ctx.redis.set(f"merge_ran:{ctx.user_name}", "true")
-                    
-                    candidates = self.ent_resolver.detect_merge_candidates()
-                    
-                    if not candidates:
-                        return JobResult(success=True, summary="No merge candidates found")
-                    
-                    auto_merge, hitl = [], []
-    
-                    for candidate in candidates:
-                        score = await self._get_merge_judgment(candidate)
-                        if score is None:
-                            continue
-                        
-                        candidate["llm_score"] = score
-                        
-                        if score >= self.AUTO_MERGE_THRESHOLD:
-                            auto_merge.append(candidate)
-                        elif score >= self.HITL_THRESHOLD:
-                            hitl.append(candidate)
-                        else:
-                            logger.info(f"Rejected ({candidate['primary_id']}, {candidate['secondary_id']}) | LLM={score:.3f}")
+            try:
+                logger.info("Batch Lock passed to Merge Job")
+                await ctx.redis.set(f"merge_ran:{ctx.user_name}", "true")
+                
+                candidates = self.ent_resolver.detect_merge_candidates()
+                
+                if not candidates:
+                    return JobResult(success=True, summary="No merge candidates found")
+                
+                auto_merge, hitl = [], []
 
-                    logger.info(f"Merge split: {len(auto_merge)} auto, {len(hitl)} HITL")
+                for candidate in candidates:
+                    score = await self._get_merge_judgment(candidate)
+                    if score is None:
+                        continue
                     
-                    merged_ids = set()
-                    successful = 0
-                    failed = 0
+                    candidate["llm_score"] = score
                     
-                    for candidate in auto_merge:
-                        primary_id = candidate["primary_id"]
-                        secondary_id = candidate["secondary_id"]
-                        
-                        if primary_id in merged_ids or secondary_id in merged_ids:
-                            continue
-                        
-                        success = await self._execute_merge(ctx.user_name, primary_id, secondary_id)
-                        
-                        if success:
-                            merged_ids.add(secondary_id)
-                            successful += 1
-                            self._sync_resolver(primary_id, secondary_id)
-                        else:
-                            failed += 1
+                    if score >= self.AUTO_MERGE_THRESHOLD:
+                        auto_merge.append(candidate)
+                    elif score >= self.HITL_THRESHOLD:
+                        hitl.append(candidate)
+                    else:
+                        logger.info(f"Rejected ({candidate['primary_id']}, {candidate['secondary_id']}) | LLM={score:.3f}")
+
+                logger.info(f"Merge split: {len(auto_merge)} auto, {len(hitl)} HITL")
+                
+                merged_ids = set()
+                successful = 0
+                failed = 0
+                
+                for candidate in auto_merge:
+                    primary_id = candidate["primary_id"]
+                    secondary_id = candidate["secondary_id"]
                     
-                    proposals_stored = await self._store_hitl_proposals(ctx, hitl, merged_ids)
-                                    
-                finally:
-                    await ctx.redis.delete(lock_key)
-                    logger.info("Maintenance Complete. Resuming Write Path.")
+                    if primary_id in merged_ids or secondary_id in merged_ids:
+                        continue
+                    
+                    success = await self._execute_merge(ctx.user_name, primary_id, secondary_id)
+                    
+                    if success:
+                        merged_ids.add(secondary_id)
+                        successful += 1
+                        self._sync_resolver(primary_id, secondary_id)
+                    else:
+                        failed += 1
+                
+                proposals_stored = await self._store_hitl_proposals(ctx, hitl, merged_ids)
+                                
+            finally:
+                await ctx.redis.delete(lock_key)
+                logger.info("Maintenance Complete. Resuming Write Path.")
 
             return JobResult(
                 success=True,

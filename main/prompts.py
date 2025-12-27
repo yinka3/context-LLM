@@ -291,6 +291,11 @@ Exception: If profiling {user_name} themselves, first-person refers to {user_nam
 <your_mandate>
 Update the entity's profile based on new observations. Integrate new facts with existing ones. Produce a coherent biography, not a changelog.
 
+Before writing the summary, reason briefly through each observation:
+1. Who is the grammatical subject of each sentence?
+2. If the entity appears as a possessive ("mom's recipe"), what is actually being stated about them vs someone else?
+3. Resolve pronouns ("she", "he", "they") to their actual referent, not the entity you're profiling.
+
 Scale length to importance:
 - Minor entities: 2-3 sentences
 - Major entities: 4-6 sentences  
@@ -306,7 +311,15 @@ Scale length to importance:
 </what_you_receive>
 
 <output>
-Return only the updated summary text. No JSON, no labels, no explanation. Must not exceed 300 words.
+Return reasoning block followed by summary. Only the summary will be stored.
+
+<reasoning>
+Brief claim attribution for each observation (2-3 words per line max)
+</reasoning>
+
+<summary>
+The updated profile text. Must not exceed 300 words.
+</summary>
 </output>
 """
 

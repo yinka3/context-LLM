@@ -9,6 +9,7 @@ import redis.asyncio as redis
 from loguru import logger
 from rapidfuzz import process as fuzzy_process, fuzz
 from typing import Dict, List, Set, Tuple, Optional
+from db.memgraph import MemGraphStore
 from main.service import LLMService
 from main.nlp_pipe import NLPPipeline
 from main.entity_resolve import EntityResolver
@@ -43,6 +44,7 @@ class BatchProcessor:
             llm: LLMService,
             ent_resolver: EntityResolver,
             nlp_pipe: NLPPipeline,
+            store: MemGraphStore,
             cpu_executor: ThreadPoolExecutor,
             user_name: str,
             active_topics: List[str],
@@ -52,6 +54,7 @@ class BatchProcessor:
             self.llm = llm
             self.ent_resolver = ent_resolver
             self.nlp = nlp_pipe
+            self.store = store
             self.executor = cpu_executor
             self.user_name = user_name
             self.topics = active_topics
@@ -137,39 +140,20 @@ class BatchProcessor:
         return unique_mentions, emotions
 
     async def _build_known_entities(self, mentions: List[Tuple[str, str, str]]) -> List[Dict]:
-        """Tiered lookup: exact then fuzzy against resolver."""
         matched_ids = set()
+        known = []
         
         for mention_name, _, _ in mentions:
-            entity_id = self.ent_resolver.get_id(mention_name)
-            if entity_id:
-                matched_ids.add(entity_id)
-                continue
-            
-            if self.ent_resolver._name_to_id:
-                result = fuzzy_process.extractOne(
-                    query=mention_name,
-                    choices=self.ent_resolver._name_to_id.keys(),
-                    scorer=fuzz.WRatio,
-                    score_cutoff=85
-                )
-                if result:
-                    matched_name, score, _ = result
-                    logger.debug(f"Fuzzy matched '{mention_name}' -> '{matched_name}' (score={score})")
-                    matched_ids.add(self.ent_resolver._name_to_id[matched_name])
-        
-        known = []
-        for ent_id in matched_ids:
-            profile = self.ent_resolver.entity_profiles.get(ent_id)
-            if profile:
-                entity = {
-                    "canonical_name": profile.get("canonical_name"),
-                    "type": profile.get("type"),
-                    "aliases": self.ent_resolver.get_mentions_for_id(ent_id)
-                }
-                if profile.get("summary"):
-                    entity["summary"] = profile["summary"]
-                known.append(entity)
+            entities = self.store.get_entities_by_name(mention_name)
+            for ent in entities:
+                if ent["id"] not in matched_ids:
+                    matched_ids.add(ent["id"])
+                    known.append({
+                        "canonical_name": ent["canonical_name"],
+                        "type": ent["type"],
+                        "aliases": ent["aliases"] or [],
+                        "summary": ent.get("summary") or ""
+                    })
         
         return known
 

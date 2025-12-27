@@ -4,6 +4,7 @@ import redis.asyncio as redis
 from concurrent.futures import ThreadPoolExecutor
 from loguru import logger
 import json
+from jobs.base import BaseJob, JobContext
 from jobs.dlq import DLQReplayJob
 from jobs.profile import ProfileRefinementJob
 from jobs.scheduler import Scheduler
@@ -25,7 +26,7 @@ load_dotenv()
 
 BATCH_SIZE = 5
 PROFILE_INTERVAL = 15
-
+SESSION_WINDOW = 50
 BATCH_TIMEOUT_SECONDS = 180.0
 
 class Context:
@@ -47,7 +48,8 @@ class Context:
         self._batch_timer_task: asyncio.Task = None
         self._batch_processing_lock = asyncio.Lock()
         self.batch_processor: BatchProcessor = None
-
+        self.profile_job: BaseJob = None
+        self.merge_job: BaseJob = None
         self.trace_logger = get_trace_logger()
 
     @classmethod
@@ -89,23 +91,24 @@ class Context:
             llm=instance.llm,
             ent_resolver=instance.ent_resolver,
             nlp_pipe=instance.nlp_pipe,
+            store=instance.store,
             cpu_executor=instance.executor,
             user_name=user_name,
             active_topics=topics,
-            get_next_ent_id=instance.get_next_ent_id,
-        )
+            get_next_ent_id=instance.get_next_ent_id)
 
+        instance.profile_job = ProfileRefinementJob(
+            llm=instance.llm,
+            resolver=instance.ent_resolver,
+            store=instance.store,
+            executor=instance.executor)
+        
+        instance.merge_job = MergeDetectionJob(
+            user_name, instance.ent_resolver, instance.store, instance.llm)
+
+        # Scheduler only gets DLQ
         instance.scheduler = Scheduler(user_name)
-        instance.scheduler.register(
-            MergeDetectionJob(user_name, instance.ent_resolver, instance.store, instance.llm, instance._batch_processing_lock)
-        )
         instance.scheduler.register(DLQReplayJob())
-        instance.scheduler.register(
-            ProfileRefinementJob(llm=instance.llm, 
-                                 resolver=instance.ent_resolver,
-                                 store=instance.store,
-                                 executor=instance.executor)
-        )
         await instance.scheduler.start()
         
         return instance
@@ -213,11 +216,29 @@ class Context:
         while await self.redis_client.llen(buffer_key) > 0:
             await self.process_batch()
         
+        logger.info("Running Last job sequence before shutdown")
+        await self._run_session_jobs()
+
+        await asyncio.sleep(SESSION_WINDOW // 2)
         if self._background_tasks:
             logger.info(f"Waiting for {len(self._background_tasks)} background tasks...")
             await asyncio.wait(self._background_tasks, timeout=90)
         
         logger.info("Shutdown complete")
+    
+    async def _run_session_jobs(self):
+        async with self._batch_processing_lock:
+            ctx = JobContext(
+                user_name=self.user_name,
+                redis=self.redis_client,
+                idle_seconds=0
+            )
+            
+            if await self.profile_job.should_run(ctx):
+                await self.profile_job.execute(ctx)
+            
+            if await self.merge_job.should_run(ctx):
+                await self.merge_job.execute(ctx)
 
     async def add(self, msg: MessageData):
         msg.id = await self.get_next_msg_id()
@@ -240,9 +261,16 @@ class Context:
             self._fire_and_forget(self.process_batch())
         elif buffer_len == 1:
             self._batch_timer_task = asyncio.create_task(self._flush_batch_timeout())
+        
+        checkpoint_key = f"checkpoint_count:{self.user_name}"
+        count = await self.redis_client.incr(checkpoint_key)
+
+        if count >= SESSION_WINDOW // 2:
+            await self.redis_client.set(checkpoint_key, 0)
+            self._fire_and_forget(self._run_session_jobs())
 
     
-    async def get_recent_context(self, num_messages: int = 10) -> List[Tuple[str, str]]:
+    async def get_recent_context(self, num_messages: int) -> List[Tuple[str, str]]:
         """Returns list of (formatted_message, raw_message) tuples."""
         sorted_set_key = f"recent_messages:{self.user_name}"
         recent_msg_ids = await self.redis_client.zrevrange(sorted_set_key, 0, num_messages-1)
@@ -281,7 +309,7 @@ class Context:
             'timestamp': msg.timestamp.isoformat()
         }))
         pipe.zadd(f"recent_messages:{self.user_name}", {msg_key: msg.timestamp.timestamp()})
-        pipe.zremrangebyrank(f"recent_messages:{self.user_name}", 0, -76)
+        pipe.zremrangebyrank(f"recent_messages:{self.user_name}", 0, -(SESSION_WINDOW + 1))
         await pipe.execute()
 
 
@@ -299,7 +327,7 @@ class Context:
             if not messages:
                 return
             
-            session_context = await self.get_recent_context(30)
+            session_context = await self.get_recent_context(SESSION_WINDOW)
             session_text = "\n".join([raw for _, raw in session_context])
             
             result = await self.batch_processor.run(messages, session_text)

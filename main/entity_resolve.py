@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from loguru import logger
 import threading
 from typing import Dict, List, Optional, Tuple
-from rapidfuzz import process as fuzz
+from rapidfuzz import fuzz
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -145,7 +145,7 @@ class EntityResolver:
         canonical_name = profile.get("canonical_name", "")
         summary = profile.get("summary", "") or ""
 
-        resolution_text = f"{canonical_name}. {summary[:200]}"
+        resolution_text = f"{canonical_name}. {summary}"
         embedding_np = self.embedding_model.encode([resolution_text])[0]
         faiss.normalize_L2(embedding_np.reshape(1, -1))
 
