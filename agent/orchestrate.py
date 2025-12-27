@@ -11,14 +11,14 @@ class ContextState:
     current_state: str = "start"
     trace_id: str = ""
     current_step: int = 0
-    inspected_entity_ids: Set[int] = field(default_factory=set)
+    history: List[Dict] = field(default_factory=list)
     hot_topics: List[str] = field(default_factory=list)
     active_topics: List[str] = field(default_factory=list)
     hot_topic_context: Dict[str, List[Dict]] = field(default_factory=dict)
     retrieved_messages: List[Dict] = field(default_factory=list)
     entity_profiles: List[Dict] = field(default_factory=list)
     graph_results: List[Dict] = field(default_factory=list)
-    web_results: List[Dict] = field(default_factory=list)
+    # web_results: List[Dict] = field(default_factory=list)
     tools_used: List[str] = field(default_factory=list)
 
 class StateOrchestrator(StateMachine):
@@ -26,7 +26,7 @@ class StateOrchestrator(StateMachine):
     start = State(initial=True)
     exploring = State()
     grounded = State()
-    web_only = State()
+    # web_only = State()
     clarify = State(final=True)
     complete = State(final=True)
     
@@ -38,10 +38,9 @@ class StateOrchestrator(StateMachine):
     get_activity = exploring.to.itself() | grounded.to.itself()
     
     find_path = grounded.to.itself()
+#    web_search = start.to(web_only)
     
-    web_search = start.to(web_only)
-    
-    finish = grounded.to(complete) | web_only.to(complete)
+    finish = exploring.to(complete) | grounded.to(complete)
     request_clarification = start.to(clarify) | exploring.to(clarify) | grounded.to(clarify)
     advance = exploring.to(grounded)
 
@@ -64,9 +63,6 @@ class StateOrchestrator(StateMachine):
         call_sig = (tool_name, str(sorted(args.items())))
         if call_sig in self._previous_calls:
             return False, "duplicate call"
-        
-        if tool_name == "find_path" and len(self.ctx.inspected_entity_ids) < 2:
-            return False, "find_path requires two known entities"
         
         if tool_name == "finish" and not self.can_finish():
             return False, "no evidence gathered"
@@ -91,8 +87,11 @@ class StateOrchestrator(StateMachine):
                 self.advance()
     
     def can_finish(self) -> bool:
-        if self.current_state == self.web_only:
-            return bool(self.ctx.web_results)
+        # if self.current_state == self.web_only:
+        #     return bool(self.ctx.web_results)
+        
+        if self.current_state == self.exploring:
+            return bool(self.ctx.retrieved_messages)
         
         return bool(
             self.ctx.entity_profiles or 

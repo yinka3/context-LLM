@@ -4,7 +4,7 @@ from typing import Dict, Optional
 
 from loguru import logger
 from redisclient import AsyncRedisClient
-from schedule.base import BaseJob, JobContext
+from jobs.base import BaseJob, JobContext
 
 
 class Scheduler:
@@ -13,7 +13,7 @@ class Scheduler:
     Jobs register themselves and define their own trigger conditions.
     """
     
-    CHECK_INTERVAL = 60
+    CHECK_INTERVAL = 30
     
     def __init__(self, user_name: str):
         self.user_name = user_name
@@ -79,7 +79,7 @@ class Scheduler:
         last_activity = await self.redis.get(f"last_activity:{self.user_name}")
         if not last_activity:
             return 0.0
-        last_ts = datetime.fromisoformat(last_activity.decode())
+        last_ts = datetime.fromisoformat(last_activity)
         return (datetime.now(timezone.utc) - last_ts).total_seconds()
     
     async def _run_pending_checks(self):

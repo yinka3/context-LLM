@@ -1,7 +1,7 @@
 from gliner import GLiNER
 from openai import AsyncOpenAI
 import torch
-from main.llm_trace import get_trace_logger
+from log.llm_trace import get_trace_logger
 from main.prompts import ner_prompt
 from main.service import LLMService
 from schema.dtypes import *

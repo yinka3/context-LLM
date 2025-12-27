@@ -23,22 +23,43 @@ class JobResult:
     reschedule_seconds: Optional[float] = None
 
 
+class JobNotifier:
+    """
+    Sets a global 'Maintenance Mode' flag in Redis while a job runs.
+    """
+    KEY = "system:active_job_warning"
+    
+    def __init__(self, redis_client: redis.Redis, message: str, ttl: int = 600):
+        self.redis = redis_client
+        self.message = message
+        self.ttl = ttl  # Auto-expire after 10 mins if we crash
+
+    async def __aenter__(self):
+        # Set the warning message visible to the Agent
+        await self.redis.setex(self.KEY, self.ttl, self.message)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # Clear the warning when job finishes (or fails)
+        await self.redis.delete(self.KEY)
+
+
 class BaseJob(ABC):
     """Base class for scheduled jobs."""
     
     @property
     @abstractmethod
     def name(self) -> str:
-        pass
+        raise NotImplementedError
     
     @abstractmethod
     async def should_run(self, ctx: JobContext) -> bool:
-        pass
+        raise NotImplementedError
     
     @abstractmethod
     async def execute(self, ctx: JobContext) -> JobResult:
-        pass
+        raise NotImplementedError
     
     async def on_shutdown(self, ctx: JobContext) -> None:
         """Override for cleanup. Default no-op."""
-        pass
+        raise NotImplementedError

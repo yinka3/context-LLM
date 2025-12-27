@@ -1,15 +1,13 @@
 from datetime import datetime, timezone
 import json
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import uuid
 
 from loguru import logger
-
 from agent.orchestrate import ContextState, StateOrchestrator
 from agent.tools import Tools
-from graph.memgraph import MemGraphStore
-from main.entity_resolve import EntityResolver
+from redisclient import AsyncRedisClient, SyncRedisClient
 from main.service import LLMService
 from main.system_prompt import get_stella_prompt
 from schema.dtypes import (
@@ -24,6 +22,10 @@ from schema.dtypes import (
     TraceEntry
 )
 from schema.tool_schema import TOOL_SCHEMAS
+
+if TYPE_CHECKING:
+    from db.memgraph import MemGraphStore
+    from main.entity_resolve import EntityResolver
 
 def build_user_message(
     ctx: ContextState,
@@ -63,8 +65,8 @@ def build_user_message(
     if ctx.retrieved_messages:
         msg += f"\n**Accumulated messages ({len(ctx.retrieved_messages)}):**\n```json\n{json.dumps(ctx.retrieved_messages, indent=2, default=str)}\n```\n"
     
-    if ctx.web_results:
-        msg += f"\n**Web results ({len(ctx.web_results)}):**\n```json\n{json.dumps(ctx.web_results, indent=2, default=str)}\n```\n"
+    # if ctx.web_results:
+    #     msg += f"\n**Web results ({len(ctx.web_results)}):**\n```json\n{json.dumps(ctx.web_results, indent=2, default=str)}\n```\n"
     
     return msg
 
@@ -80,7 +82,7 @@ def call_the_doctor(
     
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     system_prompt = get_stella_prompt(user_name, current_time, persona)
-    user_message = build_user_message(ctx, last_result, error)
+    user_message = build_user_message(ctx, ctx.history, last_result, error)
     
     response = llm.call_with_tools_sync(
         system=system_prompt,
@@ -104,7 +106,6 @@ def call_the_doctor(
     return ToolCall(name=name, args=args)   
     
 
-
 def execute_tool(tools: Tools, name: str, args: Dict) -> Optional[Dict]:
     dispatch = {
         "search_messages": lambda: tools.search_messages(args.get("query", "")),
@@ -112,8 +113,8 @@ def execute_tool(tools: Tools, name: str, args: Dict) -> Optional[Dict]:
         "get_profile": lambda: tools.get_profile(args.get("entity_name", "")),
         "get_connections": lambda: tools.get_connections(args.get("entity_name", "")),
         "get_activity": lambda: tools.get_recent_activity(args.get("entity_name", ""), args.get("hours", 24)),
-        "find_path": lambda: tools.find_path(args.get("entity_a", ""), args.get("entity_b", "")),
-        "web_search": lambda: tools.web_search(args.get("query", ""))
+        "find_path": lambda: tools.find_path(args.get("entity_a", ""), args.get("entity_b", ""))
+        # "web_search": lambda: tools.web_search(args.get("query", ""))
     }
     
     if name not in dispatch:
@@ -139,14 +140,12 @@ def update_accumulators(ctx: ContextState, tool_name: str, result):
     
     elif tool_name == "get_profile":
         ctx.entity_profiles.append(result)
-        if result.get("id"):
-            ctx.inspected_entity_ids.add(result["id"])
     
     elif tool_name in ("get_connections", "get_activity", "find_path"):
         ctx.graph_results.extend(result if isinstance(result, list) else [])
     
-    elif tool_name == "web_search":
-        ctx.web_results.extend(result if isinstance(result, list) else [])
+    # elif tool_name == "web_search":
+    #     ctx.web_results.extend(result if isinstance(result, list) else [])
 
 
 def summarize_result(tool_name: str, result: Dict) -> Tuple[str, int]:
@@ -176,15 +175,24 @@ def summarize_result(tool_name: str, result: Dict) -> Tuple[str, int]:
 
 
 
-def run(user_query: str,
+async def run(user_query: str,
         user_name: str,
         conversation_history: List[Dict],
         hot_topics: List[str], 
         active_topics: List[str],
         llm: LLMService,
-        store: MemGraphStore,
-        ent_resolver: EntityResolver
-        ) -> RunResult:
+        store: 'MemGraphStore',
+        ent_resolver: 'EntityResolver',
+        redis_client: AsyncRedisClient
+    ) -> RunResult:
+    
+    system_warning = ""
+    try:
+        raw_warning = await redis_client.get_client().get("system:active_job_warning")
+        if raw_warning:
+            system_warning = f"{raw_warning}\n\n---\n\n"
+    except Exception as e:
+        logger.error(f"Failed to check system warning: {e}")
     
     trace = QueryTrace(
         trace_id=str(uuid.uuid4()),
@@ -196,10 +204,24 @@ def run(user_query: str,
         user_query=user_query,
         hot_topics=hot_topics,
         active_topics=active_topics,
-        trace_id=trace.trace_id
+        trace_id=trace.trace_id,
+        history=conversation_history
     )
     machine = StateOrchestrator(context)
-    tools = Tools(user_name, store, ent_resolver)
+    sync_redis = SyncRedisClient().get_client()
+    tools = Tools(user_name, store, ent_resolver, sync_redis, active_topics)
+
+    if not ent_resolver.entity_profiles or len(ent_resolver.entity_profiles) <= 1:
+        return CompleteResult(
+            status="complete",
+            response="I don't know much about your world yet. Tell me about the people, places, and things in your life and I'll start remembering.",
+            tools_used=[],
+            state="start",
+            messages=[],
+            profiles=[],
+            graph=[],
+            web=[]
+        )
 
     if hot_topics:
         context.hot_topic_context = tools.get_hot_topic_context(hot_topics)
@@ -208,6 +230,36 @@ def run(user_query: str,
     error = None
     terminal_states = {machine.complete, machine.clarify}
     while machine.current_state not in terminal_states:
+        
+        if context.call_count >= context.max_calls and machine.can_finish():
+            if context.entity_profiles or context.graph_results or context.retrieved_messages:
+                partial_response = "Here's what I found, though I couldn't fully answer your question:\n"
+                
+                if context.entity_profiles:
+                    names = [p.get("canonical_name", "unknown") for p in context.entity_profiles if isinstance(p, dict)]
+                    if names:
+                        partial_response += f"- Found profiles: {', '.join(names)}\n"
+                
+                if context.retrieved_messages:
+                    partial_response += f"- Found {len(context.retrieved_messages)} related messages\n"
+                
+                return CompleteResult(
+                    status="complete",
+                    response=partial_response,
+                    tools_used=context.tools_used,
+                    state=machine.current_state.id,
+                    messages=context.retrieved_messages,
+                    profiles=context.entity_profiles,
+                    graph=context.graph_results
+                )
+    
+            # No evidence at all
+            return ClarificationResult(
+                status="clarification_needed",
+                question="I wasn't able to find enough information to answer that. Could you rephrase or be more specific?",
+                tools_used=context.tools_used,
+                state=machine.current_state.id
+            )
         
         context.current_state = machine.current_state.id
         context.current_step += 1
@@ -218,9 +270,13 @@ def run(user_query: str,
             valid, reason = machine.validate("request_clarification", {})
             if valid:
                 machine.request_clarification()
+                final_q = response.question
+                if system_warning:
+                    final_q = system_warning + final_q
+
                 return ClarificationResult(
                     status="clarification_needed",
-                    question=response.question,
+                    question=final_q,
                     tools_used=context.tools_used,
                     state=machine.current_state.id
                 )
@@ -234,15 +290,18 @@ def run(user_query: str,
             if valid:
                 machine.record_call("finish", {})
                 machine.finish()
+                final_response_text = response.content
+                if system_warning:
+                    final_response_text = system_warning + final_response_text
+
                 return CompleteResult(
                     status="complete",
-                    response=response.content,
+                    response=final_response_text,
                     tools_used=context.tools_used,
                     state=machine.current_state.id,
                     messages=context.retrieved_messages,
                     profiles=context.entity_profiles,
                     graph=context.graph_results,
-                    web=context.web_results
                 )
             else:
                 error = reason
@@ -283,7 +342,7 @@ def run(user_query: str,
             result_summary=result_summary,
             result_count=result_count,
             duration_ms=(time.perf_counter() - step_start) * 1000,
-            error=last_result.get("error")
+            error=last_result.get("error") if isinstance(last_result, dict) else None
         ))
 
 
@@ -300,12 +359,11 @@ def run(user_query: str,
 
     return CompleteResult(
         status="complete",
-        response="",
+        response=system_warning + "I encountered a state error and could not finish.",
         tools_used=context.tools_used,
         state=machine.current_state.id,
         messages=context.retrieved_messages,
         profiles=context.entity_profiles,
-        graph=context.graph_results,
-        web=context.web_results
+        graph=context.graph_results
     )
 

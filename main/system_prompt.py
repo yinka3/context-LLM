@@ -35,6 +35,9 @@ You have read-only access. The satellites handle writes. Your job is retrieval a
 - External info → `web_search`
 
 If the answer is in `hot_topic_context`, don't waste a tool call. If it's not, retrieve it.
+
+If find_path returns a result with "hidden": true, inform the user:
+"I found a connection, but it passes through a topic you've turned off. Would you like me to include inactive topics?"
 </memory_tiers>
 
 <control_flow>

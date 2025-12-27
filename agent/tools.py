@@ -4,40 +4,42 @@ from typing import List, Dict, Optional, TYPE_CHECKING
 import faiss
 import numpy as np
 from rapidfuzz import process as fuzzy_process, fuzz
-if TYPE_CHECKING:
-    from main.entity_resolve import EntityResolver
-    from graph.memgraph import MemGraphStore
+import redis
+from main.entity_resolve import EntityResolver
+from db.memgraph import MemGraphStore
 
 
 
 class Tools:
     
-    def __init__(self, user_name: str, store: 'MemGraphStore', ent_resolver: 'EntityResolver'):
+    def __init__(self, user_name: str, store: MemGraphStore, ent_resolver: EntityResolver, redis_client: redis.Redis, active_topics: List[str] = None):
         self.store = store
         self.resolver = ent_resolver
         self.user_name = user_name
+        self.redis = redis_client
+        self.active_topics = active_topics or []
     
-    def _resolve_entity_name(self, query: str) -> Optional[str]:
+    def _resolve_entity_name(self, entity: str) -> Optional[str]:
         """Resolve user input to canonical entity name via exact or fuzzy match."""
         
         
-        entity_id = self.resolver._name_to_id.get(query)
+        entity_id = self.resolver.get_id(entity)
         if entity_id:
             profile = self.resolver.entity_profiles.get(entity_id)
-            return profile["canonical_name"] if profile else query
+            return profile["canonical_name"] if profile else entity
         
         if not self.resolver._name_to_id:
             return None
         
         result = fuzzy_process.extractOne(
-            query=query,
+            query=entity,
             choices=self.resolver._name_to_id.keys(),
             scorer=fuzz.WRatio,
             score_cutoff=85
         )
         
         if result:
-            matched_name, score, _ = result
+            matched_name, _, _ = result
             entity_id = self.resolver._name_to_id[matched_name]
             profile = self.resolver.entity_profiles.get(entity_id)
             return profile["canonical_name"] if profile else matched_name
@@ -57,10 +59,8 @@ class Tools:
         
         Returns: List of messages with content, timestamp, and relevance score.
         """
-        redis = self.resolver.redis_client
         content_key = f"message_content:{self.user_name}"
-        
-        all_messages = redis.hgetall(content_key)
+        all_messages = self.redis.hgetall(content_key)
         if not all_messages:
             return []
         
@@ -126,6 +126,13 @@ class Tools:
         canonical = self._resolve_entity_name(entity_name)
         if not canonical:
             return None
+        
+        entity_id = self.resolver.get_id(canonical)
+        if entity_id:
+            profile = self.resolver.entity_profiles.get(entity_id)
+            if profile:
+                return profile
+            
         return self.store.get_entity_profile(canonical)
 
     def get_connections(self, entity_name: str, active_only: bool = True) -> List[Dict]:
@@ -165,19 +172,30 @@ class Tools:
         Find the shortest connection path between two entities.
         Use when asked "how is X connected to Y" or "what's the relationship between X and Y".
         Requires both entities to be known — use get_profile first if unsure.
-        
+
         Args:
             entity_a: First entity name
             entity_b: Second entity name
-        
-        Returns: Step-by-step path showing each entity in the chain with evidence.
-        Returns empty list if no connection found.
+
+        Returns: 
+            Step-by-step path showing each entity in the chain with evidence.
+            If path exists only through inactive topics: [{"hidden": True, "message": "..."}]
+            Empty list if no connection found.
         """
         canonical_a = self._resolve_entity_name(entity_a)
         canonical_b = self._resolve_entity_name(entity_b)
         if not canonical_a or not canonical_b:
             return []
-        return self.store.find_connection(canonical_a, canonical_b) or []
+
+        path = self.store._find_path_filtered(canonical_a, canonical_b, active_only=True)
+        if path:
+            return path
+
+        full_path = self.store._find_path_filtered(canonical_a, canonical_b, active_only=False)
+        if full_path:
+            return [{"hidden": True, "message": "Connection exists through inactive topics"}]
+        
+        return []
 
     def get_hot_topic_context(self, hot_topics: List[str]) -> Dict[str, List[Dict]]:
         """
@@ -194,16 +212,16 @@ class Tools:
             return {}
         return self.store.get_hot_topic_context(hot_topics)
 
-    def web_search(self, query: str) -> List[Dict]:
-        """
-        Search the web for external information.
-        Use ONLY for current events, external facts, or information not in the user's graph.
-        This is a separate path — once you go web, you cannot use internal tools.
+    # def web_search(self, query: str) -> List[Dict]:
+    #     """
+    #     Search the web for external information.
+    #     Use ONLY for current events, external facts, or information not in the user's graph.
+    #     This is a separate path — once you go web, you cannot use internal tools.
         
-        Args:
-            query: Search query
+    #     Args:
+    #         query: Search query
         
-        Returns: List of web results with title, snippet, url.
-        """
-        # TODO: Implement web search
-        return []
+    #     Returns: List of web results with title, snippet, url.
+    #     """
+    #     # TODO: Implement web search
+    #     return []
