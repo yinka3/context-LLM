@@ -13,7 +13,7 @@ class Scheduler:
     Jobs register themselves and define their own trigger conditions.
     """
     
-    CHECK_INTERVAL = 60
+    CHECK_INTERVAL = 30
     
     def __init__(self, user_name: str):
         self.user_name = user_name

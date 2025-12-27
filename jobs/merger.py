@@ -2,11 +2,11 @@ import asyncio
 import json
 from datetime import datetime, timezone
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 import numpy as np
 from loguru import logger
 from jobs.base import BaseJob, JobContext, JobResult, JobNotifier
-from main.prompts import get_summary_merge_prompt
+from main.prompts import get_merge_judgment_prompt, get_summary_merge_prompt
 from main.service import LLMService
 
 if TYPE_CHECKING:
@@ -19,15 +19,15 @@ class MergeDetectionJob(BaseJob):
     Detects and merges duplicate entities based on embedding similarity.
     
     Trigger: User idle for IDLE_THRESHOLD seconds, hasn't run this session.
-    Auto-merges high-confidence pairs (>= 0.9), stores others for HITL review.
+    Auto-merges high-confidence pairs (>= 0.93), stores others for HITL review.
     """
     
     IDLE_THRESHOLD = 15 * 60
-    AUTO_MERGE_THRESHOLD = 0.9
+    AUTO_MERGE_THRESHOLD = 0.93
     HITL_THRESHOLD = 0.65
-    MERGE_DELAY_SECONDS = 120
 
-    def __init__(self, ent_resolver: "EntityResolver", store: "MemGraphStore", llm_client: LLMService, batch_lock: asyncio.Lock):
+    def __init__(self, user_name: str, ent_resolver: "EntityResolver", store: "MemGraphStore", llm_client: LLMService, batch_lock: asyncio.Lock):
+        self.user_name = user_name
         self.ent_resolver = ent_resolver
         self.store = store
         self.llm = llm_client
@@ -41,21 +41,9 @@ class MergeDetectionJob(BaseJob):
         ran_key = f"merge_ran:{ctx.user_name}"
         if await ctx.redis.get(ran_key):
             return False
-        
-        dirty_key = f"dirty_entities:{ctx.user_name}"
-        if await ctx.redis.scard(dirty_key) > 0:
-            return False
 
         profile_complete_key = f"profile_complete:{ctx.user_name}"
-        profile_timestamp = await ctx.redis.get(profile_complete_key)
-        
-        if not profile_timestamp:
-            return False
-        
-        completed_at = float(profile_timestamp)
-        elapsed = time.time() - completed_at
-        
-        if elapsed < self.MERGE_DELAY_SECONDS:
+        if not await ctx.redis.get(profile_complete_key):
             return False
         
         # if ctx.idle_seconds < self.IDLE_THRESHOLD:
@@ -74,18 +62,27 @@ class MergeDetectionJob(BaseJob):
                     logger.info("Batch Lock passed to Merge Job")
                     await ctx.redis.set(f"merge_ran:{ctx.user_name}", "true")
                     
-                    loop = asyncio.get_running_loop()
-                    
-                    candidates = await loop.run_in_executor(
-                        None, self.ent_resolver.detect_merge_candidates
-                    )
+                    candidates = self.ent_resolver.detect_merge_candidates()
                     
                     if not candidates:
                         return JobResult(success=True, summary="No merge candidates found")
                     
-                    auto_merge = [c for c in candidates if c["cross_score"] >= self.AUTO_MERGE_THRESHOLD]
-                    hitl = [c for c in candidates if self.HITL_THRESHOLD <= c["cross_score"] < self.AUTO_MERGE_THRESHOLD]
-                    
+                    auto_merge, hitl = [], []
+    
+                    for candidate in candidates:
+                        score = await self._get_merge_judgment(candidate)
+                        if score is None:
+                            continue
+                        
+                        candidate["llm_score"] = score
+                        
+                        if score >= self.AUTO_MERGE_THRESHOLD:
+                            auto_merge.append(candidate)
+                        elif score >= self.HITL_THRESHOLD:
+                            hitl.append(candidate)
+                        else:
+                            logger.info(f"Rejected ({candidate['primary_id']}, {candidate['secondary_id']}) | LLM={score:.3f}")
+
                     logger.info(f"Merge split: {len(auto_merge)} auto, {len(hitl)} HITL")
                     
                     merged_ids = set()
@@ -124,40 +121,74 @@ class MergeDetectionJob(BaseJob):
         await ctx.redis.set(f"pending:{ctx.user_name}:{self.name}", "true")
         logger.debug("Merge detection pending flag set")
     
+    async def _get_merge_judgment(self, candidate: dict) -> Optional[float]:
+        system = get_merge_judgment_prompt(self.user_name)
+        user_content = json.dumps({
+            "entity_a": candidate["profile_a"],
+            "entity_b": candidate["profile_b"]
+        })
+        
+        result = await self.llm.call_reasoning(system, user_content, self.llm.DEFAULT_STRUCTURED_MODEL)
+        
+        try:
+            return float(result.strip())
+        except (ValueError, AttributeError):
+            logger.warning(f"Unparseable judgment for ({candidate['primary_id']}, {candidate['secondary_id']}): {result}")
+            return None
+
     async def _execute_merge(self, user_name: str, primary_id: int, secondary_id: int, max_retries: int = 2) -> bool:
         """Execute merge with retry."""
         loop = asyncio.get_running_loop()
         
         primary_profile = self.ent_resolver.entity_profiles.get(primary_id, {})
         secondary_profile = self.ent_resolver.entity_profiles.get(secondary_id, {})
-        merged_summary = await self._merge_summaries_llm(
-            user_name,
-            primary_name=primary_profile.get("canonical_name", "Unknown"),
-            entity_type=primary_profile.get("type", "unknown"),
-            all_aliases=list(set(
-                self.ent_resolver.get_mentions_for_id(primary_id) +
-                self.ent_resolver.get_mentions_for_id(secondary_id)
-            )),
-            summary_a=primary_profile.get("summary", ""),
-            summary_b=secondary_profile.get("summary", "")
-        )
+
+        if not primary_profile or not secondary_profile:
+            logger.error(f"Merge aborted ({primary_id}, {secondary_id}): missing profile(s)")
+            return False
+        
+        primary_name = primary_profile.get("canonical_name", "Unknown")
+        secondary_name = secondary_profile.get("canonical_name", "Unknown")
+
+        try:
+            merged_summary = await self._merge_summaries_llm(
+                user_name,
+                primary_name=primary_name,
+                entity_type=primary_profile.get("type", "unknown"),
+                all_aliases=list(set(
+                    self.ent_resolver.get_mentions_for_id(primary_id) +
+                    self.ent_resolver.get_mentions_for_id(secondary_id)
+                )),
+                summary_a=primary_profile.get("summary", ""),
+                summary_b=secondary_profile.get("summary", "")
+            )
+        except Exception as e:
+            logger.error(f"Merge ({primary_id}, {secondary_id}) {primary_name} <- {secondary_name}: LLM failed - {e}")
+            return False
         
         for attempt in range(1, max_retries + 1):
-            success = await loop.run_in_executor(
-                None,
-                self.store.merge_entities,
-                primary_id,
-                secondary_id,
-                merged_summary
-            )
+            try:
+                success = await loop.run_in_executor(
+                    None,
+                    self.store.merge_entities,
+                    primary_id,
+                    secondary_id,
+                    merged_summary
+                )
+                
+                if success:
+                    logger.info(f"Merged ({primary_id}, {secondary_id}) {primary_name} <- {secondary_name}")
+                    return True
+                else:
+                    logger.warning(f"Merge attempt {attempt}/{max_retries} ({primary_id}, {secondary_id}): store returned False")
+                    
+            except Exception as e:
+                logger.error(f"Merge attempt {attempt}/{max_retries} ({primary_id}, {secondary_id}): {type(e).__name__} - {e}")
             
-            if success:
-                return True
-            
-            logger.warning(f"Merge attempt {attempt}/{max_retries} failed")
             if attempt < max_retries:
-                await asyncio.sleep(1.0 * attempt)
+                await asyncio.sleep(2.0 * attempt)
         
+        logger.error(f"Merge failed permanently ({primary_id}, {secondary_id}) {primary_name} <- {secondary_name}")
         return False
     
     async def _merge_summaries_llm(
@@ -214,24 +245,19 @@ class MergeDetectionJob(BaseJob):
             logger.warning(f"FAISS removal failed for {secondary_id}: {e}")
     
     async def _store_hitl_proposals(self, ctx: JobContext, proposals: list, merged_ids: set) -> int:
-        """Store merge proposals for human review."""
         stored = 0
         proposal_key = f"merge_proposals:{ctx.user_name}"
         
         for candidate in proposals:
-            primary_id = candidate["primary_id"]
-            secondary_id = candidate["secondary_id"]
-            
-            if primary_id in merged_ids or secondary_id in merged_ids:
+            if candidate["primary_id"] in merged_ids or candidate["secondary_id"] in merged_ids:
                 continue
             
             proposal = {
-                "primary_id": primary_id,
-                "secondary_id": secondary_id,
+                "primary_id": candidate["primary_id"],
+                "secondary_id": candidate["secondary_id"],
                 "primary_name": candidate["primary_name"],
                 "secondary_name": candidate["secondary_name"],
-                "faiss_score": candidate["faiss_score"],
-                "cross_score": candidate["cross_score"],
+                "llm_score": candidate["llm_score"],
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "status": "pending"
             }

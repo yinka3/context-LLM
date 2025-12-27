@@ -2,9 +2,8 @@ from datetime import datetime, timezone
 from loguru import logger
 import threading
 from typing import Dict, List, Optional, Tuple
-from rapidfuzz import fuzz
+from rapidfuzz import process as fuzz
 import faiss
-import re
 import numpy as np
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from db.memgraph import MemGraphStore
@@ -208,87 +207,47 @@ class EntityResolver:
         
         candidates = []
         seen_pairs = set()
-        
-        # phase 1 to gather candidate pairs
-        name_to_ids: dict[str, list[int]] = {}
-        for ent_id, profile in self.entity_profiles.items():
-            canonical = profile.get("canonical_name", "")
-            if canonical:
-                key = canonical.lower().strip()
-                name_to_ids.setdefault(key, []).append(ent_id)
-        
-        for ids in name_to_ids.values():
-            if len(ids) < 2:
-                continue
-            for i, id_a in enumerate(ids):
-                for id_b in ids[i + 1:]:
-                    seen_pairs.add(tuple(sorted([id_a, id_b])))
-        
-        # Summary-based detection
-        for entity_id, profile in self.entity_profiles.items():
-            summary = profile.get("summary", "")
-            if not summary:
-                continue
-            
-            canonical_name = profile.get("canonical_name", "Unknown")
-            match = re.match(r'^(.+?[.!?])(?:\s+[A-Z]|$)', summary)
-            first_sentence = match.group(1).strip() if match else summary[:200].strip()
-            
-            query_text = f"{canonical_name}. {first_sentence}"
-            embedding = self.embedding_model.encode([query_text])
-            faiss.normalize_L2(embedding)
-            
-            with self._lock:
-                if self.index_id_map.ntotal == 0:
+        aliases = list(self._name_to_id.keys())
+        for i in range(len(aliases)):
+            for j in range(i + 1, len(aliases)):
+                id_i = self._name_to_id[aliases[i]]
+                id_j = self._name_to_id[aliases[j]]
+                if id_i == id_j:
                     continue
-                scores, indices = self.index_id_map.search(embedding, k=5)
-            
-            for match_id, score in zip(indices[0], scores[0]):
-                match_id = int(match_id)
-                if match_id == -1 or match_id == entity_id:
-                    continue
-                if score >= 0.50:
-                    seen_pairs.add(tuple(sorted([entity_id, match_id])))
+                score = fuzz.WRatio(aliases[i], aliases[j])
+                if score >= 85:
+                    seen_pairs.add(tuple(sorted([id_i, id_j])))
+                    
+
         
         for id_a, id_b in seen_pairs:
+            if self.store.has_direct_edge(id_a, id_b):
+                logger.debug(f"Blocked ({id_a}, {id_b}) | Direct edge exists")
+                continue
+            
+            neighbors_a = self.store.get_neighbor_ids(id_a)
+            neighbors_b = self.store.get_neighbor_ids(id_b)
+            neighbors_a.discard(1) # user id - hardcoded for now
+            neighbors_b.discard(1)
+            
+            if neighbors_a & neighbors_b:
+                logger.debug(f"Blocked ({id_a}, {id_b}) | Shared neighbors: {neighbors_a & neighbors_b}")
+                continue
+            
+            # Passed filtering - add to candidates
             profile_a = self.entity_profiles.get(id_a, {})
             profile_b = self.entity_profiles.get(id_b, {})
             
-            summary_a = profile_a.get("summary", "")
-            summary_b = profile_b.get("summary", "")
-            
-            if not summary_a or not summary_b:
-                logger.debug(f"Skipping ({id_a}, {id_b}): empty summary")
-                continue
-            
-            name_a = profile_a.get("canonical_name", "Unknown")
-            name_b = profile_b.get("canonical_name", "Unknown")
-            
-            text_a = f"{name_a}. {summary_a[:150]}"
-            text_b = f"{name_b}. {summary_b[:150]}"
-            cross_score = float(self.cross_encoder.predict([[text_a, text_b]])[0])
-            
-            if cross_score < 0.65:
-                logger.info(f"Rejected ({id_a}, {id_b}) {name_a} <-> {name_b} | Cross={cross_score:.3f}")
-                continue
-            
-            # Relationship check
-            if self.store.has_direct_edge(id_a, id_b):
-                logger.info(f"Blocked ({id_a}, {id_b}) {name_a} <-> {name_b} | Direct edge exists")
-                continue
-            
-            if cross_score >= 0.93:
-                logger.info(f"Candidate ({id_a}, {id_b}) {name_a} <-> {name_b} | Cross={cross_score:.3f} → AUTO")
-            else:
-                logger.info(f"Candidate ({id_a}, {id_b}) {name_a} <-> {name_b} | Cross={cross_score:.3f} → HITL")
-
             candidates.append({
                 "primary_id": id_a,
                 "secondary_id": id_b,
-                "primary_name": name_a,
-                "secondary_name": name_b,
-                "cross_score": cross_score
+                "primary_name": profile_a.get("canonical_name", "Unknown"),
+                "secondary_name": profile_b.get("canonical_name", "Unknown"),
+                "profile_a": profile_a,
+                "profile_b": profile_b,
             })
-        
+            
+            logger.info(f"Candidate ({id_a}, {id_b}) {profile_a.get('canonical_name')} <-> {profile_b.get('canonical_name')} | Passed graph filtering")
+    
         logger.info(f"Merge detection complete: {len(candidates)} candidates found")
         return candidates

@@ -57,7 +57,7 @@ class BatchProcessor:
             self.topics = active_topics
             self._get_next_ent_id = get_next_ent_id
         
-    async def run(self, messages: List[Dict]) -> BatchResult:
+    async def run(self, messages: List[Dict], session_text: str) -> BatchResult:
         """
         Process a batch of messages. Returns BatchResult with entity IDs and connections.
         Caller responsible for lock acquisition and publishing results.
@@ -81,7 +81,7 @@ class BatchProcessor:
             
             known_entities = await self._build_known_entities(mentions)
             
-            disambiguation = await self._disambiguate(mentions, messages, known_entities)
+            disambiguation = await self._disambiguate(mentions, messages, known_entities, session_text)
             if not disambiguation.entries:
                 logger.error("Disambiguation failed - no results returned")
                 result.success = False
@@ -162,11 +162,14 @@ class BatchProcessor:
         for ent_id in matched_ids:
             profile = self.ent_resolver.entity_profiles.get(ent_id)
             if profile:
-                known.append({
+                entity = {
                     "canonical_name": profile.get("canonical_name"),
                     "type": profile.get("type"),
                     "aliases": self.ent_resolver.get_mentions_for_id(ent_id)
-                })
+                }
+                if profile.get("summary"):
+                    entity["summary"] = profile["summary"]
+                known.append(entity)
         
         return known
 
@@ -174,16 +177,19 @@ class BatchProcessor:
         self,
         mentions: List[Tuple[str, str, str]],
         messages: List[Dict],
-        known_entities: List[Dict]
+        known_entities: List[Dict],
+        session_text: str
     ) -> DisambiguationResult:
         """Two-phase disambiguation: reasoning → structuring."""
+
         messages_text = "\n".join([f"{m['id']}: \"{m['message']}\"" for m in messages])
         mentions_fmt = [{"name": m[0], "type": m[1], "topic": m[2]} for m in mentions]
         
         system_02 = get_disambiguation_reasoning_prompt(self.user_name, messages_text)
         user_02 = json.dumps({
             "mentions": mentions_fmt,
-            "known_entities": known_entities
+            "known_entities": known_entities,
+            "session_context": session_text
         }, indent=2)
         
         reasoning = await self.llm.call_reasoning(system_02, user_02)

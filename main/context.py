@@ -97,7 +97,7 @@ class Context:
 
         instance.scheduler = Scheduler(user_name)
         instance.scheduler.register(
-            MergeDetectionJob(instance.ent_resolver, instance.store, instance.llm, instance._batch_processing_lock)
+            MergeDetectionJob(user_name, instance.ent_resolver, instance.store, instance.llm, instance._batch_processing_lock)
         )
         instance.scheduler.register(DLQReplayJob())
         instance.scheduler.register(
@@ -299,7 +299,10 @@ class Context:
             if not messages:
                 return
             
-            result = await self.batch_processor.run(messages)
+            session_context = await self.get_recent_context(30)
+            session_text = "\n".join([raw for _, raw in session_context])
+            
+            result = await self.batch_processor.run(messages, session_text)
             
             if not result.success:
                 await self.batch_processor.move_to_dead_letter(messages, result.error)
@@ -400,6 +403,7 @@ class Context:
         if new_entity_ids:
             dirty_key = f"dirty_entities:{self.user_name}"
             await self.redis_client.sadd(dirty_key, *[str(eid) for eid in new_entity_ids])
+            await self.redis_client.delete(f"profile_complete:{self.user_name}")
         
         logger.info(f"Wrote {len(entities)} entities, {len(relationships)} relationships to graph")
 

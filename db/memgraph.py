@@ -197,6 +197,15 @@ class MemGraphStore:
         with self.driver.session() as session:
             result = session.run(query, {"id_a": id_a, "id_b": id_b}).single()
             return result["connected"] if result else False
+    
+    def get_neighbor_ids(self, entity_id: int) -> set[int]:
+        query = """
+        MATCH (e:Entity {id: $entity_id})-[:RELATED_TO]-(neighbor:Entity)
+        RETURN neighbor.id as neighbor_id
+        """
+        with self.driver.session() as session:
+            result = session.run(query, {"entity_id": entity_id})
+            return {record["neighbor_id"] for record in result}
 
     def set_topic_status(self, topic_name: str, status: str):
         """Handles Topic State (active/inactive/hot)"""
