@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 from rapidfuzz import fuzz
 import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
 from db.memgraph import MemGraphStore
 
 
@@ -16,7 +16,6 @@ class EntityResolver:
         self.store = store
         
         self.embedding_model = SentenceTransformer(embedding_model, trust_remote_code=True, device='cpu')
-        self.cross_encoder = CrossEncoder('BAAI/bge-reranker-v2-m3', device='cpu')
 
         self.embedding_dim = 1024
         self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)

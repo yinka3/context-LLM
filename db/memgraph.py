@@ -36,7 +36,7 @@ class MemGraphStore:
         queries = [
             "CREATE CONSTRAINT ON (e:Entity) ASSERT e.id IS UNIQUE;",
             "CREATE CONSTRAINT ON (t:Topic) ASSERT t.name IS UNIQUE",
-            "CREATE INDEX ON :DailyMood(date)",
+            "CREATE INDEX ON :MoodCheckpoint(timestamp);"
             "CREATE INDEX ON :Entity(canonical_name);"
         ]
         
@@ -226,21 +226,24 @@ class MemGraphStore:
         with self.driver.session() as session:
             session.run(query, {"name": topic_name, "status": status}).consume()
     
-    def log_daily_mood(self,
-                       user_name: str,
-                       primary: str, primary_count: int, 
-                       secondary: str, secondary_count: int, 
-                       total: int):
+    def log_mood_checkpoint(
+        self,
+        user_name: str,
+        primary: str,
+        primary_count: int,
+        secondary: str,
+        secondary_count: int,
+        message_count: int
+    ):
         query = """
-        MATCH (u:Entity {canonical_name: $user_name, type: 'PERSON'})
-        CREATE (m:DailyMood {
-            date: date(),
+        MATCH (u:Entity {canonical_name: $user_name, type: 'person'})
+        CREATE (m:MoodCheckpoint {
             timestamp: timestamp(),
             primary_emotion: $primary,
             primary_count: $primary_count,
             secondary_emotion: $secondary,
             secondary_count: $secondary_count,
-            total_messages: $total
+            message_count: $message_count
         })
         MERGE (u)-[:FELT]->(m)
         """
@@ -251,7 +254,7 @@ class MemGraphStore:
                 "primary_count": primary_count,
                 "secondary": secondary,
                 "secondary_count": secondary_count,
-                "total": total
+                "message_count": message_count
             }).consume()
     
     

@@ -1,16 +1,14 @@
 import asyncio
 import json
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 import numpy as np
 from loguru import logger
 from jobs.base import BaseJob, JobContext, JobResult, JobNotifier
 from main.prompts import get_merge_judgment_prompt, get_summary_merge_prompt
 from main.service import LLMService
-
-if TYPE_CHECKING:
-    from main.entity_resolve import EntityResolver
-    from db.memgraph import MemGraphStore
+from main.entity_resolve import EntityResolver
+from db.memgraph import MemGraphStore
 
 
 class MergeDetectionJob(BaseJob):
@@ -25,7 +23,7 @@ class MergeDetectionJob(BaseJob):
     AUTO_MERGE_THRESHOLD = 0.93
     HITL_THRESHOLD = 0.65
 
-    def __init__(self, user_name: str, ent_resolver: "EntityResolver", store: "MemGraphStore", llm_client: LLMService):
+    def __init__(self, user_name: str, ent_resolver: EntityResolver, store: MemGraphStore, llm_client: LLMService):
         self.user_name = user_name
         self.ent_resolver = ent_resolver
         self.store = store

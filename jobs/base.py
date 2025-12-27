@@ -50,16 +50,16 @@ class BaseJob(ABC):
     @property
     @abstractmethod
     def name(self) -> str:
-        pass
+        raise NotImplementedError
     
     @abstractmethod
     async def should_run(self, ctx: JobContext) -> bool:
-        pass
+        raise NotImplementedError
     
     @abstractmethod
     async def execute(self, ctx: JobContext) -> JobResult:
-        pass
+        raise NotImplementedError
     
     async def on_shutdown(self, ctx: JobContext) -> None:
         """Override for cleanup. Default no-op."""
-        pass
+        raise NotImplementedError

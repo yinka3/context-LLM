@@ -6,6 +6,7 @@ from loguru import logger
 import json
 from jobs.base import BaseJob, JobContext
 from jobs.dlq import DLQReplayJob
+from jobs.mood import MoodCheckpointJob
 from jobs.profile import ProfileRefinementJob
 from jobs.scheduler import Scheduler
 from jobs.merger import MergeDetectionJob
@@ -34,7 +35,6 @@ class Context:
     def __init__(self, user_name: str, topics: List[str], redis_client):
         self.user_name: str = user_name
         self.active_topics: List[str] = topics
-        self.session_emotions: List[str] = []
         self.scheduler: Scheduler = None
         self.redis_client: redis.Redis = redis_client
         self.llm: LLMService = None
@@ -109,6 +109,7 @@ class Context:
         # Scheduler only gets DLQ
         instance.scheduler = Scheduler(user_name)
         instance.scheduler.register(DLQReplayJob())
+        instance.scheduler.register(MoodCheckpointJob(user_name, instance.store))
         await instance.scheduler.start()
         
         return instance
@@ -335,7 +336,7 @@ class Context:
             if not result.success:
                 await self.batch_processor.move_to_dead_letter(messages, result.error)
             else:
-                self.session_emotions.extend(result.emotions)
+                self.redis_client.rpush(f"emotions:{self.user_name}", result.emotions)
                 
                 if result.extraction_result:
                     await self._write_to_graph(
@@ -446,22 +447,6 @@ class Context:
         
         await self.scheduler.stop()
 
-        if self.session_emotions:
-            from collections import Counter
-            counts = Counter(self.session_emotions)
-            top_two = counts.most_common(2)
-            
-            primary, primary_count = top_two[0]
-            secondary, secondary_count = top_two[1] if len(top_two) > 1 else ("neutral", 0)
-            
-            self.store.log_daily_mood(
-                user_name=self.user_name,
-                primary=primary,
-                primary_count=primary_count,
-                secondary=secondary,
-                secondary_count=secondary_count,
-                total=len(self.session_emotions)
-            )
         if self.executor:
             self.executor.shutdown(wait=True)
         if self.redis_client:
