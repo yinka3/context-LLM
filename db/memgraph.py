@@ -1,13 +1,24 @@
 import time
 from loguru import logger
-from typing import Dict, List, Optional
-from neo4j import GraphDatabase, Driver, ManagedTransaction
+from typing import Dict, List
+from neo4j import GraphDatabase, ManagedTransaction
+from dotenv import load_dotenv
+import os
+load_dotenv()
 
-
+MEMGRAPH_USER=os.environ.get("MEMGRAPH_USER")
+MEMGRAPH_PASSWORD=os.environ.get("MEMGRAPH_PASSWORD")
+MEMGRAPH_HOST=os.environ.get("MEMGRAPH_HOST")
+MEMGRAPH_PORT=os.environ.get("MEMGRAPH_PORT")
 
 class MemGraphStore:
-    def __init__(self, uri: str = "bolt://localhost:7687"):
-        self.driver: Driver = GraphDatabase.driver(uri)
+    def __init__(self, uri: str = None):
+        if uri is None:
+            uri = f"bolt://{MEMGRAPH_HOST}:{MEMGRAPH_PORT}"
+        self.driver = GraphDatabase.driver(
+            uri,
+            auth=(MEMGRAPH_USER, MEMGRAPH_PASSWORD)
+        )
         self.verify_conn()
         self._setup_schema()
         logger.info("Graph store initialized")

@@ -4,14 +4,18 @@ from openai import AsyncOpenAI, OpenAI
 import instructor
 from loguru import logger
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv()
+
+STRUCTURED_MODEL = os.environ.get("STRUCTURED_MODEL", "google/gemini-2.5-flash")
+REASONING_MODEL = os.environ.get("REASONING_MODEL", "google/gemini-3-flash-preview")
+AGENT_MODEL = os.environ.get("AGENT_MODEL", "anthropic/claude-sonnet-4.5")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 T = TypeVar('T', bound=BaseModel)
 
 class LLMService:
-
-    DEFAULT_STRUCTURED_MODEL = "google/gemini-2.5-flash"
-    DEFAULT_REASONING_MODEL = "google/gemini-3-flash-preview"
-    DEFAULT_AGENT_MODEL = "anthropic/claude-sonnet-4.5"
 
     def __init__(
         self,
@@ -21,14 +25,14 @@ class LLMService:
         reasoning_model: Optional[str] = None,
         agent_model: Optional[str] = None
     ):
-        self._api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        self._api_key = api_key or OPENROUTER_API_KEY
         if not self._api_key:
-            raise ValueError("OpenRouter API key required")
+            raise ValueError("OpenRouter API key required, this aint free")
         
         self._trace = trace_logger
-        self._structured_model = structured_model or self.DEFAULT_STRUCTURED_MODEL
-        self._reasoning_model = reasoning_model or self.DEFAULT_REASONING_MODEL
-        self._agent_model = agent_model or self.DEFAULT_AGENT_MODEL
+        self._structured_model = structured_model or STRUCTURED_MODEL
+        self._reasoning_model = reasoning_model or REASONING_MODEL
+        self._agent_model = agent_model or AGENT_MODEL
 
         self._client_sync = OpenAI(
             base_url="https://openrouter.ai/api/v1",

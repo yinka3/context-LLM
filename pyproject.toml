@@ -19,7 +19,15 @@ dependencies = [
     "rapidfuzz>=3.14.3",
     "redis>=7.1.0",
     "redis-tools>=0.0.2",
+    "rich>=14.2.0",
     "sentence-transformers>=5.2.0",
     "torch>=2.9.1",
     "transformers==4.41.2",
+    "typer>=0.20.0",
 ]
+
+[project.scripts]
+vestige = "vestige.cli:app"
+
+[tool.setuptools.package-data]
+vestige = ["setup.sh", "docker-compose.yml", ".env.example"]
