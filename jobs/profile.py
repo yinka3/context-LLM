@@ -23,8 +23,7 @@ class ProfileRefinementJob(BaseJob):
     """
     
     MSG_WINDOW = 75
-    VOLUME_THRESHOLD = 20
-    USER_VOLUME_THRESHOLD = 10
+    VOLUME_THRESHOLD = 5
     IDLE_THRESHOLD = 300
     USER_IDLE_THRESHOLD = 600
     USER_MSG_COUNT = 45
@@ -41,15 +40,7 @@ class ProfileRefinementJob(BaseJob):
 
     async def should_run(self, ctx: JobContext) -> bool:
         dirty_key = f"dirty_entities:{ctx.user_name}"
-        count = await ctx.redis.scard(dirty_key)
-        
-        if count >= self.VOLUME_THRESHOLD:
-            return True
-            
-        if count > 0 and ctx.idle_seconds >= self.IDLE_THRESHOLD:
-            return True
-            
-        return False
+        return await ctx.redis.scard(dirty_key) > 0
     
     async def _maybe_refine_user(self, ctx: JobContext, dirty_count: int) -> bool:
         """
@@ -60,7 +51,7 @@ class ProfileRefinementJob(BaseJob):
         if await ctx.redis.get(ran_key):
             return False
         
-        if dirty_count < self.USER_VOLUME_THRESHOLD and ctx.idle_seconds < self.USER_IDLE_THRESHOLD:
+        if dirty_count < self.VOLUME_THRESHOLD and ctx.idle_seconds < self.USER_IDLE_THRESHOLD:
             return False
         
         user_id = self.resolver.get_id(ctx.user_name)
@@ -74,8 +65,8 @@ class ProfileRefinementJob(BaseJob):
             return False
         
         success = await self._refine_user_profile(ctx, user_id, profile)
-        
-        await ctx.redis.setex(ran_key, 3600, "true")
+
+        await ctx.redis.setex(ran_key, 300, "true")
         
         return success
 
@@ -146,6 +137,14 @@ class ProfileRefinementJob(BaseJob):
             
             return JobResult(success=True, summary=summary)
     
+    def _extract_summary(self, response: str) -> str:
+        """Extract summary from reasoning+summary response."""
+        if "<summary>" in response and "</summary>" in response:
+            start = response.index("<summary>") + len("<summary>")
+            end = response.index("</summary>")
+            return response[start:end].strip()
+        return response.strip()
+    
     async def _refine_user_profile(self, ctx: JobContext, user_id: int, profile: dict) -> bool:
         """Execute user profile refinement."""
         sorted_set_key = f"recent_messages:{ctx.user_name}"
@@ -191,10 +190,15 @@ class ProfileRefinementJob(BaseJob):
             "known_aliases": [ctx.user_name]
         }, indent=2)
         
-        new_summary = await self.llm.call_reasoning(system_prompt, user_content)
+        raw_response = await self.llm.call_reasoning(system_prompt, user_content)
+
+        if not raw_response:
+            return None
+
+        new_summary = self._extract_summary(raw_response)
         
         if not new_summary or new_summary == profile.get("summary", ""):
-            return False
+            return None
         
         loop = asyncio.get_running_loop()
         embedding = await loop.run_in_executor(
@@ -262,8 +266,13 @@ class ProfileRefinementJob(BaseJob):
                     "known_aliases": mentions
                 }, indent=2)
                 
-                new_summary = await self.llm.call_reasoning(system_prompt, user_content)
-                
+                raw_response = await self.llm.call_reasoning(system_prompt, user_content)
+
+                if not raw_response:
+                    return None
+
+                new_summary = self._extract_summary(raw_response)
+
                 if not new_summary or new_summary == existing_summary:
                     return None
                 

@@ -2,11 +2,10 @@ from datetime import datetime, timezone
 from loguru import logger
 import threading
 from typing import Dict, List, Optional, Tuple
-from rapidfuzz import process as fuzz
+from rapidfuzz import fuzz
 import faiss
-import re
 import numpy as np
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
 from db.memgraph import MemGraphStore
 
 
@@ -17,14 +16,15 @@ class EntityResolver:
         self.store = store
         
         self.embedding_model = SentenceTransformer(embedding_model, trust_remote_code=True, device='cpu')
-        self.cross_encoder = CrossEncoder('BAAI/bge-reranker-v2-m3', device='cpu')
 
         self.embedding_dim = 1024
-        self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)
-        self.index_id_map = faiss.IndexIDMap2(self.faiss_index)
+        self.index_id_map = faiss.IndexIDMap2(faiss.IndexFlatIP(self.embedding_dim))
         self.entity_profiles = {}
         self._name_to_id = {}
+        self.msg_index = faiss.IndexIDMap2(faiss.IndexFlatIP(self.embedding_dim))
+        self.msg_int_to_id: dict[int, str] = {}
         self._lock = threading.RLock()
+
     
         self._hydrate_from_store()
 
@@ -95,6 +95,33 @@ class EntityResolver:
                 logger.warning(f"Could not retrieve embedding for {entity_id}: {e}")
                 return []
     
+    def hydrate_messages(self, messages: dict[str, dict]):
+        if not messages:
+            return
+        ids, texts = [], []
+        for msg_id, data in messages.items():
+            int_id = int(msg_id.split("_")[1])
+            self.msg_int_to_id[int_id] = msg_id
+            ids.append(int_id)
+            texts.append(data["message"])
+        
+        embs = self.embedding_model.encode(texts)
+        faiss.normalize_L2(embs)
+        self.msg_index.add_with_ids(embs, np.array(ids, dtype=np.int64))
+
+    def add_message(self, msg_id: str, text: str):
+        int_id = int(msg_id.split("_")[1])
+        self.msg_int_to_id[int_id] = msg_id
+        emb = self.embedding_model.encode([text])
+        faiss.normalize_L2(emb)
+        self.msg_index.add_with_ids(emb, np.array([int_id], dtype=np.int64))
+
+    def search_messages(self, query: str, k: int = 5) -> list[tuple[str, float]]:
+        q_emb = self.embedding_model.encode([query])
+        faiss.normalize_L2(q_emb)
+        scores, ids = self.msg_index.search(q_emb, k)
+        return [(self.msg_int_to_id[int(i)], float(s)) for i, s in zip(ids[0], scores[0]) if i >= 0]
+    
     def validate_existing(self, canonical_name: str, mentions: List[str]) -> Tuple[Optional[int], bool]:
         """
         Check if canonical_name exists. If yes, register mention aliases and return ID.
@@ -146,7 +173,7 @@ class EntityResolver:
         canonical_name = profile.get("canonical_name", "")
         summary = profile.get("summary", "") or ""
 
-        resolution_text = f"{canonical_name}. {summary[:200]}"
+        resolution_text = f"{canonical_name}. {summary}"
         embedding_np = self.embedding_model.encode([resolution_text])[0]
         faiss.normalize_L2(embedding_np.reshape(1, -1))
 
@@ -207,123 +234,58 @@ class EntityResolver:
         logger.info(f"Merge detection started, {len(self.entity_profiles)} entities to scan")
         
         candidates = []
-        seen_pairs = set()
+        seen_pairs = {}
+        aliases = list(self._name_to_id.keys())
+        for i in range(len(aliases)):
+            for j in range(i + 1, len(aliases)):
+                id_i = self._name_to_id[aliases[i]]
+                id_j = self._name_to_id[aliases[j]]
+                if id_i == id_j:
+                    continue
+                score = fuzz.WRatio(aliases[i], aliases[j])
+                if score >= 85:
+                    pair_key = tuple(sorted([id_i, id_j]))
+                    if pair_key not in seen_pairs or score > seen_pairs[pair_key]:
+                        seen_pairs[pair_key] = score
+                    
+
         
-        # PASS 1: Name-based detection (case-insensitive exact matches)
-        name_to_ids: dict[str, list[int]] = {}
-        for ent_id, profile in self.entity_profiles.items():
-            canonical = profile.get("canonical_name", "")
-            if canonical:
-                key = canonical.lower().strip()
-                if key not in name_to_ids:
-                    name_to_ids[key] = []
-                name_to_ids[key].append(ent_id)
-        
-        for _, ids in name_to_ids.items():
-            if len(ids) < 2:
+        for (id_a, id_b), fuzz_score in seen_pairs.items():
+            if self.store.has_direct_edge(id_a, id_b):
+                logger.debug(f"Blocked ({id_a}, {id_b}) | Direct edge exists")
                 continue
+            profile_a = self.entity_profiles.get(id_a, {})
+            profile_b = self.entity_profiles.get(id_b, {})
+            type_a = profile_a.get("type")
+            type_b = profile_b.get("type")
+
+            neighbors_a = self.store.get_neighbor_ids(id_a)
+            neighbors_b = self.store.get_neighbor_ids(id_b)
+            neighbors_a.discard(1) # user id - hardcoded for now
+            neighbors_b.discard(1)
             
-            for i, id_a in enumerate(ids):
-                for id_b in ids[i + 1:]:
-                    pair = tuple(sorted([id_a, id_b]))
-                    if pair in seen_pairs:
-                        continue
-                    seen_pairs.add(pair)
-                    
-                    profile_a = self.entity_profiles.get(id_a, {})
-                    profile_b = self.entity_profiles.get(id_b, {})
-                    
-                    logger.info(
-                        f"Name match: ({id_a}, {id_b}) "
-                        f"{profile_a.get('canonical_name')} <-> {profile_b.get('canonical_name')} | "
-                        f"Decision=APPROVED"
-                    )
-                    
-                    primary_id, secondary_id = pair
-                    candidates.append({
-                        "primary_id": primary_id,
-                        "secondary_id": secondary_id,
-                        "primary_name": self.entity_profiles[primary_id].get("canonical_name", "Unknown"),
-                        "secondary_name": self.entity_profiles[secondary_id].get("canonical_name", "Unknown"),
-                        "faiss_score": 1.0,
-                        "cross_score": 1.0
-                    })
-        
-        # PASS 2: Summary-based detection (different names, same entity)
-        for entity_id, profile in self.entity_profiles.items():
-            summary = profile.get("summary", "")
-            entity_type = profile.get("type")
-            canonical_name = profile.get("canonical_name", "Unknown")
+            shared_neighbors = neighbors_a & neighbors_b
+            if shared_neighbors:
+                high_confidence = fuzz_score >= 95 and type_a and type_b and type_a == type_b
             
-            if not summary:
-                continue
+                if not high_confidence:
+                    logger.debug(f"Blocked ({id_a}, {id_b}) | Shared neighbors: {shared_neighbors} (score={fuzz_score}, types={type_a}/{type_b})")
+                    continue
+                else:
+                    logger.info(f"Passed ({id_a}, {id_b}) | Shared neighbors as supporting evidence (score={fuzz_score}, type={type_a})")
             
-            match = re.match(r'^(.+?[.!?])(?:\s+[A-Z]|$)', summary)
-            first_sentence = match.group(1).strip() if match else summary[:200].strip()
+            candidates.append({
+                "primary_id": id_a,
+                "secondary_id": id_b,
+                "primary_name": profile_a.get("canonical_name", "Unknown"),
+                "secondary_name": profile_b.get("canonical_name", "Unknown"),
+                "profile_a": profile_a,
+                "profile_b": profile_b,
+                "fuzz_score": fuzz_score,
+                "shared_neighbor_count": len(shared_neighbors)
+            })
             
-            query_text = f"{canonical_name}. {first_sentence}"
-            embedding = self.embedding_model.encode([query_text])
-            faiss.normalize_L2(embedding)
-            
-            with self._lock:
-                if self.index_id_map.ntotal == 0:
-                    continue
-                
-                scores, indices = self.index_id_map.search(embedding, k=5)
-            
-            for match_id, faiss_score in zip(indices[0], scores[0]):
-                match_id = int(match_id)
-                
-                if match_id == -1 or match_id == entity_id:
-                    continue
-                
-                match_profile = self.entity_profiles.get(match_id)
-                if not match_profile:
-                    continue
-                
-                pair = tuple(sorted([entity_id, match_id]))
-                if pair in seen_pairs:
-                    continue
-                
-                match_type = match_profile.get("type")
-                match_name = match_profile.get("canonical_name", "Unknown")
-                
-                # Fuzzy name check to bypass type mismatch
-                name_score = fuzz.WRatio(canonical_name.lower(), match_name.lower())
-                names_similar = name_score >= 85
-                
-                if entity_type != match_type and not names_similar:
-                    logger.debug(
-                        f"Type mismatch: {canonical_name} ({entity_type}) vs "
-                        f"{match_name} ({match_type}), skipping"
-                    )
-                    continue
-                
-                if faiss_score < 0.50:
-                    continue
-                
-                primary_text = f"{canonical_name}. {profile.get('summary', '')[:150]}"
-                secondary_text = f"{match_name}. {match_profile.get('summary', '')[:150]}"
-                cross_score = float(self.cross_encoder.predict([[primary_text, secondary_text]])[0])
-                
-                seen_pairs.add(pair)
-                
-                decision = "APPROVED" if cross_score >= 0.65 else "REJECTED"
-                logger.info(
-                    f"Summary match: ({entity_id}, {match_id}) {canonical_name} <-> {match_name} | "
-                    f"FAISS={faiss_score:.3f} Cross={cross_score:.3f} Fuzzy={name_score} Decision={decision}"
-                )
-                
-                if cross_score >= 0.65:
-                    primary_id, secondary_id = pair
-                    candidates.append({
-                        "primary_id": primary_id,
-                        "secondary_id": secondary_id,
-                        "primary_name": self.entity_profiles[primary_id].get("canonical_name", "Unknown"),
-                        "secondary_name": self.entity_profiles[secondary_id].get("canonical_name", "Unknown"),
-                        "faiss_score": float(faiss_score),
-                        "cross_score": cross_score
-                    })
-        
+            logger.info(f"Candidate ({id_a}, {id_b}) {profile_a.get('canonical_name')} <-> {profile_b.get('canonical_name')} | score={fuzz_score}")
+    
         logger.info(f"Merge detection complete: {len(candidates)} candidates found")
         return candidates

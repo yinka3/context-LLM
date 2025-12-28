@@ -7,6 +7,9 @@ from typing import Set, List, Dict, Tuple
 class ContextState:
     call_count: int = 0
     max_calls: int = 5
+    attempt_count: int = 0
+    max_attempts: int = 10
+    consecutive_rejections: int = 0
     user_query: str = ""
     current_state: str = "start"
     trace_id: str = ""
@@ -62,7 +65,7 @@ class StateOrchestrator(StateMachine):
         
         call_sig = (tool_name, str(sorted(args.items())))
         if call_sig in self._previous_calls:
-            return False, "duplicate call"
+            return False, f"Already called {tool_name} with these args. Result is in accumulated context — use it or try different tool."
         
         if tool_name == "finish" and not self.can_finish():
             return False, "no evidence gathered"
@@ -87,12 +90,6 @@ class StateOrchestrator(StateMachine):
                 self.advance()
     
     def can_finish(self) -> bool:
-        # if self.current_state == self.web_only:
-        #     return bool(self.ctx.web_results)
-        
-        if self.current_state == self.exploring:
-            return bool(self.ctx.retrieved_messages)
-        
         return bool(
             self.ctx.entity_profiles or 
             self.ctx.retrieved_messages or 

@@ -45,9 +45,25 @@ class Tools:
             return profile["canonical_name"] if profile else matched_name
         
         return None
+    
+    async def _hydrate_evidence(self, evidence_ids: list[str]) -> list[dict]:
+        if not evidence_ids:
+            return []
+        content_key = f"message_content:{self.user_name}"
+        results = []
+        for msg_id in evidence_ids:
+            raw = await self.redis.hget(content_key, msg_id)
+            if raw:
+                data = json.loads(raw)
+                results.append({
+                    "id": msg_id,
+                    "message": data["message"],
+                    "timestamp": data["timestamp"]
+                })
+        return results
 
     
-    def search_messages(self, query: str, limit: int = 5) -> List[Dict]:
+    async def search_messages(self, query: str, limit: int = 5) -> List[Dict]:
         """
         Search past user messages by semantic similarity.
         Use when looking for what the user said about a topic, event, or person.
@@ -59,46 +75,17 @@ class Tools:
         
         Returns: List of messages with content, timestamp, and relevance score.
         """
+        results = self.resolver.search_messages(query, limit)
         content_key = f"message_content:{self.user_name}"
-        all_messages = self.redis.hgetall(content_key)
-        if not all_messages:
-            return []
-        
-        msg_ids = []
-        texts = []
-        parsed_data = {}
-        
-        for msg_id, msg_data in all_messages.items():
-            msg_id = msg_id.decode() if isinstance(msg_id, bytes) else msg_id
-            parsed = json.loads(msg_data)
-            msg_ids.append(msg_id)
-            texts.append(parsed["message"])
-            parsed_data[msg_id] = parsed
-        
-        all_texts = [query] + texts
-        embeddings = self.resolver.embedding_model.encode(all_texts)
-        faiss.normalize_L2(embeddings)
-        
-        query_vec = embeddings[0]
-        msg_vecs = embeddings[1:]
-        
-        scores = np.dot(msg_vecs, query_vec)
-        top_indices = np.argsort(scores)[::-1][:limit]
-        
-        results = []
-        for idx in top_indices:
-            msg_id = msg_ids[idx]
-            results.append({
-                "id": msg_id,
-                "message": parsed_data[msg_id]["message"],
-                "timestamp": parsed_data[msg_id]["timestamp"],
-                "score": float(scores[idx])
-            })
-        
-        return results
+        output = []
+        for msg_id, score in results:
+            raw = await self.redis.hget(content_key, msg_id)
+            if raw:
+                data = json.loads(raw)
+                output.append({"id": msg_id, "message": data["message"], "timestamp": data["timestamp"], "score": score})
+        return output
 
-
-    def search_entities(self, query: str, limit: int = 5) -> List[Dict]:
+    async def search_entities(self, query: str, limit: int = 5) -> List[Dict]:
         """
         Search for entities by name or alias.
         Use when you need to find a person, place, or thing but aren't sure of exact name.
@@ -112,7 +99,7 @@ class Tools:
         """
         return self.store.search_entity(query, limit) or []
 
-    def get_profile(self, entity_name: str) -> Optional[Dict]:
+    async def get_profile(self, entity_name: str) -> Optional[Dict]:
         """
         Get full profile for a specific entity.
         Use when you know the exact entity name and need complete information.
@@ -135,7 +122,7 @@ class Tools:
             
         return self.store.get_entity_profile(canonical)
 
-    def get_connections(self, entity_name: str, active_only: bool = True) -> List[Dict]:
+    async def get_connections(self, entity_name: str, active_only: bool = True) -> List[Dict]:
         """
         Find all entities connected to a given entity.
         Use when asked about someone's relationships, network, or "who knows who".
@@ -149,9 +136,14 @@ class Tools:
         canonical = self._resolve_entity_name(entity_name)
         if not canonical:
             return []
-        return self.store.get_related_entities([canonical], active_only) or []
+        results = self.store.get_related_entities([canonical], active_only) or []
+        
+        for r in results:
+            r["evidence"] = await self._hydrate_evidence(r.pop("evidence_ids", []))
+        
+        return results
 
-    def get_recent_activity(self, entity_name: str, hours: int = 24) -> List[Dict]:
+    async def get_recent_activity(self, entity_name: str, hours: int = 24) -> List[Dict]:
         """
         Get recent interactions involving an entity within a time window.
         Use when asked "what happened with X recently" or "any updates on X".
@@ -165,9 +157,14 @@ class Tools:
         canonical = self._resolve_entity_name(entity_name)
         if not canonical:
             return []
-        return self.store.get_recent_activity(canonical, hours) or []
+        results = self.store.get_recent_activity(canonical, hours) or []
+        
+        for r in results:
+            r["evidence"] = await self._hydrate_evidence(r.pop("evidence_ids", []))
+        
+        return results
 
-    def find_path(self, entity_a: str, entity_b: str) -> List[Dict]:
+    async def find_path(self, entity_a: str, entity_b: str) -> List[Dict]:
         """
         Find the shortest connection path between two entities.
         Use when asked "how is X connected to Y" or "what's the relationship between X and Y".
@@ -189,6 +186,8 @@ class Tools:
 
         path = self.store._find_path_filtered(canonical_a, canonical_b, active_only=True)
         if path:
+            for step in path:
+                step["evidence"] = await self._hydrate_evidence(step.pop("evidence_refs", []))
             return path
 
         full_path = self.store._find_path_filtered(canonical_a, canonical_b, active_only=False)
@@ -197,7 +196,7 @@ class Tools:
         
         return []
 
-    def get_hot_topic_context(self, hot_topics: List[str]) -> Dict[str, List[Dict]]:
+    async def get_hot_topic_context(self, hot_topics: List[str]) -> Dict[str, List[Dict]]:
         """
         Retrieve pre-cached context for frequently accessed topics.
         Called automatically at start — you already have this data in hot_topic_context.

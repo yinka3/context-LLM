@@ -10,7 +10,7 @@ TOOL_SCHEMAS = [
                     "query": {"type": "string", "description": "Keywords or phrase to search for"},
                     "limit": {"type": "integer", "description": "Max results (default 5)"}
                 },
-                "required": ["query", "limit"]
+                "required": ["query"]
             }
         }
     },
@@ -59,7 +59,7 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "get_recent_activity",
+            "name": "get_activity",
             "description": "Get recent interactions involving an entity. Use for 'what happened with X recently'.",
             "parameters": {
                 "type": "object",

@@ -9,6 +9,7 @@ import redis.asyncio as redis
 from loguru import logger
 from rapidfuzz import process as fuzzy_process, fuzz
 from typing import Dict, List, Set, Tuple, Optional
+from db.memgraph import MemGraphStore
 from main.service import LLMService
 from main.nlp_pipe import NLPPipeline
 from main.entity_resolve import EntityResolver
@@ -43,6 +44,7 @@ class BatchProcessor:
             llm: LLMService,
             ent_resolver: EntityResolver,
             nlp_pipe: NLPPipeline,
+            store: MemGraphStore,
             cpu_executor: ThreadPoolExecutor,
             user_name: str,
             active_topics: List[str],
@@ -52,12 +54,13 @@ class BatchProcessor:
             self.llm = llm
             self.ent_resolver = ent_resolver
             self.nlp = nlp_pipe
+            self.store = store
             self.executor = cpu_executor
             self.user_name = user_name
             self.topics = active_topics
             self._get_next_ent_id = get_next_ent_id
         
-    async def run(self, messages: List[Dict]) -> BatchResult:
+    async def run(self, messages: List[Dict], session_text: str) -> BatchResult:
         """
         Process a batch of messages. Returns BatchResult with entity IDs and connections.
         Caller responsible for lock acquisition and publishing results.
@@ -81,9 +84,11 @@ class BatchProcessor:
             
             known_entities = await self._build_known_entities(mentions)
             
-            disambiguation = await self._disambiguate(mentions, messages, known_entities)
+            disambiguation = await self._disambiguate(mentions, messages, known_entities, session_text)
             if not disambiguation.entries:
-                logger.info("No disambiguation results, skipping")
+                logger.error("Disambiguation failed - no results returned")
+                result.success = False
+                result.error = "VEGAPUNK-02 returned empty disambiguation"
                 return result
             
             entity_ids, new_ids, alias_ids = await self._resolve(disambiguation)
@@ -112,23 +117,19 @@ class BatchProcessor:
         """Run NER and emotion detection across all messages."""
         loop = asyncio.get_running_loop()
         
-        mention_tasks = [
-            self.nlp.extract_mentions(self.user_name, self.topics, m["message"])
-            for m in messages
-        ]
+        combined_text = "\n".join([f"[MSG {m['id']}]: {m['message']}" for m in messages])
+        mentions = await self.nlp.extract_mentions(self.user_name, self.topics, combined_text)
+        
+        unique_mentions: Dict[str, Dict] = {}
+        for text, typ, topic in mentions:
+            if text not in unique_mentions:
+                unique_mentions[text] = {"type": typ, "topic": topic}
+        
         emotion_tasks = [
             loop.run_in_executor(self.executor, self.nlp.analyze_emotion, m["message"])
             for m in messages
         ]
-        
-        all_mentions = await asyncio.gather(*mention_tasks)
         all_emotions = await asyncio.gather(*emotion_tasks)
-        
-        unique_mentions: Dict[str, Dict] = {}
-        for mentions in all_mentions:
-            for text, typ, topic in mentions:
-                if text not in unique_mentions:
-                    unique_mentions[text] = {"type": typ, "topic": topic}
         
         emotions = []
         for emotion_list in all_emotions:
@@ -139,36 +140,20 @@ class BatchProcessor:
         return unique_mentions, emotions
 
     async def _build_known_entities(self, mentions: List[Tuple[str, str, str]]) -> List[Dict]:
-        """Tiered lookup: exact then fuzzy against resolver."""
         matched_ids = set()
+        known = []
         
         for mention_name, _, _ in mentions:
-            entity_id = self.ent_resolver.get_id(mention_name)
-            if entity_id:
-                matched_ids.add(entity_id)
-                continue
-            
-            if self.ent_resolver._name_to_id:
-                result = fuzzy_process.extractOne(
-                    query=mention_name,
-                    choices=self.ent_resolver._name_to_id.keys(),
-                    scorer=fuzz.WRatio,
-                    score_cutoff=85
-                )
-                if result:
-                    matched_name, score, _ = result
-                    logger.debug(f"Fuzzy matched '{mention_name}' -> '{matched_name}' (score={score})")
-                    matched_ids.add(self.ent_resolver._name_to_id[matched_name])
-        
-        known = []
-        for ent_id in matched_ids:
-            profile = self.ent_resolver.entity_profiles.get(ent_id)
-            if profile:
-                known.append({
-                    "canonical_name": profile.get("canonical_name"),
-                    "type": profile.get("type"),
-                    "aliases": self.ent_resolver.get_mentions_for_id(ent_id)
-                })
+            entities = self.store.get_entities_by_name(mention_name)
+            for ent in entities:
+                if ent["id"] not in matched_ids:
+                    matched_ids.add(ent["id"])
+                    known.append({
+                        "canonical_name": ent["canonical_name"],
+                        "type": ent["type"],
+                        "aliases": ent["aliases"] or [],
+                        "summary": ent.get("summary") or ""
+                    })
         
         return known
 
@@ -176,16 +161,19 @@ class BatchProcessor:
         self,
         mentions: List[Tuple[str, str, str]],
         messages: List[Dict],
-        known_entities: List[Dict]
+        known_entities: List[Dict],
+        session_text: str
     ) -> DisambiguationResult:
         """Two-phase disambiguation: reasoning → structuring."""
+
         messages_text = "\n".join([f"{m['id']}: \"{m['message']}\"" for m in messages])
         mentions_fmt = [{"name": m[0], "type": m[1], "topic": m[2]} for m in mentions]
         
         system_02 = get_disambiguation_reasoning_prompt(self.user_name, messages_text)
         user_02 = json.dumps({
             "mentions": mentions_fmt,
-            "known_entities": known_entities
+            "known_entities": known_entities,
+            "session_context": session_text
         }, indent=2)
         
         reasoning = await self.llm.call_reasoning(system_02, user_02)
@@ -227,7 +215,7 @@ class BatchProcessor:
                         self.executor,
                         partial(
                             self.ent_resolver.register_entity,
-                            ent_id, canonical, entry.mentions, entry.entity_type, "General"
+                            ent_id, canonical, entry.mentions, entry.entity_type, entry.topic
                         )
                     )
                     new_ids.add(ent_id)
@@ -244,7 +232,7 @@ class BatchProcessor:
                     self.executor,
                     partial(
                         self.ent_resolver.register_entity,
-                        ent_id, canonical, entry.mentions, entry.entity_type, "General"
+                        ent_id, canonical, entry.mentions, entry.entity_type, entry.topic
                     )
                 )
                 new_ids.add(ent_id)

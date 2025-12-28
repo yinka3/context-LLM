@@ -54,6 +54,11 @@ class ResolutionEntry(BaseModel):
                     "For NEW_GROUP: the longest or most complete mention. "
                     "For NEW_SINGLE: the mention text verbatim."
     )
+    topic: str = Field(
+        default="General",
+        description="The topic category this entity belongs to, from the original mention's topic. "
+        "If grouped mentions have different topics, use the topic of the canonical mention."
+    )
 
 
 class DisambiguationResult(BaseModel):
@@ -74,7 +79,7 @@ class CompleteResult(BaseResult):
     messages: List[Dict]
     profiles: List[Dict]
     graph: List[Dict]
-    web: List[Dict]
+    # web: List[Dict]
 
 
 class ClarificationResult(BaseResult):
@@ -99,7 +104,7 @@ class ClarificationRequest:
     question: str
 
 
-StellaResponse = Union[ToolCall, FinalResponse, ClarificationRequest]
+StellaResponse = Union[ToolCall, List[ToolCall], FinalResponse, ClarificationRequest]
 
 @dataclass
 class TraceEntry:
