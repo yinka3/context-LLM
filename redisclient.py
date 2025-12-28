@@ -1,8 +1,15 @@
-import redis
 import redis.asyncio as async_redis
+from dotenv import load_dotenv
+import os
+load_dotenv()
 
-REDIS_HOST = 'localhost'
-REDIS_PORT = 6379
+VESTIGE_USER_NAME = os.environ.get("VESTIGE_USER_NAME")
+REDIS_HOST = os.environ.get("REDIS_HOST")
+REDIS_PORT = os.environ.get("REDIS_POST")
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD")
+
+if not REDIS_PASSWORD:
+    raise ValueError("REDIS_PASSWORD not set in environment")
 
 class AsyncRedisClient:
     _instance = None
@@ -11,7 +18,7 @@ class AsyncRedisClient:
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             pool = async_redis.ConnectionPool.from_url(
-                url=f"redis://{REDIS_HOST}:{REDIS_PORT}",
+                url=f"redis://:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}",
                 decode_responses=True,
                 max_connections=10
             )
@@ -19,21 +26,4 @@ class AsyncRedisClient:
         return cls._instance
 
     def get_client(self) -> async_redis.Redis:
-        return self.client
-
-class SyncRedisClient:
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            pool = redis.ConnectionPool.from_url(
-                url=f"redis://{REDIS_HOST}:{REDIS_PORT}",
-                decode_responses=True,
-                max_connections=5
-            )
-            cls._instance.client = redis.Redis(connection_pool=pool)
-        return cls._instance
-
-    def get_client(self) -> redis.Redis:
         return self.client
