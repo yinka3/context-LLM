@@ -87,6 +87,6 @@ Vestige is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)
 
 ## Disclaimer
 
-Vestige is a decision-support tool, not a decision-making system. Users are responsible for verifying all extracted entities, relationships, and insights before taking action. Vestige makes no warranty regarding accuracy, completeness, or fitness for any particular purpose.
+Vestige is a decision-support tool and decision-making system. Users have access for verifying all extracted entities, relationships, and insights.
 
 See [LICENSE](./LICENSE) for full terms.
