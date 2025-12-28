@@ -9,3 +9,4 @@ rm -f *.log
 echo Restarting containers and volumes
 docker compose up -d
 echo "Done."
+clear

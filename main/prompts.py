@@ -150,6 +150,7 @@ Return structured ResolutionEntry objects:
 - `canonical_name`: the primary name
 - `mentions`: list of mention strings mapping to this entity
 - `entity_type`: pulled from original mentions list
+- `topic`: preserve from the original mention; if grouped, use the canonical mention's topic
 </output>
 """
 

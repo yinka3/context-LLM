@@ -28,7 +28,7 @@ load_dotenv()
 BATCH_SIZE = 5
 PROFILE_INTERVAL = 15
 SESSION_WINDOW = 50
-BATCH_TIMEOUT_SECONDS = 180.0
+BATCH_TIMEOUT_SECONDS = 90
 
 class Context:
 
@@ -83,6 +83,10 @@ class Context:
         )
         
         instance.ent_resolver = EntityResolver(store=instance.store)
+
+        raw_msgs = await redis_conn.hgetall(f"message_content:{user_name}")
+        messages = {k.decode(): json.loads(v) for k, v in raw_msgs.items()}
+        instance.ent_resolver.hydrate_messages(messages)
 
         await instance._get_or_create_user_entity(user_name)
 
@@ -312,6 +316,7 @@ class Context:
         pipe.zadd(f"recent_messages:{self.user_name}", {msg_key: msg.timestamp.timestamp()})
         pipe.zremrangebyrank(f"recent_messages:{self.user_name}", 0, -(SESSION_WINDOW + 1))
         await pipe.execute()
+        self.ent_resolver.add_message(msg_key, msg.message.strip())
 
 
     async def process_batch(self):

@@ -215,7 +215,7 @@ class BatchProcessor:
                         self.executor,
                         partial(
                             self.ent_resolver.register_entity,
-                            ent_id, canonical, entry.mentions, entry.entity_type, "General"
+                            ent_id, canonical, entry.mentions, entry.entity_type, entry.topic
                         )
                     )
                     new_ids.add(ent_id)
@@ -232,7 +232,7 @@ class BatchProcessor:
                     self.executor,
                     partial(
                         self.ent_resolver.register_entity,
-                        ent_id, canonical, entry.mentions, entry.entity_type, "General"
+                        ent_id, canonical, entry.mentions, entry.entity_type, entry.topic
                     )
                 )
                 new_ids.add(ent_id)

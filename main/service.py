@@ -11,13 +11,15 @@ class LLMService:
 
     DEFAULT_STRUCTURED_MODEL = "google/gemini-2.5-flash"
     DEFAULT_REASONING_MODEL = "google/gemini-3-flash-preview"
-    
+    DEFAULT_AGENT_MODEL = "anthropic/claude-sonnet-4.5"
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         trace_logger=None,
         structured_model: Optional[str] = None,
         reasoning_model: Optional[str] = None,
+        agent_model: Optional[str] = None
     ):
         self._api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not self._api_key:
@@ -26,6 +28,7 @@ class LLMService:
         self._trace = trace_logger
         self._structured_model = structured_model or self.DEFAULT_STRUCTURED_MODEL
         self._reasoning_model = reasoning_model or self.DEFAULT_REASONING_MODEL
+        self._agent_model = agent_model or self.DEFAULT_AGENT_MODEL
 
         self._client_sync = OpenAI(
             base_url="https://openrouter.ai/api/v1",
@@ -58,6 +61,10 @@ class LLMService:
     @property
     def reasoning_model(self) -> str:
         return self._reasoning_model
+    
+    @property
+    def agent_model(self) -> str:
+        return self._agent_model
 
     async def call_structured(
         self,
@@ -144,7 +151,7 @@ class LLMService:
             logger.error(f"Reasoning LLM call failed: {e}")
             return None
     
-    def call_with_tools_sync(
+    async def call_with_tools(
         self,
         system: str,
         user: str,
@@ -153,13 +160,13 @@ class LLMService:
         temperature: float = 0.0,
     ) -> Optional[Dict]:
         """Sync call with function tools. Returns parsed tool call."""
-        model = model or self._reasoning_model
+        model = model or self._agent_model
         
         if self._trace:
             self._trace.debug(f"[TOOLS SYNC] Model: {model}\nTools: {[t['function']['name'] for t in tools]}")
         
         try:
-            response = self._client_sync.chat.completions.create(
+            response = await self._client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": system},

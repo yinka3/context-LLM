@@ -115,7 +115,8 @@ class MemGraphStore:
         MATCH (e:Entity)
         WHERE e.id IS NOT NULL
         OPTIONAL MATCH (e)-[:BELONGS_TO]->(t:Topic)
-        WHERE t IS NULL OR t.status <> 'inactive'
+        WITH e, t
+        WHERE t IS NULL OR t.status IS NULL OR t.status <> 'inactive'
         RETURN e.id AS id,
             e.canonical_name AS canonical_name,
             e.aliases AS aliases,
@@ -293,10 +294,11 @@ class MemGraphStore:
         """
         query_cypher = """
         MATCH (e:Entity)
-        OPTIONAL MATCH (e)-[:BELONGS_TO]->(t:Topic)
         WHERE (e.canonical_name CONTAINS $query 
             OR ANY(alias IN e.aliases WHERE alias CONTAINS $query))
-        AND (t IS NULL OR t.status <> 'inactive')
+        OPTIONAL MATCH (e)-[:BELONGS_TO]->(t:Topic)
+        WITH e, t
+        WHERE t IS NULL OR t.status IS NULL OR t.status <> 'inactive'
         RETURN e.id as id, e.canonical_name as name, e.summary as summary, e.type as type
         ORDER BY e.last_mentioned DESC
         LIMIT $limit
@@ -313,7 +315,8 @@ class MemGraphStore:
         query = """
         MATCH (e:Entity {canonical_name: $name})
         OPTIONAL MATCH (e)-[:BELONGS_TO]->(t:Topic)
-        WHERE t IS NULL OR t.status <> 'inactive'
+        WITH e, t
+        WHERE t IS NULL OR t.status IS NULL OR t.status <> 'inactive'
         RETURN e.id as id,
             e.canonical_name as canonical_name,
             e.aliases as aliases,
@@ -344,6 +347,7 @@ class MemGraphStore:
         WHERE
             ($active_only = false) OR
             (t IS NULL) OR
+            (t.status IS NULL) OR
             (t.status <> 'inactive')
         RETURN
             source.canonical_name as source,
@@ -383,8 +387,9 @@ class MemGraphStore:
         MATCH (end:Entity {canonical_name: $end_name})
         MATCH p = shortestPath((start)-[:RELATED_TO*..4]-(end))
         WHERE ALL(n IN nodes(p) WHERE
+            $active_only = false OR
+            NOT EXISTS((n)-[:BELONGS_TO]->(:Topic)) OR
             NOT EXISTS((n)-[:BELONGS_TO]->(:Topic {status: 'inactive'}))
-            OR $active_only = false
         )
         RETURN [n in nodes(p) | n.canonical_name] as names,
             [r in relationships(p) | r.message_ids] as evidence_ids
@@ -410,26 +415,6 @@ class MemGraphStore:
                     "evidence_refs": evidence[i]
                 })
             return path_data
-    
-
-    def _fetch_entity(self, entity_id: int) -> Optional[Dict]:
-        """Fetch entity properties by ID."""
-        query = """
-        MATCH (e:Entity {id: $entity_id})
-        RETURN e.id as id,
-            e.canonical_name as canonical_name,
-            e.aliases as aliases,
-            e.type as type,
-            e.summary as summary,
-            e.embedding as embedding,
-            e.confidence as confidence,
-            e.last_mentioned as last_mentioned,
-            e.last_updated as last_updated
-        """
-        with self.driver.session() as session:
-            result = session.run(query, {"entity_id": entity_id})
-            record = result.single()
-            return dict(record) if record else None
     
     def merge_entities(self, primary_id: int, secondary_id: int, merged_summary: str) -> bool:
         """

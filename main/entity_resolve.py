@@ -18,11 +18,13 @@ class EntityResolver:
         self.embedding_model = SentenceTransformer(embedding_model, trust_remote_code=True, device='cpu')
 
         self.embedding_dim = 1024
-        self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)
-        self.index_id_map = faiss.IndexIDMap2(self.faiss_index)
+        self.index_id_map = faiss.IndexIDMap2(faiss.IndexFlatIP(self.embedding_dim))
         self.entity_profiles = {}
         self._name_to_id = {}
+        self.msg_index = faiss.IndexIDMap2(faiss.IndexFlatIP(self.embedding_dim))
+        self.msg_int_to_id: dict[int, str] = {}
         self._lock = threading.RLock()
+
     
         self._hydrate_from_store()
 
@@ -92,6 +94,33 @@ class EntityResolver:
             except Exception as e:
                 logger.warning(f"Could not retrieve embedding for {entity_id}: {e}")
                 return []
+    
+    def hydrate_messages(self, messages: dict[str, dict]):
+        if not messages:
+            return
+        ids, texts = [], []
+        for msg_id, data in messages.items():
+            int_id = int(msg_id.split("_")[1])
+            self.msg_int_to_id[int_id] = msg_id
+            ids.append(int_id)
+            texts.append(data["message"])
+        
+        embs = self.embedding_model.encode(texts)
+        faiss.normalize_L2(embs)
+        self.msg_index.add_with_ids(embs, np.array(ids, dtype=np.int64))
+
+    def add_message(self, msg_id: str, text: str):
+        int_id = int(msg_id.split("_")[1])
+        self.msg_int_to_id[int_id] = msg_id
+        emb = self.embedding_model.encode([text])
+        faiss.normalize_L2(emb)
+        self.msg_index.add_with_ids(emb, np.array([int_id], dtype=np.int64))
+
+    def search_messages(self, query: str, k: int = 5) -> list[tuple[str, float]]:
+        q_emb = self.embedding_model.encode([query])
+        faiss.normalize_L2(q_emb)
+        scores, ids = self.msg_index.search(q_emb, k)
+        return [(self.msg_int_to_id[int(i)], float(s)) for i, s in zip(ids[0], scores[0]) if i >= 0]
     
     def validate_existing(self, canonical_name: str, mentions: List[str]) -> Tuple[Optional[int], bool]:
         """
@@ -205,7 +234,7 @@ class EntityResolver:
         logger.info(f"Merge detection started, {len(self.entity_profiles)} entities to scan")
         
         candidates = []
-        seen_pairs = set()
+        seen_pairs = {}
         aliases = list(self._name_to_id.keys())
         for i in range(len(aliases)):
             for j in range(i + 1, len(aliases)):
@@ -215,27 +244,35 @@ class EntityResolver:
                     continue
                 score = fuzz.WRatio(aliases[i], aliases[j])
                 if score >= 85:
-                    seen_pairs.add(tuple(sorted([id_i, id_j])))
+                    pair_key = tuple(sorted([id_i, id_j]))
+                    if pair_key not in seen_pairs or score > seen_pairs[pair_key]:
+                        seen_pairs[pair_key] = score
                     
 
         
-        for id_a, id_b in seen_pairs:
+        for (id_a, id_b), fuzz_score in seen_pairs.items():
             if self.store.has_direct_edge(id_a, id_b):
                 logger.debug(f"Blocked ({id_a}, {id_b}) | Direct edge exists")
                 continue
-            
+            profile_a = self.entity_profiles.get(id_a, {})
+            profile_b = self.entity_profiles.get(id_b, {})
+            type_a = profile_a.get("type")
+            type_b = profile_b.get("type")
+
             neighbors_a = self.store.get_neighbor_ids(id_a)
             neighbors_b = self.store.get_neighbor_ids(id_b)
             neighbors_a.discard(1) # user id - hardcoded for now
             neighbors_b.discard(1)
             
-            if neighbors_a & neighbors_b:
-                logger.debug(f"Blocked ({id_a}, {id_b}) | Shared neighbors: {neighbors_a & neighbors_b}")
-                continue
+            shared_neighbors = neighbors_a & neighbors_b
+            if shared_neighbors:
+                high_confidence = fuzz_score >= 95 and type_a and type_b and type_a == type_b
             
-            # Passed filtering - add to candidates
-            profile_a = self.entity_profiles.get(id_a, {})
-            profile_b = self.entity_profiles.get(id_b, {})
+                if not high_confidence:
+                    logger.debug(f"Blocked ({id_a}, {id_b}) | Shared neighbors: {shared_neighbors} (score={fuzz_score}, types={type_a}/{type_b})")
+                    continue
+                else:
+                    logger.info(f"Passed ({id_a}, {id_b}) | Shared neighbors as supporting evidence (score={fuzz_score}, type={type_a})")
             
             candidates.append({
                 "primary_id": id_a,
@@ -244,9 +281,11 @@ class EntityResolver:
                 "secondary_name": profile_b.get("canonical_name", "Unknown"),
                 "profile_a": profile_a,
                 "profile_b": profile_b,
+                "fuzz_score": fuzz_score,
+                "shared_neighbor_count": len(shared_neighbors)
             })
             
-            logger.info(f"Candidate ({id_a}, {id_b}) {profile_a.get('canonical_name')} <-> {profile_b.get('canonical_name')} | Passed graph filtering")
+            logger.info(f"Candidate ({id_a}, {id_b}) {profile_a.get('canonical_name')} <-> {profile_b.get('canonical_name')} | score={fuzz_score}")
     
         logger.info(f"Merge detection complete: {len(candidates)} candidates found")
         return candidates

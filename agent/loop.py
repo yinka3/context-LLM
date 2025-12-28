@@ -5,9 +5,10 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import uuid
 
 from loguru import logger
+import redis
 from agent.orchestrate import ContextState, StateOrchestrator
 from agent.tools import Tools
-from redisclient import AsyncRedisClient, SyncRedisClient
+from redisclient import AsyncRedisClient
 from main.service import LLMService
 from main.system_prompt import get_stella_prompt
 from schema.dtypes import (
@@ -31,7 +32,6 @@ def build_user_message(
     ctx: ContextState,
     conversation_history: List[Dict],
     last_result: Optional[Dict] = None,
-    error: Optional[str] = None
 ) -> str:
     msg = ""
     
@@ -47,11 +47,21 @@ def build_user_message(
     msg += f"**State:** {ctx.current_state}\n"
     msg += f"**Calls remaining:** {ctx.max_calls - ctx.call_count}\n"
     
-    if error:
-        msg += f"\n**Error from last action:** {error}\n"
-    
     if last_result:
-        msg += f"\n**Last tool result:**\n```json\n{json.dumps(last_result, indent=2, default=str)}\n```\n"
+        msg += "\n**Last tool result(s):**\n"
+        
+        results = last_result if isinstance(last_result, list) else [last_result]
+        
+        for r in results:
+            tool = r.get("tool", "unknown")
+            if "error" in r:
+                msg += f"- `{tool}`: Error - {r['error']}\n"
+            else:
+                data = r.get("result", {}).get("data")
+                if data is None or data == [] or data == {}:
+                    msg += f"- `{tool}`: No results found\n"
+                else:
+                    msg += f"- `{tool}`: {json.dumps(data, indent=2, default=str)[:500]}\n"
     
     if ctx.hot_topic_context:
         msg += f"\n**Hot topic context (pre-fetched):**\n```json\n{json.dumps(ctx.hot_topic_context, indent=2, default=str)}\n```\n"
@@ -65,26 +75,26 @@ def build_user_message(
     if ctx.retrieved_messages:
         msg += f"\n**Accumulated messages ({len(ctx.retrieved_messages)}):**\n```json\n{json.dumps(ctx.retrieved_messages, indent=2, default=str)}\n```\n"
     
+    
     # if ctx.web_results:
     #     msg += f"\n**Web results ({len(ctx.web_results)}):**\n```json\n{json.dumps(ctx.web_results, indent=2, default=str)}\n```\n"
     
     return msg
 
 
-def call_the_doctor(
+async def call_the_doctor(
     llm: LLMService,
     ctx: ContextState,
     user_name: str,
     last_result: Optional[Dict] = None,
-    error: Optional[str] = None,
     persona: str = ""
 ) -> StellaResponse:
     
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     system_prompt = get_stella_prompt(user_name, current_time, persona)
-    user_message = build_user_message(ctx, ctx.history, last_result, error)
+    user_message = build_user_message(ctx, ctx.history, last_result)
     
-    response = llm.call_with_tools_sync(
+    response = await llm.call_with_tools(
         system=system_prompt,
         user=user_message,
         tools=TOOL_SCHEMAS
@@ -93,35 +103,37 @@ def call_the_doctor(
     if not response or not response.get("tool_calls"):
         return FinalResponse(content="I couldn't determine how to help.")
     
-    tool_call = response["tool_calls"][0]
-    name = tool_call["name"]
-    args = json.loads(tool_call["arguments"])
+    tool_calls = response["tool_calls"]
+    if len(tool_calls) == 1:
+        tc = tool_calls[0]
+        name = tc["name"]
+        args = json.loads(tc["arguments"])
+        
+        if name == "finish":
+            return FinalResponse(content=args.get("response", ""))
+        if name == "request_clarification":
+            return ClarificationRequest(question=args.get("question", ""))
     
-    if name == "finish":
-        return FinalResponse(content=args.get("response", ""))
-    
-    if name == "request_clarification":
-        return ClarificationRequest(question=args.get("question", ""))
-    
-    return ToolCall(name=name, args=args)   
+        return ToolCall(name=name, args=args)
+
+    return [ToolCall(name=tc["name"], args=json.loads(tc["arguments"])) for tc in tool_calls] 
     
 
-def execute_tool(tools: Tools, name: str, args: Dict) -> Optional[Dict]:
+async def execute_tool(tools: Tools, name: str, args: Dict) -> Optional[Dict]:
     dispatch = {
-        "search_messages": lambda: tools.search_messages(args.get("query", "")),
+        "search_messages": lambda: tools.search_messages(args.get("query", ""), args.get("limit", 5)),
         "search_entities": lambda: tools.search_entities(args.get("query", "")),
         "get_profile": lambda: tools.get_profile(args.get("entity_name", "")),
         "get_connections": lambda: tools.get_connections(args.get("entity_name", "")),
         "get_activity": lambda: tools.get_recent_activity(args.get("entity_name", ""), args.get("hours", 24)),
         "find_path": lambda: tools.find_path(args.get("entity_a", ""), args.get("entity_b", ""))
-        # "web_search": lambda: tools.web_search(args.get("query", ""))
     }
     
     if name not in dispatch:
         return {"error": f"Unknown tool: {name}"}
     
     try:
-        result = dispatch[name]()
+        result = await dispatch[name]()
         return {"data": result}
     except Exception as e:
         logger.error(f"Tool {name} failed: {e}")
@@ -129,23 +141,28 @@ def execute_tool(tools: Tools, name: str, args: Dict) -> Optional[Dict]:
 
 
 def update_accumulators(ctx: ContextState, tool_name: str, result):
-    if not result:
+    if not result or "error" in result:
+        return
+    
+    data = result.get("data")
+    if not data:
         return
     
     if tool_name == "search_messages":
-        ctx.retrieved_messages.extend(result if isinstance(result, list) else [])
+        ctx.retrieved_messages.extend(data if isinstance(data, list) else [])
     
     elif tool_name == "search_entities":
-        ctx.entity_profiles.extend(result if isinstance(result, list) else [])
+        ctx.entity_profiles.extend(data if isinstance(data, list) else [])
     
     elif tool_name == "get_profile":
-        ctx.entity_profiles.append(result)
+        if data:
+            ctx.entity_profiles.append(data)
     
     elif tool_name in ("get_connections", "get_activity", "find_path"):
-        ctx.graph_results.extend(result if isinstance(result, list) else [])
+        ctx.graph_results.extend(data if isinstance(data, list) else [])
     
     # elif tool_name == "web_search":
-    #     ctx.web_results.extend(result if isinstance(result, list) else [])
+    #     ctx.web_results.extend(result if isinstance(data, list) else [])
 
 
 def summarize_result(tool_name: str, result: Dict) -> Tuple[str, int]:
@@ -183,12 +200,12 @@ async def run(user_query: str,
         llm: LLMService,
         store: 'MemGraphStore',
         ent_resolver: 'EntityResolver',
-        redis_client: AsyncRedisClient
+        redis_client: redis.Redis
     ) -> RunResult:
     
     system_warning = ""
     try:
-        raw_warning = await redis_client.get_client().get("system:active_job_warning")
+        raw_warning = await redis_client.get("system:active_job_warning")
         if raw_warning:
             system_warning = f"{raw_warning}\n\n---\n\n"
     except Exception as e:
@@ -208,8 +225,7 @@ async def run(user_query: str,
         history=conversation_history
     )
     machine = StateOrchestrator(context)
-    sync_redis = SyncRedisClient().get_client()
-    tools = Tools(user_name, store, ent_resolver, sync_redis, active_topics)
+    tools = Tools(user_name, store, ent_resolver, redis_client, active_topics)
 
     if not ent_resolver.entity_profiles or len(ent_resolver.entity_profiles) <= 1:
         return CompleteResult(
@@ -219,20 +235,27 @@ async def run(user_query: str,
             state="start",
             messages=[],
             profiles=[],
-            graph=[],
-            web=[]
+            graph=[]
+            # web=[]
         )
 
     if hot_topics:
         context.hot_topic_context = tools.get_hot_topic_context(hot_topics)
     
     last_result = None
-    error = None
     terminal_states = {machine.complete, machine.clarify}
     while machine.current_state not in terminal_states:
-        
-        if context.call_count >= context.max_calls and machine.can_finish():
-            if context.entity_profiles or context.graph_results or context.retrieved_messages:
+        context.attempt_count += 1
+
+        if context.attempt_count >= context.max_attempts:
+            return ClarificationResult(
+                status="clarification_needed",
+                question="I'm having trouble processing this. Could you rephrase your question?",
+                tools_used=context.tools_used,
+                state=machine.current_state.id)
+    
+        if context.call_count >= context.max_calls:
+            if machine.can_finish():
                 partial_response = "Here's what I found, though I couldn't fully answer your question:\n"
                 
                 if context.entity_profiles:
@@ -250,21 +273,19 @@ async def run(user_query: str,
                     state=machine.current_state.id,
                     messages=context.retrieved_messages,
                     profiles=context.entity_profiles,
-                    graph=context.graph_results
-                )
-    
-            # No evidence at all
+                    graph=context.graph_results)
+            
             return ClarificationResult(
                 status="clarification_needed",
-                question="I wasn't able to find enough information to answer that. Could you rephrase or be more specific?",
+                question="I couldn't find relevant information. Could you rephrase or be more specific?",
                 tools_used=context.tools_used,
-                state=machine.current_state.id
-            )
+                state=machine.current_state.id)
+    
         
         context.current_state = machine.current_state.id
         context.current_step += 1
         step_start = time.perf_counter()
-        response = call_the_doctor(llm, context, user_name, last_result, error)
+        response = await call_the_doctor(llm, context, user_name, last_result)
         
         if isinstance(response, ClarificationRequest):
             valid, reason = machine.validate("request_clarification", {})
@@ -273,7 +294,6 @@ async def run(user_query: str,
                 final_q = response.question
                 if system_warning:
                     final_q = system_warning + final_q
-
                 return ClarificationResult(
                     status="clarification_needed",
                     question=final_q,
@@ -281,8 +301,7 @@ async def run(user_query: str,
                     state=machine.current_state.id
                 )
             else:
-                error = reason
-                last_result = None
+                last_result = [{"tool": "request_clarification", "error": reason}]
                 continue
         
         if isinstance(response, FinalResponse):
@@ -293,7 +312,6 @@ async def run(user_query: str,
                 final_response_text = response.content
                 if system_warning:
                     final_response_text = system_warning + final_response_text
-
                 return CompleteResult(
                     status="complete",
                     response=final_response_text,
@@ -301,57 +319,84 @@ async def run(user_query: str,
                     state=machine.current_state.id,
                     messages=context.retrieved_messages,
                     profiles=context.entity_profiles,
-                    graph=context.graph_results,
+                    graph=context.graph_results
                 )
             else:
-                error = reason
-                last_result = None
+                last_result = [{"tool": "finish", "error": reason}]
                 continue
         
-        tool_name = response.name
-        args = response.args
+
+        tool_calls = [response] if isinstance(response, ToolCall) else response
         
-        valid, reason = machine.validate(tool_name, args)
+        all_results = []
+        for tc in tool_calls:
+            tool_name = tc.name
+            args = tc.args
+            
+            valid, reason = machine.validate(tool_name, args)
+            
+            if not valid:
+                trace.entries.append(TraceEntry(
+                    step=context.current_step,
+                    state=context.current_state,
+                    tool=tool_name,
+                    args=args,
+                    resolved_args={},
+                    result_summary=f"Validation failed: {reason}",
+                    result_count=0,
+                    duration_ms=(time.perf_counter() - step_start) * 1000,
+                    error=reason
+                ))
+                
+                all_results.append({"tool": tool_name, "error": reason})
+                context.consecutive_rejections += 1
+                if context.consecutive_rejections >= 3:
+                    break
+                continue
+            
+            result = await execute_tool(tools, tool_name, args)
+            result_summary, result_count = summarize_result(tool_name, result)
         
-        if not valid:
             trace.entries.append(TraceEntry(
                 step=context.current_step,
                 state=context.current_state,
                 tool=tool_name,
                 args=args,
-                resolved_args={},
-                result_summary="",
-                result_count=0,
+                resolved_args=args,
+                result_summary=result_summary,
+                result_count=result_count,
                 duration_ms=(time.perf_counter() - step_start) * 1000,
-                error=reason
+                error=result.get("error") if isinstance(result, dict) else None
             ))
-            error = reason
-            last_result = None
-            continue
-        
+            
+            machine.record_call(tool_name, args)
+            context.consecutive_rejections = 0
+            
+            if hasattr(machine, tool_name):
+                getattr(machine, tool_name)()
+            
+            update_accumulators(context, tool_name, result)
+            all_results.append({"tool": tool_name, "result": result})
 
-        last_result = execute_tool(tools, tool_name, args)
-        result_summary, result_count = summarize_result(tool_name, last_result)
-        
-        trace.entries.append(TraceEntry(
-            step=context.current_step,
-            state=context.current_state,
-            tool=tool_name,
-            args=args,
-            resolved_args=args,
-            result_summary=result_summary,
-            result_count=result_count,
-            duration_ms=(time.perf_counter() - step_start) * 1000,
-            error=last_result.get("error") if isinstance(last_result, dict) else None
-        ))
-
-
-        machine.record_call(tool_name, args)
-        getattr(machine, tool_name)()
-
-        update_accumulators(context, tool_name, last_result)
+        if context.consecutive_rejections >= 3 and not any("result" in r for r in all_results):
+            if context.entity_profiles or context.retrieved_messages or context.graph_results:
+                return CompleteResult(
+                    status="complete",
+                    response="I found some information but had trouble completing the search.",
+                    tools_used=context.tools_used,
+                    state=machine.current_state.id,
+                    messages=context.retrieved_messages,
+                    profiles=context.entity_profiles,
+                    graph=context.graph_results
+                )
+            return ClarificationResult(
+                status="clarification_needed",
+                question="I'm having trouble with that search. Could you rephrase or be more specific?",
+                tools_used=context.tools_used,
+                state=machine.current_state.id
+            )
+        last_result = all_results
         machine.try_advance()
-        error = None
     
     logger.info(f"[STELLA] Trace {trace.trace_id} completed: {len(trace.entries)} steps")
     for entry in trace.entries:
