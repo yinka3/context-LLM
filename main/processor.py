@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import redis.asyncio as redis
 from loguru import logger
-from rapidfuzz import process as fuzzy_process, fuzz
 from typing import Dict, List, Set, Tuple, Optional
 from db.memgraph import MemGraphStore
 from main.service import LLMService
