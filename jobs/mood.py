@@ -18,7 +18,7 @@ class MoodCheckpointJob(BaseJob):
         return "mood_checkpoint"
     
     async def should_run(self, ctx: JobContext) -> bool:
-        await ctx.redis.llen(f"emotions:{ctx.user_name}") >= self.VOLUME_THRESHOLD
+        return await ctx.redis.llen(f"emotions:{ctx.user_name}") >= self.VOLUME_THRESHOLD
     
 
     async def execute(self, ctx: JobContext) -> JobResult:

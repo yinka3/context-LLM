@@ -7,6 +7,6 @@ sudo rm -rf ./redis_data
 rm -f *.log
 
 echo Restarting containers and volumes
-docker compose up -d
+docker compose up -d redis memgraph
 echo "Done."
 clear

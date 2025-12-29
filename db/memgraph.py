@@ -427,6 +427,54 @@ class MemGraphStore:
                 })
             return path_data
     
+    def get_topics_by_status(self) -> dict:
+        query = """
+        MATCH (t:Topic)
+        RETURN t.name as name, coalesce(t.status, 'active') as status
+        """
+        with self.driver.session() as session:
+            result = session.run(query)
+            grouped = {"active": [], "hot": [], "inactive": []}
+            for record in result:
+                status = record["status"]
+                if status in grouped:
+                    grouped[status].append(record["name"])
+            return grouped
+    
+    def get_entities_list(self, topic: str = None, limit: int = 50) -> list[dict]:
+        query = """
+        MATCH (e:Entity)
+        OPTIONAL MATCH (e)-[:BELONGS_TO]->(t:Topic)
+        WHERE ($topic IS NULL OR t.name = $topic)
+        AND (t IS NULL OR t.status IS NULL OR t.status <> 'inactive')
+        RETURN e.id as id,
+            e.canonical_name as canonical_name,
+            e.type as type,
+            e.summary as summary,
+            t.name as topic
+        ORDER BY e.last_mentioned DESC
+        LIMIT $limit
+        """
+        with self.driver.session() as session:
+            result = session.run(query, {"topic": topic, "limit": limit})
+            return [dict(record) for record in result]
+    
+    def get_mood_history(self, user_name: str, limit: int = 10) -> list[dict]:
+        query = """
+        MATCH (u:Entity {canonical_name: $user_name})-[:FELT]->(m:MoodCheckpoint)
+        RETURN m.primary_emotion as primary_emotion,
+            m.primary_count as primary_count,
+            m.secondary_emotion as secondary_emotion,
+            m.secondary_count as secondary_count,
+            m.timestamp as timestamp,
+            m.message_count as message_count
+        ORDER BY m.timestamp DESC
+        LIMIT $limit
+        """
+        with self.driver.session() as session:
+            result = session.run(query, {"user_name": user_name, "limit": limit})
+            return [dict(record) for record in result]
+    
     def merge_entities(self, primary_id: int, secondary_id: int, merged_summary: str) -> bool:
         """
         Merge secondary entity into primary (single transaction).
