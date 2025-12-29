@@ -10,6 +10,7 @@ from jobs.mood import MoodCheckpointJob
 from jobs.profile import ProfileRefinementJob
 from jobs.scheduler import Scheduler
 from jobs.merger import MergeDetectionJob
+from config import get_config_value
 from main.processor import BatchProcessor
 from main.service import LLMService
 from redisclient import AsyncRedisClient
@@ -172,7 +173,7 @@ class Context:
         logger.info(f"Creating new USER entity for {user_name}")
         new_id = await self.get_next_ent_id()
         
-        summary = f"The primary user named {user_name}"
+        summary = get_config_value("user_summary") or f"The primary user named {user_name}"
 
         embedding = await loop.run_in_executor(
             self.executor,
@@ -341,7 +342,8 @@ class Context:
             if not result.success:
                 await self.batch_processor.move_to_dead_letter(messages, result.error)
             else:
-                self.redis_client.rpush(f"emotions:{self.user_name}", result.emotions)
+                if result.emotions:
+                    await self.redis_client.rpush(f"emotions:{self.user_name}", *result.emotions)
                 
                 if result.extraction_result:
                     await self._write_to_graph(

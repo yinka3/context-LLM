@@ -5,7 +5,7 @@ load_dotenv()
 
 VESTIGE_USER_NAME = os.environ.get("VESTIGE_USER_NAME")
 REDIS_HOST = os.environ.get("REDIS_HOST")
-REDIS_PORT = os.environ.get("REDIS_POST")
+REDIS_PORT = os.environ.get("REDIS_PORT")
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD")
 
 if not REDIS_PASSWORD:

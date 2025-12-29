@@ -8,7 +8,6 @@ from loguru import logger
 import redis
 from agent.orchestrate import ContextState, StateOrchestrator
 from agent.tools import Tools
-from redisclient import AsyncRedisClient
 from main.service import LLMService
 from main.system_prompt import get_stella_prompt
 from schema.dtypes import (
@@ -226,18 +225,6 @@ async def run(user_query: str,
     )
     machine = StateOrchestrator(context)
     tools = Tools(user_name, store, ent_resolver, redis_client, active_topics)
-
-    if not ent_resolver.entity_profiles or len(ent_resolver.entity_profiles) <= 1:
-        return CompleteResult(
-            status="complete",
-            response="I don't know much about your world yet. Tell me about the people, places, and things in your life and I'll start remembering.",
-            tools_used=[],
-            state="start",
-            messages=[],
-            profiles=[],
-            graph=[]
-            # web=[]
-        )
 
     if hot_topics:
         context.hot_topic_context = tools.get_hot_topic_context(hot_topics)
