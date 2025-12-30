@@ -61,28 +61,109 @@ class Tools:
                     "timestamp": data["timestamp"]
                 })
         return results
+    
+
+    async def _get_surrounding_context(self, msg_id: str, window: int = 2) -> List[Dict]:
+        """Get surrounding turns for context using pipeline."""
+        sorted_key = f"recent_conversation:{self.user_name}"
+        conv_key = f"conversation:{self.user_name}"
+        
+        # Find target turn
+        if msg_id.startswith("msg_"):
+            user_msg_id = int(msg_id.replace("msg_", ""))
+            # Need to scan for matching user_msg_id — unavoidable without reverse index
+            all_turns = await self.redis.zrange(sorted_key, 0, -1)
+            all_data = await self.redis.hmget(conv_key, *all_turns)
+            
+            target_idx = None
+            parsed_turns = []
+            for i, (turn_id, raw) in enumerate(zip(all_turns, all_data)):
+                if raw:
+                    data = json.loads(raw)
+                    parsed_turns.append({"turn_id": turn_id, **data})
+                    if data.get("user_msg_id") == user_msg_id:
+                        target_idx = i
+            
+            if target_idx is None:
+                return []
+            
+            # Slice window
+            start = max(0, target_idx - window)
+            end = min(len(parsed_turns), target_idx + window + 1)
+            
+            return [
+                {"role": t["role"], "content": t["content"], "timestamp": t["timestamp"]}
+                for t in parsed_turns[start:end]
+                if t["turn_id"] != f"turn_{target_idx}"  # exclude the match itself
+            ]
+        
+        else:
+
+            all_turns = await self.redis.zrange(sorted_key, 0, -1)
+            
+            if msg_id not in all_turns:
+                return []
+            
+            target_idx = all_turns.index(msg_id)
+            start = max(0, target_idx - window)
+            end = min(len(all_turns), target_idx + window + 1)
+            
+            context_turns = [t for t in all_turns[start:end] if t != msg_id]
+            
+            if not context_turns:
+                return []
+            
+            pipe = self.redis.pipeline()
+            for turn_id in context_turns:
+                pipe.hget(conv_key, turn_id)
+            results = await pipe.execute()
+            
+            context = []
+            for raw in results:
+                if raw:
+                    data = json.loads(raw)
+                    context.append({
+                        "role": data["role"],
+                        "content": data["content"],
+                        "timestamp": data["timestamp"]
+                    })
+            
+            return context
 
     
     async def search_messages(self, query: str, limit: int = 5) -> List[Dict]:
-        """
-        Search past user messages by semantic similarity.
-        Use when looking for what the user said about a topic, event, or person.
-        Good starting point when the query references past conversations.
-        
-        Args:
-            query: Keywords or phrase to search for
-            limit: Max results (default 5)
-        
-        Returns: List of messages with content, timestamp, and relevance score.
-        """
         results = self.resolver.search_messages(query, limit)
-        content_key = f"message_content:{self.user_name}"
+        
         output = []
         for msg_id, score in results:
-            raw = await self.redis.hget(content_key, msg_id)
-            if raw:
-                data = json.loads(raw)
-                output.append({"id": msg_id, "message": data["message"], "timestamp": data["timestamp"], "score": score})
+            if msg_id.startswith("msg_"):
+                content_key = f"message_content:{self.user_name}"
+                raw = await self.redis.hget(content_key, msg_id)
+                if raw:
+                    data = json.loads(raw)
+                    output.append({
+                        "id": msg_id,
+                        "role": "user",
+                        "message": data["message"],
+                        "timestamp": data["timestamp"],
+                        "score": score,
+                        "context": await self._get_surrounding_context(msg_id)
+                    })
+                    
+            elif msg_id.startswith("turn_"):
+                conv_key = f"conversation:{self.user_name}"
+                raw = await self.redis.hget(conv_key, msg_id)
+                if raw:
+                    data = json.loads(raw)
+                    output.append({
+                        "id": msg_id,
+                        "role": data["role"],
+                        "message": data["content"],
+                        "timestamp": data["timestamp"],
+                        "score": score,
+                        "context": await self._get_surrounding_context(msg_id)
+                    })
+        
         return output
 
     async def search_entities(self, query: str, limit: int = 5) -> List[Dict]:

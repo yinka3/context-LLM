@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from functools import partial
 import json
 import re
-from typing import List, Optional
+from typing import Dict, List, Optional
 from loguru import logger
 from db.memgraph import MemGraphStore
 from jobs.base import BaseJob, JobContext, JobNotifier, JobResult
@@ -18,7 +18,7 @@ class ProfileRefinementJob(BaseJob):
     using the sliding window of recent messages.
     
     Triggers:
-    1. VOLUME: If >30 entities are dirty (ensures we catch them in the 75-msg window).
+    1. VOLUME: If >=5 entities are dirty (ensures we catch them in the 75-msg window).
     2. TIME: If user is idle for >5 minutes and we have ANY dirty entities.
     """
     
@@ -69,6 +69,45 @@ class ProfileRefinementJob(BaseJob):
         await ctx.redis.setex(ran_key, 300, "true")
         
         return success
+    
+    async def _get_conversation_context(self, ctx: JobContext, num_turns: int) -> List[Dict]:
+        """Fetch recent conversation with both user and STELLA turns."""
+        sorted_key = f"recent_conversation:{ctx.user_name}"
+        conv_key = f"conversation:{ctx.user_name}"
+        
+        turn_ids = await ctx.redis.zrevrange(sorted_key, 0, num_turns - 1)
+        if not turn_ids:
+            return []
+        
+        turn_ids.reverse()
+        turn_data = await ctx.redis.hmget(conv_key, *turn_ids)
+        
+        results = []
+        now = datetime.now(timezone.utc)
+        
+        for data in turn_data:
+            if data:
+                parsed = json.loads(data)
+                ts = datetime.fromisoformat(parsed['timestamp'])
+                delta = (now - ts).total_seconds()
+                
+                if delta < 3600:
+                    relative = f"{int(delta // 60)}m ago" if delta >= 60 else "just now"
+                elif delta < 86400:
+                    relative = f"{int(delta // 3600)}h ago"
+                else:
+                    relative = f"{int(delta // 86400)}d ago"
+                
+                role_label = "User" if parsed["role"] == "user" else "STELLA"
+                results.append({
+                    "role": parsed["role"],
+                    "role_label": role_label,
+                    "content": parsed["content"],
+                    "formatted": f"({relative}) [{role_label}]: {parsed['content']}",
+                    "raw": parsed["content"]
+                })
+        
+        return results
 
     async def execute(self, ctx: JobContext) -> JobResult:
         warning = "⚠️ **Deepening Profiles.** I am reading through recent conversations to update entity details. Please wait a moment for the best results."
@@ -85,36 +124,13 @@ class ProfileRefinementJob(BaseJob):
             updates = []
             
             if entity_ids:
-                sorted_set_key = f"recent_messages:{ctx.user_name}"
-                recent_msg_ids = await ctx.redis.zrevrange(sorted_set_key, 0, self.MSG_WINDOW - 1)
-                
-                if not recent_msg_ids:
+                conversation = await self._get_conversation_context(ctx, self.MSG_WINDOW * 2)
+        
+                if not conversation:
                     await ctx.redis.sadd(dirty_key, *[str(eid) for eid in entity_ids])
-                    return JobResult(success=False, summary="No context messages found")
+                    return JobResult(success=False, summary="No context found")
                 
-                msg_data_list = await ctx.redis.hmget(f"message_content:{ctx.user_name}", *recent_msg_ids)
-                
-                recent_context = []
-                now = datetime.now()
-                
-                for msg_data in msg_data_list:
-                    if msg_data:
-                        parsed = json.loads(msg_data)
-                        raw = parsed['message']
-                        ts = datetime.fromisoformat(parsed['timestamp'])
-                        
-                        delta = (now - ts).total_seconds()
-                        if delta < 3600:
-                            mins = int(delta // 60)
-                            relative = f"{mins}m ago" if mins > 1 else "just now"
-                        elif delta < 86400:
-                            relative = f"{int(delta // 3600)}h ago"
-                        else:
-                            relative = f"{int(delta // 86400)}d ago"
-                        
-                        recent_context.append((f"({relative}) {raw}", raw))
-                
-                updates = await self._run_updates(ctx, entity_ids, recent_context)
+                updates = await self._run_updates(ctx, entity_ids, conversation)
                 
                 if updates:
                     await self._write_updates(updates)
@@ -147,36 +163,13 @@ class ProfileRefinementJob(BaseJob):
     
     async def _refine_user_profile(self, ctx: JobContext, user_id: int, profile: dict) -> bool:
         """Execute user profile refinement."""
-        sorted_set_key = f"recent_messages:{ctx.user_name}"
-        recent_msg_ids = await ctx.redis.zrevrange(sorted_set_key, 0, self.USER_MSG_COUNT - 1)
-        
-        if not recent_msg_ids:
+        conversation = await self._get_conversation_context(ctx, self.USER_MSG_COUNT * 2)
+    
+        if not conversation:
             return False
         
-        msg_data_list = await ctx.redis.hmget(
-            f"message_content:{ctx.user_name}", *recent_msg_ids
-        )
-        
-        observations = []
-        now = datetime.now()
-        
-        for msg_data in msg_data_list:
-            if msg_data:
-                parsed = json.loads(msg_data)
-                raw = parsed['message']
-                ts = datetime.fromisoformat(parsed['timestamp'])
-                
-                delta = (now - ts).total_seconds()
-                if delta < 3600:
-                    mins = int(delta // 60)
-                    relative = f"{mins}m ago" if mins > 1 else "just now"
-                elif delta < 86400:
-                    relative = f"{int(delta // 3600)}h ago"
-                else:
-                    relative = f"{int(delta // 86400)}d ago"
-                
-                observations.append(f"({relative}) {raw}")
-        
+        observations = [turn["formatted"] for turn in conversation]
+    
         if not observations:
             return False
         
@@ -224,9 +217,9 @@ class ProfileRefinementJob(BaseJob):
         
         logger.info(f"Refined user profile for {ctx.user_name}")
         return True
+    
 
-
-    async def _run_updates(self, ctx: JobContext, entity_ids: List[int], recent_context: List[tuple]):
+    async def _run_updates(self, ctx: JobContext, entity_ids: List[int], conversation: List[Dict]):
         current_msg_id = await ctx.redis.get("global:next_msg_id")
         current_msg_id = int(current_msg_id) if current_msg_id else 0
         
@@ -251,18 +244,25 @@ class ProfileRefinementJob(BaseJob):
                     re.IGNORECASE
                 )
                 
-                observations = [formatted for formatted, raw in recent_context if pattern.search(raw)]
+                observations = []
 
+                for i, turn in enumerate(conversation):
+                    if turn["role"] == "user" and pattern.search(turn["raw"]):
+                        if i > 0 and conversation[i-1]["role"] == "assistant":
+                            observations.append(conversation[i-1]["formatted"])
+                        observations.append(turn["formatted"])
+                        if i + 1 < len(conversation) and conversation[i+1]["role"] == "assistant":
+                            observations.append(conversation[i+1]["formatted"])
+            
                 if not observations:
                     return None
                 
-                context_text = "\n".join(observations)
                 system_prompt = get_profile_update_prompt(ctx.user_name)
                 user_content = json.dumps({
                     "entity_name": canonical_name,
                     "entity_type": entity_type,
                     "existing_summary": existing_summary,
-                    "new_observations": context_text,
+                    "new_observations": observations,
                     "known_aliases": mentions
                 }, indent=2)
                 

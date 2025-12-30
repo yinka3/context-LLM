@@ -23,6 +23,7 @@ class EntityResolver:
         self._name_to_id = {}
         self.msg_index = faiss.IndexIDMap2(faiss.IndexFlatIP(self.embedding_dim))
         self.msg_int_to_id: dict[int, str] = {}
+        self._message_texts = {}
         self._lock = threading.RLock()
 
     
@@ -99,24 +100,33 @@ class EntityResolver:
         if not messages:
             return
         ids, texts = [], []
-        for msg_id, data in messages.items():
-            int_id = int(msg_id.split("_")[1])
-            self.msg_int_to_id[int_id] = msg_id
+        for msg_key, data in messages.items():
+            prefix, num = msg_key.split("_")
+            num = int(num)
+            int_id = num if prefix == "msg" else num + 1_000_000
+            
+            self.msg_int_to_id[int_id] = msg_key
             ids.append(int_id)
-            texts.append(data["message"])
+            texts.append(data.get("message") or data.get("content"))  # message for user, content for turns
         
         embs = self.embedding_model.encode(texts)
         faiss.normalize_L2(embs)
         self.msg_index.add_with_ids(embs, np.array(ids, dtype=np.int64))
 
-    def add_message(self, msg_id: str, text: str):
-        int_id = int(msg_id.split("_")[1])
-        self.msg_int_to_id[int_id] = msg_id
+    
+    def add_message(self, msg_key: str, text: str):
+        prefix, num = msg_key.split("_")
+        num = int(num)
+        
+        # hacky solution: offset to 1 mill, aint nobody texting for 20+ years, would be nice tho lol
+        int_id = num if prefix == "msg" else num + 1_000_000
+        
+        self.msg_int_to_id[int_id] = msg_key
         emb = self.embedding_model.encode([text])
         faiss.normalize_L2(emb)
         self.msg_index.add_with_ids(emb, np.array([int_id], dtype=np.int64))
 
-    def search_messages(self, query: str, k: int = 5) -> list[tuple[str, float]]:
+    def search_messages(self, query: str, k: int = 10) -> list[tuple[str, float]]:
         q_emb = self.embedding_model.encode([query])
         faiss.normalize_L2(q_emb)
         scores, ids = self.msg_index.search(q_emb, k)
